@@ -1,0 +1,28 @@
+{
+  "name": "pi-pwsh",
+  "version": "0.1.0",
+  "description": "Replace pi's built-in bash tool with PowerShell 7 (pwsh) on Windows",
+  "license": "MIT",
+  "author": "4fuu",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/4fuu/pi-pwsh.git"
+  },
+  "type": "module",
+  "keywords": ["pi-package", "pi-extension", "powershell", "pwsh", "windows"],
+  "files": ["src", "README.md", "LICENSE"],
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.80.10",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.5.0"
+  }
+}
