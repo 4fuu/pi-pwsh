@@ -187,6 +187,7 @@ export default function (pi: ExtensionAPI) {
 			promptSnippet: "Execute PowerShell 7 (pwsh) commands",
 			promptGuidelines: [
 				"Use pwsh for file operations and shell tasks; write PowerShell syntax, not bash/POSIX syntax.",
+				"Unix tools (grep, find, sed, awk, etc.) are not available on Windows. Prefer modern cross-platform alternatives when installed (e.g. rg instead of grep, fd instead of find); otherwise use native PowerShell cmdlets (e.g. Select-String, Get-ChildItem).",
 			],
 		});
 
