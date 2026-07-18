@@ -24,6 +24,20 @@ This extension disables `bash` and registers a `pwsh` tool instead.
 
 ## Installation
 
+With pi:
+
+```bash
+pi install npm:@4fu/pi-pwsh
+```
+
+Or try it for a single run without installing:
+
+```bash
+pi -e npm:@4fu/pi-pwsh
+```
+
+### From source
+
 Symlink or copy into pi's extensions directory:
 
 ```powershell
