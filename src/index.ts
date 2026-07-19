@@ -1,11 +1,11 @@
 /**
- * pi-pwsh — Replace pi's built-in `bash` tool with PowerShell 7 (`pwsh`),
- * including background jobs that actually survive across tool calls.
+ * pi-pwsh — Route pi's shell, directory listing, and search tasks through
+ * PowerShell 7 (`pwsh`), including background jobs that survive tool calls.
  *
  * Why: Windows has no reliable bash. A tool named "bash" also primes the model
- * to emit POSIX syntax. This extension disables `bash` and registers a `pwsh`
- * tool that reuses pi's built-in bash tool definition (tail truncation, temp
- * files for full output, non-zero exit codes as tool errors, streaming preview,
+ * to emit POSIX syntax. This extension disables `bash`, `ls`, `find`, and `grep`,
+ * then registers a `pwsh` tool that reuses pi's built-in bash tool definition
+ * (tail truncation, temp files for full output, non-zero exit codes as tool errors, streaming preview,
  * built-in renderer) with only the spawn layer swapped to pwsh.
  *
  * Background jobs: every pwsh call is a fresh pwsh process, so native
@@ -108,6 +108,8 @@ QUOTING: PowerShell quoting differs from bash. Single quotes are literal strings
 
 ENVIRONMENT VARIABLES: Use PowerShell syntax: $env:NODE_ENV = 'production'; npm start (NOT bash-style NODE_ENV=production npm start).
 
+GET-CHILDITEM / SELECT-STRING: Recursive searches built from these cmdlets do not honor .gitignore or automatically prune heavy directories. Keep the path, depth, and output limits tight; never recursively scan any location that should not be searched.
+
 BACKGROUND JOBS: Never run long-lived commands (dev servers, watchers, builds) in the foreground — they block your work. Run them as detached background jobs instead: append \` &\` (\`npm run dev &\`) or use Start-Job (\`Start-Job -ScriptBlock { npm run dev } -Name dev\`). Note: the standard PowerShell job cmdlets (Start-Job, Get-Job, etc.) are overridden — jobs run as detached processes that survive across pwsh calls (and /reload); do not assume native PowerShell job semantics. Manage them with Get-Job / Receive-Job / Stop-Job / Remove-Job / Wait-Job (pipeline support, e.g. \`Get-Job | Stop-Job\`). Jobs don't share variables with your pwsh call. Run Get-JobHelp for usage and examples.`;
 
 export default function (pi: ExtensionAPI) {
@@ -131,11 +133,12 @@ export default function (pi: ExtensionAPI) {
 			description: DESCRIPTION,
 			promptSnippet: "Execute PowerShell 7 (pwsh) commands",
 			promptGuidelines: [
-				"Use pwsh for shell tasks, both foreground and background; write PowerShell syntax; prefer modern cross-platform tools (rg, fd) or native cmdlets (Select-String, Get-ChildItem) over Unix tools.",
+				"Use pwsh for shell tasks, both foreground and background; write PowerShell syntax; prefer modern cross-platform tools (rg, fd, etc.) when available, otherwise use native PowerShell cmdlets with tightly bounded scope, and avoid Unix-only commands.",
 			],
 		});
 
 		const active = pi.getActiveTools();
-		pi.setActiveTools([...active.filter((name) => name !== "bash" && name !== "pwsh"), "pwsh"]);
+		const disabled = new Set(["bash", "ls", "find", "grep", "pwsh"]);
+		pi.setActiveTools([...active.filter((name) => !disabled.has(name)), "pwsh"]);
 	});
 }

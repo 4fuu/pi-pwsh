@@ -1,17 +1,18 @@
 # pi-pwsh
 
-Replace pi's built-in `bash` tool with PowerShell 7 (`pwsh`) on Windows.
+Route pi's shell, directory listing, and search tasks through PowerShell 7 (`pwsh`) on Windows.
 
 ## Why
 
 - Windows has no reliable bash implementation (Git Bash hangs on background processes, path translation is flaky).
 - A tool named `bash` primes the model to emit POSIX syntax (`&&`, `grep`, `$VAR`), which fails under PowerShell.
 
-This extension disables `bash` and registers a `pwsh` tool instead.
+This extension disables `bash`, `ls`, `find`, and `grep`, then registers a `pwsh` tool instead.
 
 ## What it does
 
 - Registers a `pwsh` tool that **reuses pi's built-in bash tool definition** — tail truncation (last 2000 lines / 50KB), full output saved to a temp file, non-zero exit codes surfaced as tool errors, streaming preview, and the built-in renderer all come for free. Only the spawn layer is replaced.
+- Disables pi's built-in `ls`, `find`, and `grep` tools so filesystem discovery and search are routed through `pwsh`; prompt guidance prefers available cross-platform tools such as `rg` and `fd` and bounds native recursive cmdlets.
 - Spawns `pwsh -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command <cmd>`.
 - Forces UTF-8 output encoding (non-ASCII output is not mangled by the legacy OEM codepage).
 - Preserves real native exit codes: `pwsh -Command` would otherwise flatten them to 0/1, which breaks `rg` (1 = no match vs 2 = error) and `git diff --quiet`-style semantics. An exit-code epilogue restores them — identically for foreground commands and background jobs.

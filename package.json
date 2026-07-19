@@ -1,7 +1,7 @@
 {
   "name": "@4fu/pi-pwsh",
-  "version": "0.4.0",
-  "description": "Replace pi's built-in bash tool with PowerShell 7 (pwsh) on Windows",
+  "version": "0.5.0",
+  "description": "Route pi's shell, directory listing, and search tasks through PowerShell 7 on Windows",
   "license": "MIT",
   "author": "4fuu",
   "repository": {
