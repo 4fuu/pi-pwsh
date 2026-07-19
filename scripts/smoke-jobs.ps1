@@ -6,6 +6,9 @@ $prelude = Join-Path $PSScriptRoot '..' 'src' 'prelude.ps1'
 $jobDir = Join-Path $env:TEMP 'pi-pwsh-jobs'
 
 $script:pass = 0; $script:fail = 0
+# Exercise the Node launcher path (the extension passes process.execPath the same way).
+$nodeExe = (Get-Command node.exe -ErrorAction SilentlyContinue).Source
+if ($nodeExe) { $env:PIPWSH_NODE = $nodeExe }
 function Invoke-Pwsh([string]$cmd) {
     $q = "'" + ($prelude -replace "'", "''") + "'"
     $full = ". $q; [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; `$OutputEncoding = [System.Text.Encoding]::UTF8; $cmd"
@@ -74,7 +77,7 @@ Assert 'stop-job' ($r.Output -match 'Stopped') $r.Output
 $r = Invoke-Pwsh "Get-Job -Name sleeper"
 Assert 'stop-persists' ($r.Output -match 'Stopped') $r.Output
 # The wrapper's whole tree must be dead: no leftover pwsh running our cmd file.
-# (Jobs are launched detached via WMI, so check by command line, not parentage.)
+# (Jobs are launched detached via double-spawn, so check by command line, not parentage.)
 $sleeperAlive = Get-CimInstance Win32_Process -Filter "Name = 'pwsh.exe'" |
 	Where-Object { $_.CommandLine -match 'sleeper' }
 Assert 'tree-killed' ($null -eq $sleeperAlive) ("alive: " + ($sleeperAlive | Out-String))
@@ -91,20 +94,54 @@ Assert 'remove-all' ($r.Output.Trim() -eq '') $r.Output
 $leftover = Get-ChildItem $jobDir -Filter '*.meta.json' -ErrorAction SilentlyContinue
 Assert 'no-leftover-files' ($null -eq $leftover) ($leftover | Out-String)
 
-# --- 5b. env injection: auto PATH + explicit -Environment ---------------------
-# Session PATH changes (fnm/scoop shims) must be visible inside the job.
+# --- 5b. env: full session inheritance + explicit -Environment override ------
+# Session PATH changes (fnm/scoop shims) are inherited by the job.
 Invoke-Pwsh "`$env:PATH = 'C:\pipwsh-mark;' + `$env:PATH; Start-Job { `$env:PATH } -Name envpath" | Out-Null
 $r = Invoke-Pwsh "Wait-Job -Name envpath | Out-Null; Receive-Job -Name envpath"
-Assert 'env-path-auto-injected' ($r.Output -match 'pipwsh-mark') $r.Output
-# Explicit variables land in the job; session values are NOT inherited otherwise.
+Assert 'env-path-inherited' ($r.Output -match 'pipwsh-mark') $r.Output
+# Arbitrary session variables (proxies, VIRTUAL_ENV, ...) are inherited too.
+Invoke-Pwsh "`$env:PI_PWSH_MARK = 'session-val'; Start-Job { `$env:PI_PWSH_MARK } -Name envinh" | Out-Null
+$r = Invoke-Pwsh "Wait-Job -Name envinh | Out-Null; Receive-Job -Name envinh"
+Assert 'env-session-inherited' ($r.Output -match 'session-val') $r.Output
+# -Environment overrides the inherited value.
 Invoke-Pwsh "`$env:PI_PWSH_MARK = 'session-only'; Start-Job { `$env:PI_PWSH_MARK } -Name envexp -Environment @{ PI_PWSH_MARK = 'mark-123' }" | Out-Null
 $r = Invoke-Pwsh "Wait-Job -Name envexp | Out-Null; Receive-Job -Name envexp"
-Assert 'env-explicit' ($r.Output -match 'mark-123') $r.Output
-Invoke-Pwsh "Start-Job { `$env:PI_PWSH_NOINJECT } -Name envnone" | Out-Null
-$r = Invoke-Pwsh "Wait-Job -Name envnone | Out-Null; Receive-Job -Name envnone"
-Assert 'env-not-inherited' ($r.Output.Trim() -eq '') $r.Output
+Assert 'env-explicit-override' ($r.Output -match 'mark-123') $r.Output
 $r = Invoke-Pwsh "Start-Job { 1 } -Name envbad -Environment @{ 'BAD-NAME' = 'x' }"
 Assert 'env-invalid-name' ($r.Output -match 'invalid environment variable name') $r.Output
+
+# --- 5c. abort survival: killing the starting call's tree must spare the job --
+$rootScript = Join-Path $env:TEMP 'pi-pwsh-orphan-root.ps1'
+$qPrelude = "'" + ($prelude -replace "'", "''") + "'"
+[System.IO.File]::WriteAllText($rootScript, ". $qPrelude; Start-Job { Start-Sleep 120 } -Name orph | Out-Null; Start-Sleep 60", [System.Text.Encoding]::UTF8)
+$root = Start-Process -FilePath pwsh -ArgumentList @('-NoProfile', '-File', $rootScript) -WindowStyle Hidden -PassThru
+$deadline = (Get-Date).AddSeconds(20)
+$registered = $false
+while ((Get-Date) -lt $deadline) {
+	$r = Invoke-Pwsh "Get-Job -Name orph"
+	if ($r.Output -match 'Running') { $registered = $true; break }
+	Start-Sleep -Milliseconds 300
+}
+Assert 'orphan-job-started' $registered
+& taskkill /PID $root.Id /T /F 2>$null | Out-Null
+Start-Sleep 2
+$r = Invoke-Pwsh "Get-Job -Name orph"
+Assert 'orphan-survives-tree-kill' ($r.Output -match 'Running') $r.Output
+Invoke-Pwsh "Remove-Job -Name orph -Force" | Out-Null
+Remove-Item $rootScript -Force -ErrorAction SilentlyContinue
+
+# --- 5d. pipe-handle leak: starting a long job must NOT block the call --------
+# (A detached job must not inherit this call's stdout pipe; otherwise callers
+# block until the job exits — and timeout kills don't unblock them.)
+$t = Get-Date
+Invoke-Pwsh "Start-Job { Start-Sleep 60 } -Name pipeleak" | Out-Null
+$elapsed = [int]((Get-Date) - $t).TotalSeconds
+Invoke-Pwsh "Remove-Job -Name pipeleak -Force" | Out-Null
+Assert 'start-long-job-returns-fast' ($elapsed -lt 15) ("took ${elapsed}s")
+
+# pwsh launcher fallback (PIPWSH_NODE unset) still launches jobs fine.
+$r = Invoke-Pwsh "`$env:PIPWSH_NODE = ''; Start-Job { 'via-ps-launcher' } -Name psl | Out-Null; Wait-Job -Name psl | Out-Null; Receive-Job -Name psl"
+Assert 'pwsh-launcher-fallback' ($r.Output -match 'via-ps-launcher') $r.Output
 
 # --- 6. stubs, FilePath, Get-JobHelp ------------------------------------------
 $r = Invoke-Pwsh "Suspend-Job"

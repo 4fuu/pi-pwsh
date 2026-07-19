@@ -49,6 +49,51 @@ if (-not (Test-Path -LiteralPath $script:PiPwshFormatFile)) {
 Update-FormatData -PrependPath $script:PiPwshFormatFile
 
 # ---------------------------------------------------------------------------
+# Job launcher: a short-lived helper that spawns the job wrapper and exits
+# immediately, recording the job PID. The dead launcher breaks the
+# ParentProcessId chain that taskkill /T walks, so killing the tree of the
+# pwsh call that started a job cannot take the job down. As a side benefit
+# the job inherits the launcher parent's FULL session environment (proxy
+# vars, VIRTUAL_ENV, fnm PATH, ...) — no registry-environment surprises.
+# Two launchers are written: Node (~3x faster to boot; pi itself runs on
+# Node, so index.ts passes process.execPath as PIPWSH_NODE) and pwsh
+# (fallback when PIPWSH_NODE is unset).
+# ---------------------------------------------------------------------------
+# Write helper: refresh content only when it differs (avoids breaking running
+# launches with constant rewrites, but self-heals stale files after upgrades).
+function PiPwshEnsureFile([string]$path, [string]$content) {
+	if ((Test-Path -LiteralPath $path) -and ((Get-Content -LiteralPath $path -Raw -ErrorAction SilentlyContinue) -eq $content)) { return }
+	try { [System.IO.File]::WriteAllText($path, $content, [System.Text.Encoding]::UTF8) } catch { }
+}
+
+$script:PiPwshLauncher = Join-Path $script:PiPwshJobDir '_launcher.ps1'
+PiPwshEnsureFile $script:PiPwshLauncher @'
+param([string]$WrapFile, [string]$PidFile, [string]$WorkingDirectory)
+$p = Start-Process -FilePath (Join-Path $PSHOME 'pwsh.exe') -ArgumentList @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $WrapFile + '"')) -WorkingDirectory $WorkingDirectory -WindowStyle Hidden -PassThru
+[System.IO.File]::WriteAllText($PidFile, [string]$p.Id, [System.Text.Encoding]::ASCII)
+'@
+$script:PiPwshLauncherNode = Join-Path $script:PiPwshJobDir '_launcher.cjs'
+PiPwshEnsureFile $script:PiPwshLauncherNode @'
+// pi-pwsh job launcher: spawn the job, record its PID, exit.
+// Env contract (set by Start-Job): PI_PWSH_L_EXE, PI_PWSH_L_ARGS (JSON
+// array), PI_PWSH_L_WD, PI_PWSH_L_PID. The child inherits THIS process env
+// (= the calling pwsh session env) — full environment inheritance for jobs.
+// NOTE: no `detached: true` — on Windows that creates the child with
+// DETACHED_PROCESS (no console), and console apps like pwsh die instantly.
+// Detachment from taskkill /T comes from THIS process exiting immediately
+// after the spawn, which breaks the ParentProcessId chain.
+const { spawn } = require("node:child_process");
+const fs = require("node:fs");
+const child = spawn(process.env.PI_PWSH_L_EXE, JSON.parse(process.env.PI_PWSH_L_ARGS), {
+	cwd: process.env.PI_PWSH_L_WD,
+	windowsHide: true,
+	stdio: "ignore",
+});
+fs.writeFileSync(process.env.PI_PWSH_L_PID, String(child.pid), "ascii");
+child.unref();
+'@
+
+# ---------------------------------------------------------------------------
 # Internal helpers (PiPwsh* prefix — not part of the public surface).
 # ---------------------------------------------------------------------------
 
@@ -198,10 +243,9 @@ function Start-Job {
 
 		[string]$WorkingDirectory,
 
-		# Explicit env injection: WMI-created processes get the registry (logon)
-		# environment, not this session's. PATH is re-injected automatically;
-		# use -Environment for anything else. Values are stored in the job's
-		# wrap script under %TEMP%\pi-pwsh-jobs until Remove-Job.
+		# Explicit env overrides/additions, written into the job's wrap script.
+		# (The calling session's environment itself is inherited in memory via
+		# the launcher — no need to re-inject PATH & friends.)
 		[hashtable]$Environment
 	)
 
@@ -252,14 +296,14 @@ function Start-Job {
 		$exitFile  = Join-Path $jobDir "$Name.exit"
 		Remove-Item -LiteralPath $exitFile, $logFile -Force -ErrorAction SilentlyContinue
 
-		# Env re-injection: PATH from this session (fnm/scoop/shim setups modify
-		# it per-session) plus anything passed via -Environment (wins on conflict).
-		$envMap = @{ PATH = $env:PATH }
-		if ($Environment) { foreach ($k in $Environment.Keys) { $envMap[$k] = [string]$Environment[$k] } }
+		# -Environment: explicit overrides/additions. The session environment
+		# itself is inherited via the launcher; these win on conflict.
 		$envLines = ''
-		foreach ($k in $envMap.Keys) {
-			if ($k -notmatch '^[A-Za-z_][A-Za-z0-9_]*$') { throw "Start-Job: invalid environment variable name '$k'. Use letters, digits and '_'." }
-			$envLines += "`$env:$k = $(PiPwshQuote ([string]$envMap[$k]))`n"
+		if ($Environment) {
+			foreach ($k in $Environment.Keys) {
+				if ($k -notmatch '^[A-Za-z_][A-Za-z0-9_]*$') { throw "Start-Job: invalid environment variable name '$k'. Use letters, digits and '_'." }
+				$envLines += "`$env:$k = $(PiPwshQuote ([string]$Environment[$k]))`n"
+			}
 		}
 
 		$utf8 = '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $OutputEncoding = [System.Text.Encoding]::UTF8;'
@@ -282,29 +326,54 @@ Set-Content -LiteralPath $(PiPwshQuote $exitFile) -Value `$ec -NoNewline
 		[System.IO.File]::WriteAllText($innerFile, $inner, [System.Text.Encoding]::UTF8)
 		[System.IO.File]::WriteAllText($wrapFile, $wrap, [System.Text.Encoding]::UTF8)
 
-		# Launch DETACHED via WMI: the new process is parented to the WMI provider
-		# host, NOT to this pwsh — so taskkill /T on this call's tree (abort/
-		# timeout of the tool call that started the job) cannot take it down.
-		# Trade-off: WMI-created processes get the registry (logon) environment,
-		# not $env: changes made in this session. Falls back to Start-Process
-		# (child of this process) if WMI is unavailable.
-		# Note: use the full pwsh path — WmiPrvSE resolves names against the
-		# SYSTEM PATH, which may not include a per-user pwsh install (scoop).
-		$pwshExe = Join-Path $PSHOME 'pwsh.exe'
-		$argLine = '"' + $pwshExe + '" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $wrapFile + '"'
+		# Launch DETACHED via double-spawn: a short-lived launcher (child of this
+		# pwsh, so it inherits the FULL session environment) spawns the job and
+		# exits immediately, recording the job PID. taskkill /T walks
+		# ParentProcessId links at kill time — the dead launcher breaks the
+		# chain, so abort/timeout of THIS call cannot kill the job.
+		# Launcher preference: Node (fast boot, passed in as PIPWSH_NODE) →
+		# pwsh launcher → direct Start-Process (child of this process — works,
+		# but abort/timeout of this call CAN kill the job).
 		$procId = 0
+		$pidFile = Join-Path $jobDir "$Name.pid"
+		Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue
+		$pwshExe = Join-Path $PSHOME 'pwsh.exe'
 		try {
-			$startupInfo = New-CimInstance -CimClass (Get-CimClass -ClassName Win32_ProcessStartup) -ClientOnly
-			$startupInfo.ShowWindow = 0 # SW_HIDE
-			$created = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
-				CommandLine               = $argLine
-				CurrentDirectory          = $wd
-				ProcessStartupInformation = $startupInfo
+			if ($env:PIPWSH_NODE -and (Test-Path -LiteralPath $env:PIPWSH_NODE)) {
+				$env:PI_PWSH_L_EXE = $pwshExe
+				$env:PI_PWSH_L_ARGS = (@('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $wrapFile) | ConvertTo-Json -Compress)
+				$env:PI_PWSH_L_WD = $wd
+				$env:PI_PWSH_L_PID = $pidFile
+				# Start-Process (ShellExecuteEx) is LOAD-BEARING here: it starts the
+				# launcher WITHOUT inheriting handles from this process. A plain
+				# `& node ...` child inherits EVERY inheritable handle — including the
+				# write end of this call's stdout pipe — and libuv's spawn passes all
+				# of node's inheritable handles on to the detached job (Windows handle
+				# inheritance is all-or-nothing). The job would then keep that pipe
+				# open for its whole lifetime, so any caller reading our stdout (pipe
+				# consumers, the pwsh tool's close-event) blocks until the JOB exits —
+				# even after the job's starting call was killed on timeout/abort.
+				# (Redirecting the launcher to $null does NOT help: PowerShell still
+				# captures native output through a pipe, and the leaked handle is this
+				# call's own stdout pipe, not the launcher's.)
+				try {
+					$launcher = Start-Process -FilePath $env:PIPWSH_NODE -ArgumentList ('"' + $script:PiPwshLauncherNode + '"') -WindowStyle Hidden -PassThru
+					if (-not $launcher.WaitForExit(5000)) { try { $launcher.Kill() } catch { } }
+				} finally {
+					Remove-Item Env:PI_PWSH_L_EXE, Env:PI_PWSH_L_ARGS, Env:PI_PWSH_L_WD, Env:PI_PWSH_L_PID -ErrorAction SilentlyContinue
+				}
+			} else {
+				& $pwshExe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $script:PiPwshLauncher -WrapFile $wrapFile -PidFile $pidFile -WorkingDirectory $wd *> $null
 			}
-			if ($created.ReturnValue -eq 0) { $procId = [int]$created.ProcessId }
+			if (Test-Path -LiteralPath $pidFile) {
+				$null = [int]::TryParse(((Get-Content -LiteralPath $pidFile -Raw).Trim()), [ref]$procId)
+			}
 		} catch { }
+		Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue
 		if ($procId -le 0) {
-			$p = Start-Process -FilePath 'pwsh' -ArgumentList @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $wrapFile + '"')) -WorkingDirectory $wd -WindowStyle Hidden -PassThru
+			# Fallback: direct child of this process — abort/timeout of this call
+			# CAN kill the job, but the job itself works.
+			$p = Start-Process -FilePath $pwshExe -ArgumentList @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $wrapFile + '"')) -WorkingDirectory $wd -WindowStyle Hidden -PassThru
 			$procId = $p.Id
 		}
 
@@ -473,7 +542,7 @@ function Remove-Job {
 				}
 				PiPwshKillTree ([int]$m.Pid)
 			}
-			foreach ($suffix in '.meta.json', '.cmd.ps1', '.wrap.ps1', '.log', '.exit') {
+			foreach ($suffix in '.meta.json', '.cmd.ps1', '.wrap.ps1', '.log', '.exit', '.pid') {
 				Remove-Item -LiteralPath (Join-Path $script:PiPwshJobDir ($m.Name + $suffix)) -Force -ErrorAction SilentlyContinue
 			}
 			PiPwshToObject $m
@@ -503,10 +572,11 @@ function Get-JobHelp {
 pi-pwsh background jobs — full reference
 =========================================
 
-WHY: every pwsh tool call is a fresh pwsh process. Native PowerShell jobs
-(Start-Job, the & background operator) die when that process exits. The job
-cmdlets in this shell are OVERRIDDEN with implementations backed by real
-detached OS processes that persist across pwsh calls.
+Every pwsh tool call is a fresh pwsh process. The job cmdlets in this shell
+(Start-Job, Get-Job, Receive-Job, Stop-Job, Remove-Job, Wait-Job) are
+OVERRIDDEN so jobs run as detached OS processes that persist across calls —
+including across /reload and pi restarts. Do not assume native PowerShell
+job semantics.
 
 QUICK START
 -----------
@@ -527,15 +597,13 @@ Start-Job -FilePath <script.ps1>    [-Name <name>] [-WorkingDirectory <dir>] [-E
   - Appending ` &` to any single-pipeline command is rewritten to Start-Job
     automatically (bash-style). Multi-statement scripts with `&` in the middle
     are NOT intercepted.
-  - Jobs are launched DETACHED via WMI (Win32_Process.Create), not as children
-    of the calling pwsh: aborting or timing out the pwsh call that started a
-    job does NOT kill it.
+  - A job keeps running even if the pwsh call that started it is aborted or
+    times out — Stop-Job is the only way to kill it.
   - Jobs are separate OS processes: they do NOT share variables, functions, or
-    session state with your pwsh call. Environment: jobs get the registry
-    (logon) environment, EXCEPT PATH (re-injected from your session) and any
-    variables passed via -Environment. Values land in the job's wrap script
-    under %TEMP%\pi-pwsh-jobs until Remove-Job — do not inject secrets you
-    would not put in the command itself.
+    session state with your pwsh call — but they DO inherit the session's
+    full environment (PATH, proxies, VIRTUAL_ENV, ...). -Environment @{...}
+    overrides or adds variables; do not pass secrets you would not put in
+    the command itself.
   - All output streams (stdout, stderr, verbose, warnings, native output) are
     merged into one log: $env:TEMP\pi-pwsh-jobs\<name>.log
 
@@ -582,11 +650,5 @@ UNSUPPORTED
 -----------
 Suspend-Job / Resume-Job / Debug-Job — these throw with guidance (jobs are
 detached OS processes; interactive debugging is not available).
-
-STORAGE LAYOUT ($env:TEMP\pi-pwsh-jobs\)
-----------------------------------------
-  <name>.meta.json  registry entry  |  <name>.log   merged output
-  <name>.exit       exit code       |  <name>.cmd.ps1 / .wrap.ps1  scripts
-The registry survives pi restarts and /reload; Remove-Job cleans up.
 '@
 }
