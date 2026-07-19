@@ -93,7 +93,7 @@ QUOTING: PowerShell quoting differs from bash. Single quotes are literal strings
 
 ENVIRONMENT VARIABLES: Use PowerShell syntax: $env:NODE_ENV = 'production'; npm start (NOT bash-style NODE_ENV=production npm start).
 
-BACKGROUND JOBS: Never run long-lived commands (dev servers, watchers, builds) in the foreground — they block your work. Run them as detached background jobs instead: append \` &\` (\`npm run dev &\`) or use Start-Job (\`Start-Job -ScriptBlock { npm run dev } -Name dev\`). Jobs are real OS processes that persist across pwsh calls. Manage them with Get-Job / Receive-Job / Stop-Job / Remove-Job / Wait-Job (pipeline support, e.g. \`Get-Job | Stop-Job\`). Jobs don't share variables with your pwsh call. Run Get-JobHelp for usage and examples.`;
+BACKGROUND JOBS: Never run long-lived commands (dev servers, watchers, builds) in the foreground — they block your work. Run them as detached background jobs instead: append \` &\` (\`npm run dev &\`) or use Start-Job (\`Start-Job -ScriptBlock { npm run dev } -Name dev\`). Note: the standard PowerShell job cmdlets (Start-Job, Get-Job, etc.) are replaced by this extension with real detached OS processes — jobs survive across pwsh calls; do not assume default PowerShell semantics. Manage them with Get-Job / Receive-Job / Stop-Job / Remove-Job / Wait-Job (pipeline support, e.g. \`Get-Job | Stop-Job\`). Jobs don't share variables with your pwsh call. Run Get-JobHelp for usage and examples.`;
 
 export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
