@@ -1,5 +1,6 @@
 /**
- * pi-pwsh — Replace pi's built-in `bash` tool with PowerShell 7 (`pwsh`).
+ * pi-pwsh — Replace pi's built-in `bash` tool with PowerShell 7 (`pwsh`),
+ * including background jobs that actually survive across tool calls.
  *
  * Why: Windows has no reliable bash. A tool named "bash" also primes the model
  * to emit POSIX syntax. This extension disables `bash` and registers a `pwsh`
@@ -7,102 +8,34 @@
  * files for full output, non-zero exit codes as tool errors, streaming preview,
  * built-in renderer) with only the spawn layer swapped to pwsh.
  *
+ * Background jobs: every pwsh call is a fresh pwsh process, so native
+ * PowerShell jobs (Start-Job, trailing `&`) die when the call ends. Each call
+ * dot-sources prelude.ps1, which overrides the job cmdlets (Start-Job, Get-Job,
+ * Receive-Job, Stop-Job, Remove-Job, Wait-Job) with implementations backed by
+ * real detached OS processes (file-based registry in %TEMP%\pi-pwsh-jobs).
+ * A trailing ` &` is rewritten to Start-Job via PowerShell's own parser
+ * (background.ts), so bash-style `npm run dev &` works as expected.
+ *
  * Requires PowerShell 7+ (`pwsh` on PATH). No fallback: if pwsh is missing the
  * extension reports an error and leaves the built-in bash tool untouched.
  */
 
 import { spawn } from "child_process";
+import { dirname, join } from "path";
+import { fileURLToPath } from "url";
 import {
 	createBashToolDefinition,
 	type BashOperations,
 	type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
+import { spawnAndStream, UTF8_PREFIX } from "./spawn.ts";
+import { rewriteBackgroundOperator } from "./background.ts";
 
-/** Force UTF-8 so non-ASCII output (e.g. CJK) is not mangled by the legacy OEM codepage. */
-const UTF8_PREFIX =
-	"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $OutputEncoding = [System.Text.Encoding]::UTF8; ";
+const PRELUDE_PATH = join(dirname(fileURLToPath(import.meta.url)), "prelude.ps1");
 
-const MAX_TIMEOUT_MS = 2_147_483_647;
-
-/** Kill the whole process tree on Windows (child.kill() alone orphans children like npm). */
-function killTree(pid: number | undefined): void {
-	if (!pid) return;
-	try {
-		spawn("taskkill", ["/pid", String(pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
-	} catch {
-		// Best effort.
-	}
-}
-
-interface ExecOptions {
-	onData: (data: Buffer) => void;
-	signal?: AbortSignal;
-	timeout?: number;
-	env?: NodeJS.ProcessEnv;
-}
-
-/** Spawn a process and stream combined stdout/stderr into onData, following bash.ts error conventions. */
-function spawnAndStream(
-	exe: string,
-	args: string[],
-	cwd: string,
-	{ onData, signal, timeout, env }: ExecOptions,
-): Promise<{ exitCode: number | null; stderrText: string }> {
-	return new Promise((resolve, reject) => {
-		if (signal?.aborted) {
-			reject(new Error("aborted"));
-			return;
-		}
-		const timeoutMs =
-			timeout === undefined ? undefined : Math.min(Math.max(timeout, 0.001), MAX_TIMEOUT_MS / 1000) * 1000;
-
-		const child = spawn(exe, args, {
-			cwd,
-			env: env ?? process.env,
-			stdio: ["ignore", "pipe", "pipe"],
-			windowsHide: true,
-		});
-
-		let stderrText = "";
-		let timedOut = false;
-		let timeoutHandle: NodeJS.Timeout | undefined;
-
-		const onAbort = () => killTree(child.pid);
-		if (signal) {
-			if (signal.aborted) onAbort();
-			else signal.addEventListener("abort", onAbort, { once: true });
-		}
-		if (timeoutMs !== undefined) {
-			timeoutHandle = setTimeout(() => {
-				timedOut = true;
-				killTree(child.pid);
-			}, timeoutMs);
-		}
-
-		child.stdout?.on("data", onData);
-		child.stderr?.on("data", (data: Buffer) => {
-			stderrText += data.toString("utf-8");
-			onData(data);
-		});
-
-		child.on("error", (err) => {
-			if (timeoutHandle) clearTimeout(timeoutHandle);
-			signal?.removeEventListener("abort", onAbort);
-			reject(err);
-		});
-
-		child.on("close", (code) => {
-			if (timeoutHandle) clearTimeout(timeoutHandle);
-			signal?.removeEventListener("abort", onAbort);
-			if (signal?.aborted) {
-				reject(new Error("aborted"));
-			} else if (timedOut) {
-				reject(new Error(`timeout:${timeout}`));
-			} else {
-				resolve({ exitCode: code, stderrText });
-			}
-		});
-	});
+/** Single-quote a string for embedding in PowerShell source. */
+function psQuote(value: string): string {
+	return `'${value.replace(/'/g, "''")}'`;
 }
 
 /** npm/yarn/pnpm etc. are .cmd batch files on Windows; pwsh cannot spawn them directly. */
@@ -117,14 +50,11 @@ function isBatchFileSpawnError(stderrText: string): boolean {
 function createPwshOperations(): BashOperations {
 	return {
 		exec: async (command, cwd, options) => {
-			const pwshArgs = [
-				"-NoProfile",
-				"-NonInteractive",
-				"-ExecutionPolicy",
-				"Bypass",
-				"-Command",
-				UTF8_PREFIX + command,
-			];
+			// bash-style `cmd &` → Start-Job (detached), via the PowerShell parser.
+			const rewritten = await rewriteBackgroundOperator(command, cwd, options.signal);
+			// Dot-source the prelude (job cmdlet overrides), then the command.
+			const injected = `. ${psQuote(PRELUDE_PATH)}; ${UTF8_PREFIX}${rewritten}`;
+			const pwshArgs = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", injected];
 			const first = await spawnAndStream("pwsh", pwshArgs, cwd, options);
 
 			if (first.exitCode !== 0 && isBatchFileSpawnError(first.stderrText) && !options.signal?.aborted) {
@@ -163,7 +93,7 @@ QUOTING: PowerShell quoting differs from bash. Single quotes are literal strings
 
 ENVIRONMENT VARIABLES: Use PowerShell syntax: $env:NODE_ENV = 'production'; npm start (NOT bash-style NODE_ENV=production npm start).
 
-BATCH FILES: npm, yarn, pnpm are .cmd batch files on Windows. If a command fails with "not a valid Win32 application", the tool automatically retries with cmd /c. You can also wrap explicitly: cmd /c "npm run dev".`;
+BACKGROUND JOBS: Never run long-lived commands (dev servers, watchers, builds) in the foreground — they block your work. Run them as detached background jobs instead: append \` &\` (\`npm run dev &\`) or use Start-Job (\`Start-Job -ScriptBlock { npm run dev } -Name dev\`). Jobs are real OS processes that persist across pwsh calls. Manage them with Get-Job / Receive-Job / Stop-Job / Remove-Job / Wait-Job (pipeline support, e.g. \`Get-Job | Stop-Job\`). Jobs don't share variables with your pwsh call. Run Get-JobHelp for usage and examples.`;
 
 export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
@@ -184,8 +114,9 @@ export default function (pi: ExtensionAPI) {
 			name: "pwsh",
 			label: "pwsh",
 			description: DESCRIPTION,
-			promptSnippet: "Execute PowerShell 7 (pwsh) commands",
+			promptSnippet: "Execute PowerShell 7 (pwsh) commands; supports detached background jobs (Start-Job / trailing &)",
 			promptGuidelines: [
+				"For long-running commands (dev servers, watchers, builds), run them as pwsh background jobs — append ` &` or use Start-Job — instead of in the pwsh foreground; poll with Get-Job/Receive-Job and stop with Stop-Job.",
 				"Use pwsh for file operations and shell tasks; write PowerShell syntax, not bash/POSIX syntax.",
 				"Unix tools (grep, find, sed, awk, etc.) are not available on Windows. Prefer modern cross-platform alternatives when installed (e.g. rg instead of grep, fd instead of find); otherwise use native PowerShell cmdlets (e.g. Select-String, Get-ChildItem).",
 			],

@@ -18,6 +18,16 @@ This extension disables `bash` and registers a `pwsh` tool instead.
 - Kills the whole process tree (`taskkill /T /F`) on timeout or abort — no orphaned `npm run dev` processes.
 - No default timeout; the model can pass `timeout` (seconds) per call.
 
+## Background jobs
+
+Every `pwsh` tool call spawns a fresh pwsh process, so native PowerShell jobs (`Start-Job`, the `&` background operator) **die when the tool call ends**. This extension fixes that from inside the shell — no extra tools:
+
+- Every call dot-sources `src/prelude.ps1`, which **overrides the job cmdlets** (`Start-Job`, `Get-Job`, `Receive-Job`, `Stop-Job`, `Remove-Job`, `Wait-Job`) with implementations backed by real detached OS processes. Pipeline forms work: `Get-Job | Stop-Job`, `Start-Job { npm run build } -Name build | Wait-Job | Receive-Job`.
+- A trailing ` &` (`npm run dev &`) is rewritten to `Start-Job` before execution, using PowerShell's own parser (`src/background.ts`) — strings, comments, the `& { }` call operator and `&&` are never mistaken for it. Only single-pipeline commands are rewritten; anything else runs as-is.
+- Job state lives in `%TEMP%\pi-pwsh-jobs\` (one `.meta.json` + log/exit/script files per job), so it **survives `/reload` and pi restarts** and is inspectable by hand.
+- `Receive-Job` consumes output like the native cmdlet (each read returns what arrived since the last one; `-Keep` re-reads, `-Tail N` peeks). Exit codes are captured (`Get-Job` shows `Completed`/`Failed` + `ExitCode`); `Stop-Job` kills the **whole process tree** (`taskkill /T /F`).
+- `Suspend-Job`/`Resume-Job`/`Debug-Job` throw actionable guidance. `Get-JobHelp` prints the full reference in the shell.
+
 ## Requirements
 
 - PowerShell 7+ (`pwsh` on `PATH`). There is **no fallback**: if `pwsh` is not found, the extension shows an error notification and leaves the built-in `bash` tool active.
@@ -59,6 +69,15 @@ Run `npm install` once in this directory, then `/reload` in pi.
 ```powershell
 npm install
 npm run typecheck
+```
+
+Tests:
+
+```powershell
+# Job prelude end-to-end (each case is a fresh pwsh process, like a real tool call)
+pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-jobs.ps1
+# Trailing-& interception (PowerShell parser based)
+node scripts/smoke-background.mjs
 ```
 
 ## License
