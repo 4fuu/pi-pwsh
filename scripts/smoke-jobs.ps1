@@ -47,6 +47,10 @@ $r = Invoke-Pwsh "Wait-Job -Name e7 | Out-Null; Get-Job -Name e7 | Select-Object
 Assert 'failed-7' ($r.Output -match 'Failed' -and $r.Output -match '7') $r.Output
 $r = Invoke-Pwsh "Receive-Job -Name e7"
 Assert 'failed-7-keeps-log' ($r.Output -match 'x') $r.Output
+# Cmdlet-only failure (no native call): must be Failed, not Completed/0.
+Invoke-Pwsh "Start-Job { Get-Item C:\definitely-missing-pipwsh } -Name ecmdlet" | Out-Null
+$r = Invoke-Pwsh "Wait-Job -Name ecmdlet | Out-Null; Get-Job -Name ecmdlet | Select-Object State, ExitCode | Out-String"
+Assert 'failed-cmdlet' ($r.Output -match 'Failed' -and $r.Output -match '1') $r.Output
 
 # --- 3. duplicate name, CJK, Get-Job filters ---------------------------------
 Invoke-Pwsh "Start-Job { Write-Output 'keep-me-content' } -Name dup" | Out-Null
@@ -70,7 +74,9 @@ Assert 'stop-job' ($r.Output -match 'Stopped') $r.Output
 $r = Invoke-Pwsh "Get-Job -Name sleeper"
 Assert 'stop-persists' ($r.Output -match 'Stopped') $r.Output
 # The wrapper's whole tree must be dead: no leftover pwsh running our cmd file.
-$sleeperAlive = Get-Process pwsh -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -match 'sleeper' }
+# (Jobs are launched detached via WMI, so check by command line, not parentage.)
+$sleeperAlive = Get-CimInstance Win32_Process -Filter "Name = 'pwsh.exe'" |
+	Where-Object { $_.CommandLine -match 'sleeper' }
 Assert 'tree-killed' ($null -eq $sleeperAlive) ("alive: " + ($sleeperAlive | Out-String))
 
 # --- 5. remove: running needs -Force; then clean everything -------------------
@@ -84,6 +90,21 @@ $r = Invoke-Pwsh "Get-Job | Remove-Job -Force | Out-Null; Get-Job"
 Assert 'remove-all' ($r.Output.Trim() -eq '') $r.Output
 $leftover = Get-ChildItem $jobDir -Filter '*.meta.json' -ErrorAction SilentlyContinue
 Assert 'no-leftover-files' ($null -eq $leftover) ($leftover | Out-String)
+
+# --- 5b. env injection: auto PATH + explicit -Environment ---------------------
+# Session PATH changes (fnm/scoop shims) must be visible inside the job.
+Invoke-Pwsh "`$env:PATH = 'C:\pipwsh-mark;' + `$env:PATH; Start-Job { `$env:PATH } -Name envpath" | Out-Null
+$r = Invoke-Pwsh "Wait-Job -Name envpath | Out-Null; Receive-Job -Name envpath"
+Assert 'env-path-auto-injected' ($r.Output -match 'pipwsh-mark') $r.Output
+# Explicit variables land in the job; session values are NOT inherited otherwise.
+Invoke-Pwsh "`$env:PI_PWSH_MARK = 'session-only'; Start-Job { `$env:PI_PWSH_MARK } -Name envexp -Environment @{ PI_PWSH_MARK = 'mark-123' }" | Out-Null
+$r = Invoke-Pwsh "Wait-Job -Name envexp | Out-Null; Receive-Job -Name envexp"
+Assert 'env-explicit' ($r.Output -match 'mark-123') $r.Output
+Invoke-Pwsh "Start-Job { `$env:PI_PWSH_NOINJECT } -Name envnone" | Out-Null
+$r = Invoke-Pwsh "Wait-Job -Name envnone | Out-Null; Receive-Job -Name envnone"
+Assert 'env-not-inherited' ($r.Output.Trim() -eq '') $r.Output
+$r = Invoke-Pwsh "Start-Job { 1 } -Name envbad -Environment @{ 'BAD-NAME' = 'x' }"
+Assert 'env-invalid-name' ($r.Output -match 'invalid environment variable name') $r.Output
 
 # --- 6. stubs, FilePath, Get-JobHelp ------------------------------------------
 $r = Invoke-Pwsh "Suspend-Job"

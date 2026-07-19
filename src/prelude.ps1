@@ -144,15 +144,23 @@ function PiPwshResolve($jobs, $names, $ids) {
 }
 
 function PiPwshReadLogText($meta, [long]$fromOffset) {
-	if (-not (Test-Path -LiteralPath $meta.LogFile)) { return '' }
+	# Returns @{ Text; Position } — Position is the stream offset actually read
+	# up to (NOT the file length afterwards), so bytes appended concurrently by
+	# a running job are picked up by the next read instead of being skipped.
+	$result = @{ Text = ''; Position = $fromOffset }
+	if (-not (Test-Path -LiteralPath $meta.LogFile)) { return $result }
 	try {
 		$fs = [System.IO.FileStream]::new($meta.LogFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
 		try {
 			if ($fromOffset -gt 0) { $null = $fs.Seek($fromOffset, [System.IO.SeekOrigin]::Begin) }
 			$sr = [System.IO.StreamReader]::new($fs, [System.Text.Encoding]::UTF8)
-			try { return $sr.ReadToEnd() } finally { $sr.Dispose() }
+			try {
+				$result.Text = $sr.ReadToEnd()
+				$result.Position = $fs.Position
+			} finally { $sr.Dispose() }
 		} finally { $fs.Dispose() }
-	} catch { return '' }
+	} catch { }
+	return $result
 }
 
 function PiPwshWait($metas, [int]$timeoutSec) {
@@ -188,7 +196,13 @@ function Start-Job {
 		[Parameter(Position = 1)]
 		[string]$Name,
 
-		[string]$WorkingDirectory
+		[string]$WorkingDirectory,
+
+		# Explicit env injection: WMI-created processes get the registry (logon)
+		# environment, not this session's. PATH is re-injected automatically;
+		# use -Environment for anything else. Values are stored in the job's
+		# wrap script under %TEMP%\pi-pwsh-jobs until Remove-Job.
+		[hashtable]$Environment
 	)
 
 	$jobDir = $script:PiPwshJobDir
@@ -211,7 +225,13 @@ function Start-Job {
 	$mutex = [System.Threading.Mutex]::new($false, 'pi-pwsh-jobs-lock')
 	$locked = $false
 	try {
-		$locked = $mutex.WaitOne(10000)
+		try {
+			$locked = $mutex.WaitOne(10000)
+		} catch [System.Threading.AbandonedMutexException] {
+			# Previous owner was killed while holding the lock (e.g. taskkill on
+			# abort/timeout). The mutex is now owned by THIS wait despite the throw.
+			$locked = $true
+		}
 		if (-not $locked) { throw 'Start-Job: timed out acquiring the job registry lock.' }
 
 		$all = @(PiPwshAllMeta)
@@ -232,11 +252,24 @@ function Start-Job {
 		$exitFile  = Join-Path $jobDir "$Name.exit"
 		Remove-Item -LiteralPath $exitFile, $logFile -Force -ErrorAction SilentlyContinue
 
+		# Env re-injection: PATH from this session (fnm/scoop/shim setups modify
+		# it per-session) plus anything passed via -Environment (wins on conflict).
+		$envMap = @{ PATH = $env:PATH }
+		if ($Environment) { foreach ($k in $Environment.Keys) { $envMap[$k] = [string]$Environment[$k] } }
+		$envLines = ''
+		foreach ($k in $envMap.Keys) {
+			if ($k -notmatch '^[A-Za-z_][A-Za-z0-9_]*$') { throw "Start-Job: invalid environment variable name '$k'. Use letters, digits and '_'." }
+			$envLines += "`$env:$k = $(PiPwshQuote ([string]$envMap[$k]))`n"
+		}
+
 		$utf8 = '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $OutputEncoding = [System.Text.Encoding]::UTF8;'
-		$inner = "$utf8`n$command`nexit `$LASTEXITCODE`n"
+		# Exit-code epilogue: preserve the real native exit code (pwsh flattens it
+		# to 0/1 otherwise); $? covers cmdlet-only failures. Mirrors the epilogue
+		# the pwsh tool appends to foreground commands (src/spawn.ts).
+		$inner = "$utf8`n$command`n; `$__pipwsh_ok = `$?; if (`$null -ne `$global:LASTEXITCODE) { exit `$global:LASTEXITCODE } else { exit (`$__pipwsh_ok ? 0 : 1) }`n"
 		$wrap = @"
 $utf8
-`$ec = 1
+$envLines`$ec = 1
 try {
 	Set-Location -LiteralPath $(PiPwshQuote $wd) -ErrorAction Stop
 	pwsh -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $(PiPwshQuote $innerFile) *> $(PiPwshQuote $logFile)
@@ -249,13 +282,36 @@ Set-Content -LiteralPath $(PiPwshQuote $exitFile) -Value `$ec -NoNewline
 		[System.IO.File]::WriteAllText($innerFile, $inner, [System.Text.Encoding]::UTF8)
 		[System.IO.File]::WriteAllText($wrapFile, $wrap, [System.Text.Encoding]::UTF8)
 
-		$argList = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $wrapFile + '"'))
-		$p = Start-Process -FilePath 'pwsh' -ArgumentList $argList -WindowStyle Hidden -PassThru
+		# Launch DETACHED via WMI: the new process is parented to the WMI provider
+		# host, NOT to this pwsh — so taskkill /T on this call's tree (abort/
+		# timeout of the tool call that started the job) cannot take it down.
+		# Trade-off: WMI-created processes get the registry (logon) environment,
+		# not $env: changes made in this session. Falls back to Start-Process
+		# (child of this process) if WMI is unavailable.
+		# Note: use the full pwsh path — WmiPrvSE resolves names against the
+		# SYSTEM PATH, which may not include a per-user pwsh install (scoop).
+		$pwshExe = Join-Path $PSHOME 'pwsh.exe'
+		$argLine = '"' + $pwshExe + '" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $wrapFile + '"'
+		$procId = 0
+		try {
+			$startupInfo = New-CimInstance -CimClass (Get-CimClass -ClassName Win32_ProcessStartup) -ClientOnly
+			$startupInfo.ShowWindow = 0 # SW_HIDE
+			$created = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
+				CommandLine               = $argLine
+				CurrentDirectory          = $wd
+				ProcessStartupInformation = $startupInfo
+			}
+			if ($created.ReturnValue -eq 0) { $procId = [int]$created.ProcessId }
+		} catch { }
+		if ($procId -le 0) {
+			$p = Start-Process -FilePath 'pwsh' -ArgumentList @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $wrapFile + '"')) -WorkingDirectory $wd -WindowStyle Hidden -PassThru
+			$procId = $p.Id
+		}
 
 		$meta = [ordered]@{
 			Id               = $id
 			Name             = $Name
-			Pid              = $p.Id
+			Pid              = $procId
 			Command          = $command
 			WorkingDirectory = $wd
 			LogFile          = $logFile
@@ -324,7 +380,7 @@ function Receive-Job {
 
 			if ($Tail -gt 0) {
 				# Peek at the last N lines without touching the read offset.
-				$all = (PiPwshReadLogText $m 0).TrimEnd()
+				$all = (PiPwshReadLogText $m 0).Text.TrimEnd()
 				if (-not $all) { continue }
 				$lines = $all -split "\r?\n"
 				$skip = [Math]::Max(0, $lines.Count - $Tail)
@@ -332,15 +388,13 @@ function Receive-Job {
 				continue
 			}
 
-			$chunk = PiPwshReadLogText $m ([long]$m.ReadOffset)
+			$r = PiPwshReadLogText $m ([long]$m.ReadOffset)
 			if (-not $Keep) {
-				$newLen = 0
-				try { if (Test-Path -LiteralPath $m.LogFile) { $newLen = (Get-Item -LiteralPath $m.LogFile).Length } } catch { }
-				$m.ReadOffset = $newLen
+				$m.ReadOffset = $r.Position
 				PiPwshWriteMeta $m
 			}
-			if ($chunk) {
-				$chunk.TrimEnd() -split "\r?\n"
+			if ($r.Text) {
+				$r.Text.TrimEnd() -split "\r?\n"
 			}
 		}
 	}
@@ -466,16 +520,22 @@ QUICK START
 
 STARTING JOBS
 -------------
-Start-Job -ScriptBlock <scriptblock> [-Name <name>] [-WorkingDirectory <dir>]
-Start-Job -FilePath <script.ps1>    [-Name <name>] [-WorkingDirectory <dir>]
+Start-Job -ScriptBlock <scriptblock> [-Name <name>] [-WorkingDirectory <dir>] [-Environment @{NAME='value'}]
+Start-Job -FilePath <script.ps1>    [-Name <name>] [-WorkingDirectory <dir>] [-Environment @{NAME='value'}]
   - Returns immediately with a job object. Names are auto-allocated (Job1, Job2, ...)
     when -Name is omitted; reuse of an existing name is an error.
   - Appending ` &` to any single-pipeline command is rewritten to Start-Job
     automatically (bash-style). Multi-statement scripts with `&` in the middle
     are NOT intercepted.
+  - Jobs are launched DETACHED via WMI (Win32_Process.Create), not as children
+    of the calling pwsh: aborting or timing out the pwsh call that started a
+    job does NOT kill it.
   - Jobs are separate OS processes: they do NOT share variables, functions, or
-    session state with your pwsh call. Pass data via files or embed it in the
-    command.
+    session state with your pwsh call. Environment: jobs get the registry
+    (logon) environment, EXCEPT PATH (re-injected from your session) and any
+    variables passed via -Environment. Values land in the job's wrap script
+    under %TEMP%\pi-pwsh-jobs until Remove-Job — do not inject secrets you
+    would not put in the command itself.
   - All output streams (stdout, stderr, verbose, warnings, native output) are
     merged into one log: $env:TEMP\pi-pwsh-jobs\<name>.log
 

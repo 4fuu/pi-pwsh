@@ -28,7 +28,7 @@ import {
 	type BashOperations,
 	type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
-import { spawnAndStream, UTF8_PREFIX } from "./spawn.ts";
+import { spawnAndStream, EXIT_EPILOGUE, UTF8_PREFIX } from "./spawn.ts";
 import { rewriteBackgroundOperator } from "./background.ts";
 
 const PRELUDE_PATH = join(dirname(fileURLToPath(import.meta.url)), "prelude.ps1");
@@ -52,13 +52,25 @@ function createPwshOperations(): BashOperations {
 		exec: async (command, cwd, options) => {
 			// bash-style `cmd &` → Start-Job (detached), via the PowerShell parser.
 			const rewritten = await rewriteBackgroundOperator(command, cwd, options.signal);
-			// Dot-source the prelude (job cmdlet overrides), then the command.
-			const injected = `. ${psQuote(PRELUDE_PATH)}; ${UTF8_PREFIX}${rewritten}`;
+			// Dot-source the prelude (job cmdlet overrides), then the command, then
+			// an epilogue that preserves the real exit code (pwsh -Command would
+			// otherwise flatten native exit codes to 0/1).
+			const injected = `. ${psQuote(PRELUDE_PATH)}; ${UTF8_PREFIX}${rewritten}${EXIT_EPILOGUE}`;
 			const pwshArgs = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", injected];
 			const first = await spawnAndStream("pwsh", pwshArgs, cwd, options);
 
-			if (first.exitCode !== 0 && isBatchFileSpawnError(first.stderrText) && !options.signal?.aborted) {
-				const retry = await spawnAndStream("cmd", ["/d", "/s", "/c", command], cwd, options);
+			// Fallback for "not a valid Win32 application" (npm/yarn/pnpm are .cmd
+			// batch files on Windows). Skipped when the command was rewritten for
+			// background execution: cmd has no equivalent semantics (a trailing `&`
+			// is a command separator there) and Start-Job could not have caused it.
+			if (
+				first.exitCode !== 0 &&
+				rewritten === command &&
+				isBatchFileSpawnError(first.stderrText) &&
+				!options.signal?.aborted
+			) {
+				options.onData(Buffer.from("\n[pi-pwsh] direct spawn failed; retrying via cmd /c.\n"));
+				const retry = await spawnAndStream("cmd", ["/d", "/s", "/c", `chcp 65001>nul & ${command}`], cwd, options);
 				return { exitCode: retry.exitCode };
 			}
 			return { exitCode: first.exitCode };

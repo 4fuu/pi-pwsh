@@ -8,6 +8,21 @@ import { spawn } from "child_process";
 export const UTF8_PREFIX =
 	"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $OutputEncoding = [System.Text.Encoding]::UTF8; ";
 
+/**
+ * `pwsh -Command` flattens native exit codes to 0/1 unless the script ends
+ * with an explicit `exit` (e.g. `cmd /c exit 3` makes the process exit 1).
+ * Appending this epilogue preserves the real code: $LASTEXITCODE when a
+ * native command ran, otherwise 0/1 derived from $? (cmdlet failures).
+ * Mirrors the epilogue in the job wrapper (prelude.ps1) so foreground and
+ * background execution report exit codes identically.
+ *
+ * Starts with "\n; " — the newline detaches from a trailing line comment,
+ * and the `;` neutralizes a trailing backtick (line continuation would
+ * otherwise glue the epilogue into the last command's arguments).
+ */
+export const EXIT_EPILOGUE =
+	"\n; $__pipwsh_ok = $?; if ($null -ne $global:LASTEXITCODE) { exit $global:LASTEXITCODE } else { exit ($__pipwsh_ok ? 0 : 1) }";
+
 const MAX_TIMEOUT_MS = 2_147_483_647;
 
 /** Kill the whole process tree on Windows (child.kill() alone orphans children like npm). */

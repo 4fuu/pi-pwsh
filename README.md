@@ -14,7 +14,8 @@ This extension disables `bash` and registers a `pwsh` tool instead.
 - Registers a `pwsh` tool that **reuses pi's built-in bash tool definition** — tail truncation (last 2000 lines / 50KB), full output saved to a temp file, non-zero exit codes surfaced as tool errors, streaming preview, and the built-in renderer all come for free. Only the spawn layer is replaced.
 - Spawns `pwsh -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command <cmd>`.
 - Forces UTF-8 output encoding (non-ASCII output is not mangled by the legacy OEM codepage).
-- Auto-retries with `cmd /c` when a command fails with "not a valid Win32 application" (npm/yarn/pnpm are `.cmd` batch files on Windows).
+- Preserves real native exit codes: `pwsh -Command` would otherwise flatten them to 0/1, which breaks `rg` (1 = no match vs 2 = error) and `git diff --quiet`-style semantics. An exit-code epilogue restores them — identically for foreground commands and background jobs.
+- Auto-retries with `cmd /c` when a command fails with "not a valid Win32 application" (npm/yarn/pnpm are `.cmd` batch files on Windows). Skipped for commands rewritten to background jobs, where cmd's `&` semantics would be wrong.
 - Kills the whole process tree (`taskkill /T /F`) on timeout or abort — no orphaned `npm run dev` processes.
 - No default timeout; the model can pass `timeout` (seconds) per call.
 
@@ -23,6 +24,7 @@ This extension disables `bash` and registers a `pwsh` tool instead.
 Every `pwsh` tool call spawns a fresh pwsh process, so native PowerShell jobs (`Start-Job`, the `&` background operator) **die when the tool call ends**. This extension fixes that from inside the shell — no extra tools:
 
 - Every call dot-sources `src/prelude.ps1`, which **overrides the job cmdlets** (`Start-Job`, `Get-Job`, `Receive-Job`, `Stop-Job`, `Remove-Job`, `Wait-Job`) with implementations backed by real detached OS processes. Pipeline forms work: `Get-Job | Stop-Job`, `Start-Job { npm run build } -Name build | Wait-Job | Receive-Job`.
+- Jobs are launched **detached via WMI** (`Win32_Process.Create`), not as children of the calling pwsh — aborting or timing out the tool call that started a job does **not** kill it. Since WMI processes get the registry (logon) environment rather than the session's, `Start-Job` re-injects the current `PATH` automatically (covers `fnm use` / scoop shims) and accepts `-Environment @{ NAME = 'value' }` for anything else (stored in the job's wrap script under `%TEMP%\pi-pwsh-jobs` until `Remove-Job`).
 - A trailing ` &` (`npm run dev &`) is rewritten to `Start-Job` before execution, using PowerShell's own parser (`src/background.ts`) — strings, comments, the `& { }` call operator and `&&` are never mistaken for it. Only single-pipeline commands are rewritten; anything else runs as-is.
 - Job state lives in `%TEMP%\pi-pwsh-jobs\` (one `.meta.json` + log/exit/script files per job), so it **survives `/reload` and pi restarts** and is inspectable by hand.
 - `Receive-Job` consumes output like the native cmdlet (each read returns what arrived since the last one; `-Keep` re-reads, `-Tail N` peeks). Exit codes are captured (`Get-Job` shows `Completed`/`Failed` + `ExitCode`); `Stop-Job` kills the **whole process tree** (`taskkill /T /F`).
@@ -78,6 +80,8 @@ Tests:
 pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-jobs.ps1
 # Trailing-& interception (PowerShell parser based)
 node scripts/smoke-background.mjs
+# Foreground exit-code fidelity (native codes survive the pwsh -Command flattening)
+node scripts/smoke-exitcode.mjs
 ```
 
 ## License
