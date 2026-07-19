@@ -114,11 +114,9 @@ export default function (pi: ExtensionAPI) {
 			name: "pwsh",
 			label: "pwsh",
 			description: DESCRIPTION,
-			promptSnippet: "Execute PowerShell 7 (pwsh) commands; supports detached background jobs (Start-Job / trailing &)",
+			promptSnippet: "Execute PowerShell 7 (pwsh) commands",
 			promptGuidelines: [
-				"For long-running commands (dev servers, watchers, builds), run them as pwsh background jobs — append ` &` or use Start-Job — instead of in the pwsh foreground; poll with Get-Job/Receive-Job and stop with Stop-Job.",
-				"Use pwsh for file operations and shell tasks; write PowerShell syntax, not bash/POSIX syntax.",
-				"Unix tools (grep, find, sed, awk, etc.) are not available on Windows. Prefer modern cross-platform alternatives when installed (e.g. rg instead of grep, fd instead of find); otherwise use native PowerShell cmdlets (e.g. Select-String, Get-ChildItem).",
+				"Use pwsh for shell tasks, both foreground and background; write PowerShell syntax; prefer modern cross-platform tools (rg, fd) or native cmdlets (Select-String, Get-ChildItem) over Unix tools.",
 			],
 		});
 
