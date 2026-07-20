@@ -4,9 +4,45 @@
 
 import { spawn } from "child_process";
 
-/** Force UTF-8 so non-ASCII output (e.g. CJK) is not mangled by the legacy OEM codepage. */
+const RUNTIME_ENV_DEFAULTS: Readonly<Record<string, string>> = {
+	PYTHONIOENCODING: "utf-8",
+	PYTHONUTF8: "1",
+	PYTHONUNBUFFERED: "1",
+};
+
+function findEnvKey(env: NodeJS.ProcessEnv, name: string): string | undefined {
+	if (process.platform !== "win32") {
+		return Object.prototype.hasOwnProperty.call(env, name) ? name : undefined;
+	}
+	const normalized = name.toUpperCase();
+	return Object.keys(env).find((key) => key.toUpperCase() === normalized);
+}
+
+/**
+ * Build the environment inherited by user commands. Python defaults make its
+ * stdio/file defaults match the tool's UTF-8 transport and keep logs streaming;
+ * caller-defined values are preserved. Explicit extras always win.
+ */
+export function createRuntimeEnv(
+	extra: Readonly<Record<string, string>> = {},
+	baseEnv: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+	const env = { ...baseEnv };
+	for (const [name, value] of Object.entries(RUNTIME_ENV_DEFAULTS)) {
+		const existing = findEnvKey(env, name);
+		if (existing === undefined || env[existing] === undefined) env[name] = value;
+	}
+	for (const [name, value] of Object.entries(extra)) {
+		const existing = findEnvKey(env, name);
+		if (existing !== undefined && existing !== name) delete env[existing];
+		env[name] = value;
+	}
+	return env;
+}
+
+/** Force plain UTF-8 output without adding a BOM to native-command stdin. */
 export const UTF8_PREFIX =
-	"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $OutputEncoding = [System.Text.Encoding]::UTF8; ";
+	"[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $OutputEncoding = [System.Text.UTF8Encoding]::new($false); if ($null -ne $PSStyle) { $PSStyle.OutputRendering = 'PlainText' }; ";
 
 /**
  * `pwsh -Command` flattens native exit codes to 0/1 unless the script ends

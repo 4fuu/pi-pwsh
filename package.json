@@ -1,6 +1,6 @@
 {
   "name": "@4fu/pi-pwsh",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "Route pi's shell, directory listing, and search tasks through PowerShell 7 on Windows",
   "license": "MIT",
   "author": "4fuu",

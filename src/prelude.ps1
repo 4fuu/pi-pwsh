@@ -306,7 +306,7 @@ function Start-Job {
 			}
 		}
 
-		$utf8 = '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $OutputEncoding = [System.Text.Encoding]::UTF8;'
+		$utf8 = '[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $OutputEncoding = [System.Text.UTF8Encoding]::new($false); if ($null -ne $PSStyle) { $PSStyle.OutputRendering = "PlainText" };'
 		# Exit-code epilogue: preserve the real native exit code (pwsh flattens it
 		# to 0/1 otherwise); $? covers cmdlet-only failures. Mirrors the epilogue
 		# the pwsh tool appends to foreground commands (src/spawn.ts).

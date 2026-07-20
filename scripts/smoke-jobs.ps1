@@ -11,7 +11,7 @@ $nodeExe = (Get-Command node.exe -ErrorAction SilentlyContinue).Source
 if ($nodeExe) { $env:PIPWSH_NODE = $nodeExe }
 function Invoke-Pwsh([string]$cmd) {
     $q = "'" + ($prelude -replace "'", "''") + "'"
-    $full = ". $q; [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; `$OutputEncoding = [System.Text.Encoding]::UTF8; $cmd"
+    $full = "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(`$false); `$OutputEncoding = [System.Text.UTF8Encoding]::new(`$false); if (`$null -ne `$PSStyle) { `$PSStyle.OutputRendering = 'PlainText' }; . $q; $cmd"
     $out = pwsh -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $full 2>&1 | Out-String
     return @{ Output = $out; ExitCode = $LASTEXITCODE }
 }

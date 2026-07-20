@@ -14,7 +14,8 @@ This extension disables `bash`, `ls`, `find`, and `grep`, then registers a `pwsh
 - Registers a `pwsh` tool that **reuses pi's built-in bash tool definition** — tail truncation (last 2000 lines / 50KB), full output saved to a temp file, non-zero exit codes surfaced as tool errors, streaming preview, and the built-in renderer all come for free. Only the spawn layer is replaced.
 - Disables pi's built-in `ls`, `find`, and `grep` tools so filesystem discovery and search are routed through `pwsh`; prompt guidance prefers available cross-platform tools such as `rg` and `fd` and bounds native recursive cmdlets.
 - Spawns `pwsh -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command <cmd>`.
-- Forces UTF-8 output encoding (non-ASCII output is not mangled by the legacy OEM codepage).
+- Forces plain UTF-8 output without a BOM (non-ASCII output is not mangled, PowerShell formatting does not leak ANSI escapes, and piped native-command input is not prefixed with `EF BB BF`).
+- Defaults Python subprocesses to `PYTHONIOENCODING=utf-8`, `PYTHONUTF8=1`, and `PYTHONUNBUFFERED=1` so stdio and implicit text-file reads use UTF-8 and long-running logs stream promptly. Existing environment values are respected, and the defaults are scoped to processes launched by the tool.
 - Preserves real native exit codes: `pwsh -Command` would otherwise flatten them to 0/1, which breaks `rg` (1 = no match vs 2 = error) and `git diff --quiet`-style semantics. An exit-code epilogue restores them — identically for foreground commands and background jobs.
 - Auto-retries with `cmd /c` when a command fails with "not a valid Win32 application" (npm/yarn/pnpm are `.cmd` batch files on Windows). Skipped for commands rewritten to background jobs, where cmd's `&` semantics would be wrong.
 - Kills the whole process tree (`taskkill /T /F`) on timeout or abort — no orphaned `npm run dev` processes.
@@ -78,6 +79,8 @@ npm run typecheck
 Tests:
 
 ```powershell
+# Runtime defaults (UTF-8 without BOM, plain errors, Python environment)
+node scripts/smoke-runtime.mjs
 # Job prelude end-to-end (each case is a fresh pwsh process, like a real tool call)
 pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-jobs.ps1
 # Trailing-& interception (PowerShell parser based)

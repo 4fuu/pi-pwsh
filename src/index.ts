@@ -28,7 +28,7 @@ import {
 	type BashOperations,
 	type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
-import { spawnAndStream, EXIT_EPILOGUE, UTF8_PREFIX } from "./spawn.ts";
+import { createRuntimeEnv, spawnAndStream, EXIT_EPILOGUE, UTF8_PREFIX } from "./spawn.ts";
 import { rewriteBackgroundOperator } from "./background.ts";
 
 const PRELUDE_PATH = join(dirname(fileURLToPath(import.meta.url)), "prelude.ps1");
@@ -52,14 +52,15 @@ function createPwshOperations(): BashOperations {
 		exec: async (command, cwd, options) => {
 			// bash-style `cmd &` → Start-Job (detached), via the PowerShell parser.
 			const rewritten = await rewriteBackgroundOperator(command, cwd, options.signal);
-			// Dot-source the prelude (job cmdlet overrides), then the command, then
-			// an epilogue that preserves the real exit code (pwsh -Command would
-			// otherwise flatten native exit codes to 0/1).
-			const injected = `. ${psQuote(PRELUDE_PATH)}; ${UTF8_PREFIX}${rewritten}${EXIT_EPILOGUE}`;
+			// Establish the UTF-8/plain-text runtime, dot-source the prelude (job
+			// cmdlet overrides), run the command, then preserve the real exit code
+			// (pwsh -Command would otherwise flatten native exit codes to 0/1).
+			const injected = `${UTF8_PREFIX}. ${psQuote(PRELUDE_PATH)}; ${rewritten}${EXIT_EPILOGUE}`;
 			const pwshArgs = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", injected];
 			// PIPWSH_NODE lets the prelude launch jobs via a tiny Node script
-			// (~3x faster to boot than a pwsh launcher).
-			const env = { ...process.env, PIPWSH_NODE: process.execPath };
+			// (~3x faster to boot than a pwsh launcher). Runtime defaults also
+			// flow into detached jobs and the cmd fallback below.
+			const env = createRuntimeEnv({ PIPWSH_NODE: process.execPath });
 			const first = await spawnAndStream("pwsh", pwshArgs, cwd, { ...options, env });
 
 			// Fallback for "not a valid Win32 application" (npm/yarn/pnpm are .cmd
@@ -73,7 +74,12 @@ function createPwshOperations(): BashOperations {
 				!options.signal?.aborted
 			) {
 				options.onData(Buffer.from("\n[pi-pwsh] direct spawn failed; retrying via cmd /c.\n"));
-				const retry = await spawnAndStream("cmd", ["/d", "/s", "/c", `chcp 65001>nul & ${command}`], cwd, options);
+				const retry = await spawnAndStream(
+					"cmd",
+					["/d", "/s", "/c", `chcp 65001>nul & ${command}`],
+					cwd,
+					{ ...options, env },
+				);
 				return { exitCode: retry.exitCode };
 			}
 			return { exitCode: first.exitCode };
