@@ -102,7 +102,22 @@ function detectPwsh(): Promise<{ ok: boolean; version?: string }> {
 	});
 }
 
-const DESCRIPTION = `Execute a PowerShell 7 (pwsh) command on Windows in the current working directory. Returns stdout and stderr. Output is truncated to the last 2000 lines or 50KB (whichever is hit first); if truncated, full output is saved to a temp file. Optionally provide a timeout in seconds (no default timeout).
+/** Check that Windows Sudo is available and runs inline (stdio comes back to us). */
+function detectSudo(): Promise<boolean> {
+	return new Promise((resolve) => {
+		const child = spawn("sudo", ["config"], { stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
+		let out = "";
+		child.stdout?.on("data", (d: Buffer) => {
+			out += d.toString("utf-8");
+		});
+		child.on("error", () => resolve(false));
+		child.on("close", (code) => {
+			resolve(code === 0 && /inline|内联/i.test(out));
+		});
+	});
+}
+
+const DESCRIPTION = `Execute a PowerShell 7 (pwsh) command on Windows in the current working directory. Returns stdout and stderr. Output is truncated to the last 2000 lines or 50KB (whichever is hit first); if truncated, full output is saved to a temp file. For completeness and accuracy, prefer filtering and truncating the output yourself. Optionally provide a timeout in seconds (no default timeout).
 
 QUOTING: PowerShell quoting differs from bash. Single quotes are literal strings (escape with ''). Double quotes allow variable expansion. Backtick (\`) is the escape character, not backslash.
 
@@ -112,8 +127,12 @@ GET-CHILDITEM / SELECT-STRING: Recursive searches built from these cmdlets do no
 
 BACKGROUND JOBS: Never run long-lived commands (dev servers, watchers, builds) in the foreground — they block your work. Run them as detached background jobs instead: append \` &\` (\`npm run dev &\`) or use Start-Job (\`Start-Job -ScriptBlock { npm run dev } -Name dev\`). Note: the standard PowerShell job cmdlets (Start-Job, Get-Job, etc.) are overridden — jobs run as detached processes that survive across pwsh calls (and /reload); do not assume native PowerShell job semantics. Manage them with Get-Job / Receive-Job / Stop-Job / Remove-Job / Wait-Job (pipeline support, e.g. \`Get-Job | Stop-Job\`). Jobs don't share variables with your pwsh call. Run Get-JobHelp for usage and examples.`;
 
+const ELEVATION_SECTION = `\n\nELEVATION: \`sudo\` is available. Prefix a command with \`sudo\` to run it as administrator (e.g. \`sudo <command>\`); a UAC prompt will appear and wait for the user to approve.`;
+
 export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
+		// Probe pwsh and sudo once per session; the tool description is built
+		// from the results and stays stable for the rest of the session.
 		const detection = await detectPwsh();
 		if (!detection.ok) {
 			ctx.ui.notify(
@@ -125,12 +144,13 @@ export default function (pi: ExtensionAPI) {
 
 		// Reuse the built-in bash tool definition (truncation, temp files, exit-code
 		// errors, streaming, renderer) with only the spawn layer swapped to pwsh.
+		const sudoAvailable = await detectSudo();
 		const bashDef = createBashToolDefinition(ctx.cwd, { operations: createPwshOperations() });
 		pi.registerTool({
 			...bashDef,
 			name: "pwsh",
 			label: "pwsh",
-			description: DESCRIPTION,
+			description: DESCRIPTION + (sudoAvailable ? ELEVATION_SECTION : ""),
 			promptSnippet: "Execute PowerShell 7 (pwsh) commands",
 			promptGuidelines: [
 				"Use pwsh for shell tasks, both foreground and background; write PowerShell syntax; prefer modern cross-platform tools (rg, fd, etc.) when available, otherwise use native PowerShell cmdlets with tightly bounded scope, and avoid Unix-only commands.",

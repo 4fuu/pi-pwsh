@@ -19,6 +19,7 @@ This extension disables `bash`, `ls`, `find`, and `grep`, then registers a `pwsh
 - Auto-retries with `cmd /c` when a command fails with "not a valid Win32 application" (npm/yarn/pnpm are `.cmd` batch files on Windows). Skipped for commands rewritten to background jobs, where cmd's `&` semantics would be wrong.
 - Kills the whole process tree (`taskkill /T /F`) on timeout or abort — no orphaned `npm run dev` processes.
 - No default timeout; the model can pass `timeout` (seconds) per call.
+- Probes [Windows Sudo](https://learn.microsoft.com/windows/advanced-settings/sudo/) once per session; when available in inline mode, the tool description tells the model it can prefix a command with `sudo` to run it as administrator (each call still requires the user to approve the UAC prompt).
 
 ## Background jobs
 
