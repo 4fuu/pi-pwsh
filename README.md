@@ -19,6 +19,7 @@ This extension disables `bash`, `ls`, `find`, and `grep`, then registers a `pwsh
 - Preserves real native exit codes: `pwsh -Command` would otherwise flatten them to 0/1, which breaks `rg` (1 = no match vs 2 = error) and `git diff --quiet`-style semantics. An exit-code epilogue restores them — identically for foreground commands and background jobs.
 - Auto-retries with `cmd /c` when a command fails with "not a valid Win32 application" (npm/yarn/pnpm are `.cmd` batch files on Windows). Skipped for commands rewritten to background jobs, where cmd's `&` semantics would be wrong.
 - Kills the whole process tree (`taskkill /T /F`) on timeout or abort — no orphaned `npm run dev` processes.
+- Does not hang when a launched/detached descendant inherits stdout or stderr: after the shell exits, a short output-idle grace captures trailing data without waiting forever for inherited handles to close.
 - No default timeout; the model can pass `timeout` (seconds) per call.
 - Probes [Windows Sudo](https://learn.microsoft.com/windows/advanced-settings/sudo/) once per session; when available in inline mode, the tool description tells the model it can prefix a command with `sudo` to run it as administrator (each call still requires the user to approve the UAC prompt).
 
@@ -87,6 +88,8 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-jobs.ps1
 node scripts/smoke-background.mjs
 # Foreground exit-code fidelity (native codes survive the pwsh -Command flattening)
 node scripts/smoke-exitcode.mjs
+# Timeout/abort settlement and inherited-stdio descendants
+npm run test:timeout
 ```
 
 ## License

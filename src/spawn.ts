@@ -2,7 +2,7 @@
  * Shared spawn layer for the pwsh tool and the background job tools.
  */
 
-import { spawn } from "child_process";
+import { spawn, type ChildProcess } from "child_process";
 
 const RUNTIME_ENV_DEFAULTS: Readonly<Record<string, string>> = {
 	PYTHONIOENCODING: "utf-8",
@@ -60,6 +60,88 @@ export const EXIT_EPILOGUE =
 	"\n; $__pipwsh_ok = $?; if ($null -ne $global:LASTEXITCODE) { exit $global:LASTEXITCODE } else { exit ($__pipwsh_ok ? 0 : 1) }";
 
 const MAX_TIMEOUT_MS = 2_147_483_647;
+const EXIT_STDIO_GRACE_MS = 100;
+
+/**
+ * Wait for the spawned process to exit without hanging on pipe handles inherited
+ * by a detached descendant. After exit, keep reading until both streams end or
+ * no output arrives for a short grace period; active tail output re-arms it.
+ *
+ * This mirrors pi's local bash backend. Waiting only for ChildProcess "close"
+ * is incorrect here because "close" also waits for every inherited stdio handle.
+ */
+function waitForChildProcess(child: ChildProcess): Promise<number | null> {
+	return new Promise((resolve, reject) => {
+		let settled = false;
+		let exited = false;
+		let exitCode: number | null = null;
+		let postExitTimer: NodeJS.Timeout | undefined;
+		let stdoutEnded = child.stdout === null;
+		let stderrEnded = child.stderr === null;
+
+		const cleanup = () => {
+			if (postExitTimer) clearTimeout(postExitTimer);
+			child.removeListener("error", onError);
+			child.removeListener("exit", onExit);
+			child.removeListener("close", onClose);
+			child.stdout?.removeListener("end", onStdoutEnd);
+			child.stderr?.removeListener("end", onStderrEnd);
+			child.stdout?.removeListener("data", onData);
+			child.stderr?.removeListener("data", onData);
+		};
+
+		const finalize = (code: number | null) => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			child.stdout?.destroy();
+			child.stderr?.destroy();
+			resolve(code);
+		};
+
+		const maybeFinalizeAfterExit = () => {
+			if (exited && stdoutEnded && stderrEnded) finalize(exitCode);
+		};
+
+		const armIdleTimer = () => {
+			if (postExitTimer) clearTimeout(postExitTimer);
+			postExitTimer = setTimeout(() => finalize(exitCode), EXIT_STDIO_GRACE_MS);
+		};
+
+		const onData = () => {
+			if (exited && !settled) armIdleTimer();
+		};
+		const onStdoutEnd = () => {
+			stdoutEnded = true;
+			maybeFinalizeAfterExit();
+		};
+		const onStderrEnd = () => {
+			stderrEnded = true;
+			maybeFinalizeAfterExit();
+		};
+		const onError = (err: Error) => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			reject(err);
+		};
+		const onExit = (code: number | null) => {
+			exited = true;
+			exitCode = code;
+			maybeFinalizeAfterExit();
+			if (!settled) armIdleTimer();
+		};
+		const onClose = (code: number | null) => finalize(code);
+
+		child.stdout?.once("end", onStdoutEnd);
+		child.stderr?.once("end", onStderrEnd);
+		child.stdout?.on("data", onData);
+		child.stderr?.on("data", onData);
+		child.once("error", onError);
+		child.once("exit", onExit);
+		child.once("close", onClose);
+	});
+}
 
 /** Kill the whole process tree on Windows (child.kill() alone orphans children like npm). */
 export function killTree(pid: number | undefined): void {
@@ -79,32 +161,36 @@ export interface ExecOptions {
 }
 
 /** Spawn a process and stream combined stdout/stderr into onData, following bash.ts error conventions. */
-export function spawnAndStream(
+export async function spawnAndStream(
 	exe: string,
 	args: string[],
 	cwd: string,
 	{ onData, signal, timeout, env }: ExecOptions,
 ): Promise<{ exitCode: number | null; stderrText: string }> {
-	return new Promise((resolve, reject) => {
-		if (signal?.aborted) {
-			reject(new Error("aborted"));
-			return;
-		}
-		const timeoutMs =
-			timeout === undefined ? undefined : Math.min(Math.max(timeout, 0.001), MAX_TIMEOUT_MS / 1000) * 1000;
+	if (signal?.aborted) throw new Error("aborted");
+	const timeoutMs =
+		timeout === undefined ? undefined : Math.min(Math.max(timeout, 0.001), MAX_TIMEOUT_MS / 1000) * 1000;
 
-		const child = spawn(exe, args, {
-			cwd,
-			env: env ?? process.env,
-			stdio: ["ignore", "pipe", "pipe"],
-			windowsHide: true,
-		});
+	const child = spawn(exe, args, {
+		cwd,
+		env: env ?? process.env,
+		stdio: ["ignore", "pipe", "pipe"],
+		windowsHide: true,
+	});
 
-		let stderrText = "";
-		let timedOut = false;
-		let timeoutHandle: NodeJS.Timeout | undefined;
+	let stderrText = "";
+	let timedOut = false;
+	let timeoutHandle: NodeJS.Timeout | undefined;
+	const onStdoutData = (data: Buffer) => onData(data);
+	const onStderrData = (data: Buffer) => {
+		stderrText += data.toString("utf-8");
+		onData(data);
+	};
+	const onAbort = () => killTree(child.pid);
 
-		const onAbort = () => killTree(child.pid);
+	try {
+		child.stdout?.on("data", onStdoutData);
+		child.stderr?.on("data", onStderrData);
 		if (signal) {
 			if (signal.aborted) onAbort();
 			else signal.addEventListener("abort", onAbort, { once: true });
@@ -116,28 +202,14 @@ export function spawnAndStream(
 			}, timeoutMs);
 		}
 
-		child.stdout?.on("data", onData);
-		child.stderr?.on("data", (data: Buffer) => {
-			stderrText += data.toString("utf-8");
-			onData(data);
-		});
-
-		child.on("error", (err) => {
-			if (timeoutHandle) clearTimeout(timeoutHandle);
-			signal?.removeEventListener("abort", onAbort);
-			reject(err);
-		});
-
-		child.on("close", (code) => {
-			if (timeoutHandle) clearTimeout(timeoutHandle);
-			signal?.removeEventListener("abort", onAbort);
-			if (signal?.aborted) {
-				reject(new Error("aborted"));
-			} else if (timedOut) {
-				reject(new Error(`timeout:${timeout}`));
-			} else {
-				resolve({ exitCode: code, stderrText });
-			}
-		});
-	});
+		const exitCode = await waitForChildProcess(child);
+		if (signal?.aborted) throw new Error("aborted");
+		if (timedOut) throw new Error(`timeout:${timeout}`);
+		return { exitCode, stderrText };
+	} finally {
+		if (timeoutHandle) clearTimeout(timeoutHandle);
+		signal?.removeEventListener("abort", onAbort);
+		child.stdout?.removeListener("data", onStdoutData);
+		child.stderr?.removeListener("data", onStderrData);
+	}
 }
