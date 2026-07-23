@@ -1,8 +1,8 @@
-# Smoke test for the pi-pwsh job prelude (src/prelude.ps1).
+# Smoke test for the pi-pwsh job helpers (src/jobs.ps1).
 # Every Invoke-Pwsh call is a fresh pwsh process — exactly like a pwsh tool call —
 # so this verifies that jobs genuinely persist across calls via the file registry.
 $ErrorActionPreference = 'Stop'
-$prelude = Join-Path $PSScriptRoot '..' 'src' 'prelude.ps1'
+$prelude = Join-Path $PSScriptRoot '..' 'src' 'jobs.ps1'
 $jobDir = Join-Path $env:TEMP 'pi-pwsh-jobs'
 
 $script:pass = 0; $script:fail = 0

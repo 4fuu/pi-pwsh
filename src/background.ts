@@ -52,7 +52,7 @@ export async function rewriteBackgroundOperator(command: string, cwd: string, si
 	try {
 		const r = await spawnAndStream(
 			"pwsh",
-			["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", PROBE],
+			["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", PROBE],
 			cwd,
 			{
 				onData: (d) => (out += d.toString("utf-8")),

@@ -9,12 +9,16 @@
  * built-in renderer) with only the spawn layer swapped to pwsh.
  *
  * Background jobs: every pwsh call is a fresh pwsh process, so native
- * PowerShell jobs (Start-Job, trailing `&`) die when the call ends. Each call
- * dot-sources prelude.ps1, which overrides the job cmdlets (Start-Job, Get-Job,
- * Receive-Job, Stop-Job, Remove-Job, Wait-Job) with implementations backed by
- * real detached OS processes (file-based registry in %TEMP%\pi-pwsh-jobs).
- * A trailing ` &` is rewritten to Start-Job via PowerShell's own parser
- * (background.ts), so bash-style `npm run dev &` works as expected.
+ * PowerShell jobs (Start-Job, trailing `&`) die when the call ends. Commands
+ * that reference job helpers lazily load jobs.ps1, which overrides the job
+ * cmdlets with implementations backed by real detached OS processes
+ * (file-based registry in %TEMP%\pi-pwsh-jobs). A trailing ` &` is rewritten
+ * to Start-Job via PowerShell's own parser (background.ts), so bash-style
+ * `npm run dev &` works as expected.
+ *
+ * Interactive processes: session-scoped node-pty/ConPTY sessions and user UI
+ * requests are exposed as lazily loaded PowerShell functions over a private
+ * named-pipe RPC bridge, keeping `pwsh` as the extension's only model tool.
  *
  * Requires PowerShell 7+ (`pwsh` on PATH). No fallback: if pwsh is missing the
  * extension reports an error and leaves the built-in bash tool untouched.
@@ -30,8 +34,16 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { createRuntimeEnv, spawnAndStream, EXIT_EPILOGUE, UTF8_PREFIX } from "./spawn.ts";
 import { rewriteBackgroundOperator } from "./background.ts";
+import { PwshSessionRuntime } from "./session-runtime.ts";
 
-const PRELUDE_PATH = join(dirname(fileURLToPath(import.meta.url)), "prelude.ps1");
+const SOURCE_DIR = dirname(fileURLToPath(import.meta.url));
+const JOBS_PATH = join(SOURCE_DIR, "jobs.ps1");
+const PTY_PATH = join(SOURCE_DIR, "powershell", "pty.ps1");
+const USER_REQUEST_PATH = join(SOURCE_DIR, "powershell", "user-request.ps1");
+
+const JOB_HELPER_PATTERN = /\b(?:Start-Job|Get-Job|Receive-Job|Wait-Job|Stop-Job|Remove-Job|Suspend-Job|Resume-Job|Debug-Job|Get-JobHelp)\b/i;
+const PTY_HELPER_PATTERN = /\b(?:Start-Pty|Get-Pty(?:Screen|Help)?|Receive-Pty|Send-PtyInput|Wait-Pty|Resize-Pty|Stop-Pty|Remove-Pty)\b/i;
+const USER_REQUEST_PATTERN = /\b(?:Request-Pi(?:Input|Confirmation|Selection|PtyInput|PtyControl)|Get-PiRequestHelp)\b/i;
 
 /** Single-quote a string for embedding in PowerShell source. */
 function psQuote(value: string): string {
@@ -47,29 +59,44 @@ function isBatchFileSpawnError(stderrText: string): boolean {
 	);
 }
 
-function createPwshOperations(): BashOperations {
+function helperPrelude(command: string, backgroundRewritten: boolean): { source: string; needsRpc: boolean } {
+	const paths: string[] = [];
+	if (backgroundRewritten || JOB_HELPER_PATTERN.test(command)) paths.push(JOBS_PATH);
+	if (PTY_HELPER_PATTERN.test(command)) paths.push(PTY_PATH);
+	if (USER_REQUEST_PATTERN.test(command)) paths.push(USER_REQUEST_PATH);
+	return {
+		source: paths.map((path) => `. ${psQuote(path)}; `).join(""),
+		needsRpc: paths.includes(PTY_PATH) || paths.includes(USER_REQUEST_PATH),
+	};
+}
+
+function createPwshOperations(runtime: PwshSessionRuntime): BashOperations {
 	return {
 		exec: async (command, cwd, options) => {
 			// bash-style `cmd &` → Start-Job (detached), via the PowerShell parser.
 			const rewritten = await rewriteBackgroundOperator(command, cwd, options.signal);
-			// Establish the UTF-8/plain-text runtime, dot-source the prelude (job
-			// cmdlet overrides), run the command, then preserve the real exit code
-			// (pwsh -Command would otherwise flatten native exit codes to 0/1).
-			const injected = `${UTF8_PREFIX}. ${psQuote(PRELUDE_PATH)}; ${rewritten}${EXIT_EPILOGUE}`;
-			const pwshArgs = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", injected];
-			// PIPWSH_NODE lets the prelude launch jobs via a tiny Node script
-			// (~3x faster to boot than a pwsh launcher). Runtime defaults also
-			// flow into detached jobs and the cmd fallback below.
-			const env = createRuntimeEnv({ PIPWSH_NODE: process.execPath });
+			// Helper families are loaded only when their literal command names are
+			// referenced. Ordinary commands therefore avoid parsing and initializing
+			// the large job/PTY prelude on every fresh pwsh process.
+			const helper = helperPrelude(rewritten, rewritten !== command);
+			const injected = `${UTF8_PREFIX}${helper.source}${rewritten}${EXIT_EPILOGUE}`;
+			const pwshArgs = ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", injected];
+			// PIPWSH_NODE lets the job prelude launch via a fast Node helper. RPC
+			// credentials are exposed only to calls that load an interactive helper;
+			// rpc.ps1 captures and removes them before the user command runs.
+			const env = createRuntimeEnv({
+				PIPWSH_NODE: process.execPath,
+				...(helper.needsRpc ? runtime.env : {}),
+			});
 			const first = await spawnAndStream("pwsh", pwshArgs, cwd, { ...options, env });
 
 			// Fallback for "not a valid Win32 application" (npm/yarn/pnpm are .cmd
-			// batch files on Windows). Skipped when the command was rewritten for
-			// background execution: cmd has no equivalent semantics (a trailing `&`
-			// is a command separator there) and Start-Job could not have caused it.
+			// batch files on Windows). Skipped for rewritten background commands and
+			// helper calls, whose semantics cannot be reproduced by cmd.exe.
 			if (
 				first.exitCode !== 0 &&
 				rewritten === command &&
+				!helper.source &&
 				isBatchFileSpawnError(first.stderrText) &&
 				!options.signal?.aborted
 			) {
@@ -88,12 +115,12 @@ function createPwshOperations(): BashOperations {
 }
 
 /** Check that pwsh (PowerShell 7+) is available. */
-function detectPwsh(): Promise<{ ok: boolean; version?: string }> {
+function detectPwsh(): Promise<{ ok: boolean; version?: string; executable?: string }> {
 	return new Promise((resolve) => {
 		let out = "";
 		const child = spawn(
 			"pwsh",
-			["-NoProfile", "-NonInteractive", "-Command", "$PSVersionTable.PSVersion.ToString()"],
+			["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "[Console]::WriteLine($PSVersionTable.PSVersion.ToString()); [Console]::WriteLine((Join-Path $PSHOME 'pwsh.exe'))"],
 			{ stdio: ["ignore", "pipe", "ignore"], windowsHide: true },
 		);
 		child.stdout?.on("data", (d: Buffer) => {
@@ -101,9 +128,9 @@ function detectPwsh(): Promise<{ ok: boolean; version?: string }> {
 		});
 		child.on("error", () => resolve({ ok: false }));
 		child.on("close", (code) => {
-			const version = out.trim();
+			const [version = "", executable = ""] = out.trim().split(/\r?\n/, 2);
 			const major = Number.parseInt(version.split(".")[0] ?? "", 10);
-			resolve(code === 0 && major >= 7 ? { ok: true, version } : { ok: false });
+			resolve(code === 0 && major >= 7 && executable ? { ok: true, version, executable } : { ok: false });
 		});
 	});
 }
@@ -131,16 +158,26 @@ ENVIRONMENT VARIABLES: Use PowerShell syntax: $env:NODE_ENV = 'production'; npm 
 
 GET-CHILDITEM / SELECT-STRING: Recursive searches built from these cmdlets do not honor .gitignore or automatically prune heavy directories. Keep the path, depth, and output limits tight; never recursively scan any location that should not be searched.
 
-BACKGROUND JOBS: Never run long-lived commands (dev servers, watchers, builds) in the foreground — they block your work. Run them as detached background jobs instead: append \` &\` (\`npm run dev &\`) or use Start-Job (\`Start-Job -ScriptBlock { npm run dev } -Name dev\`). Note: the standard PowerShell job cmdlets (Start-Job, Get-Job, etc.) are overridden — jobs run as detached processes that survive across pwsh calls (and /reload); do not assume native PowerShell job semantics. Manage them with Get-Job / Receive-Job / Stop-Job / Remove-Job / Wait-Job (pipeline support, e.g. \`Get-Job | Stop-Job\`). Jobs don't share variables with your pwsh call. Run Get-JobHelp for usage and examples.`;
+BACKGROUND JOBS: Never run long-lived commands (dev servers, watchers, builds) in the foreground — they block your work. Run them as detached background jobs instead: append \` &\` (\`npm run dev &\`) or use Start-Job (\`Start-Job -ScriptBlock { npm run dev } -Name dev\`). Note: the standard PowerShell job cmdlets (Start-Job, Get-Job, etc.) are overridden — jobs run as detached processes that survive across pwsh calls (and /reload); do not assume native PowerShell job semantics. Manage them with Get-Job / Receive-Job / Stop-Job / Remove-Job / Wait-Job (pipeline support, e.g. \`Get-Job | Stop-Job\`). Jobs don't share variables with your pwsh call. Run Get-JobHelp for usage and examples.
+
+PTY SESSIONS: PowerShell helper functions manage persistent interactive processes across pwsh calls; invoke them through pwsh and run Get-PtyHelp for commands, lifecycle, and examples. USER REQUESTS: PowerShell helper functions can request input, confirmation, selection, secret PTY input, or temporary terminal control from the user; invoke them through pwsh and run Get-PiRequestHelp for details.`;
 
 const ELEVATION_SECTION = `\n\nELEVATION: \`sudo\` is available. Prefix a command with \`sudo\` to run it as administrator (e.g. \`sudo <command>\`); a UAC prompt will appear and wait for the user to approve.`;
 
 export default function (pi: ExtensionAPI) {
+	let runtime: PwshSessionRuntime | undefined;
+
+	pi.on("session_shutdown", async () => {
+		const current = runtime;
+		runtime = undefined;
+		await current?.close();
+	});
+
 	pi.on("session_start", async (_event, ctx) => {
-		// Probe pwsh and sudo once per session; the tool description is built
-		// from the results and stays stable for the rest of the session.
-		const detection = await detectPwsh();
-		if (!detection.ok) {
+		// Probe pwsh and sudo concurrently once per session; the tool description
+		// is then stable for the rest of that session.
+		const [detection, sudoAvailable] = await Promise.all([detectPwsh(), detectSudo()]);
+		if (!detection.ok || !detection.executable) {
 			ctx.ui.notify(
 				"pi-pwsh: `pwsh` (PowerShell 7+) was not found on PATH. Install PowerShell 7 (https://github.com/PowerShell/PowerShell) or disable this extension. The built-in bash tool was left active.",
 				"error",
@@ -148,10 +185,18 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
+		await runtime?.close();
+		const nextRuntime = new PwshSessionRuntime(ctx, detection.executable);
+		try {
+			await nextRuntime.start();
+		} catch (error) {
+			ctx.ui.notify(`pi-pwsh: interactive service startup failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+		}
+		runtime = nextRuntime;
+
 		// Reuse the built-in bash tool definition (truncation, temp files, exit-code
 		// errors, streaming, renderer) with only the spawn layer swapped to pwsh.
-		const sudoAvailable = await detectSudo();
-		const bashDef = createBashToolDefinition(ctx.cwd, { operations: createPwshOperations() });
+		const bashDef = createBashToolDefinition(ctx.cwd, { operations: createPwshOperations(nextRuntime) });
 		pi.registerTool({
 			...bashDef,
 			name: "pwsh",

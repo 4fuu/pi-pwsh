@@ -42,14 +42,14 @@ export function createRuntimeEnv(
 
 /** Force plain UTF-8 output without adding a BOM to native-command stdin. */
 export const UTF8_PREFIX =
-	"[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $OutputEncoding = [System.Text.UTF8Encoding]::new($false); if ($null -ne $PSStyle) { $PSStyle.OutputRendering = 'PlainText' }; ";
+	"$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $PSStyle.OutputRendering = 'PlainText'; ";
 
 /**
  * `pwsh -Command` flattens native exit codes to 0/1 unless the script ends
  * with an explicit `exit` (e.g. `cmd /c exit 3` makes the process exit 1).
  * Appending this epilogue preserves the real code: $LASTEXITCODE when a
  * native command ran, otherwise 0/1 derived from $? (cmdlet failures).
- * Mirrors the epilogue in the job wrapper (prelude.ps1) so foreground and
+ * Mirrors the epilogue in the job wrapper (jobs.ps1) so foreground and
  * background execution report exit codes identically.
  *
  * Starts with "\n; " — the newline detaches from a trailing line comment,
