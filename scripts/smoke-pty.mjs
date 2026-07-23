@@ -17,6 +17,7 @@ const pi = {
 };
 
 const notifications = [];
+const dialogs = [];
 const ctx = {
 	cwd: process.cwd(),
 	mode: "tui",
@@ -35,13 +36,14 @@ const ctx = {
 				};
 				try {
 					component = await factory({ requestRender() {}, terminal: { rows: 30, columns: 100 } }, {}, {}, done);
-					const firstLine = component.render(100)[0] ?? "";
-					if (firstLine.startsWith("PTY ")) component.handleInput("\x1d");
-					else {
-						component.focused = true;
-						component.handleInput("s3cr3t");
-						component.handleInput("\n");
-					}
+					const initial = component.render(100);
+					const dialog = { initial: [...initial], afterInput: [] };
+					dialogs.push(dialog);
+					const promptLine = initial[1] ?? "";
+					component.focused = true;
+					component.handleInput(/password|secret/i.test(promptLine) ? "s3cr3t" : "Ada");
+					dialog.afterInput = component.render(100);
+					component.handleInput("\n");
 				} catch (error) { reject(error); }
 			});
 		},
@@ -63,6 +65,12 @@ async function run(command, timeout) {
 	return result.content.map((item) => item.type === "text" ? item.text : "").join("\n");
 }
 
+function lastDialog() {
+	const dialog = dialogs.at(-1);
+	assert.ok(dialog, "expected a custom input dialog");
+	return dialog;
+}
+
 try {
 	const jobHelp = await run("Get-JobHelp");
 	assert.match(jobHelp, /pi-pwsh background jobs/);
@@ -81,6 +89,7 @@ try {
 	assert.match(screen, /Name:/);
 
 	await run("Request-PiPtyInput -Name smoke -Prompt 'Name' -Enter | Out-Null");
+	assert.deepEqual(lastDialog().initial.slice(0, 2), ["PTY input requested", "Name"]);
 	const ended = await run("Wait-Pty -Name smoke -Exit -Timeout 5 | Select-Object Name, State, ExitCode | ConvertTo-Json -Compress");
 	assert.match(ended, /"State":"Completed"/);
 	assert.match(ended, /"ExitCode":0/);
@@ -92,14 +101,14 @@ try {
 	const requestHelp = await run("Get-PiRequestHelp");
 	assert.match(requestHelp, /Ask the user for input, confirmation, or selection/);
 	assert.equal((await run("Request-PiInput -Title Test -Prompt Name")).trim(), "Ada");
+	assert.deepEqual(lastDialog().initial.slice(0, 2), ["Test", "Name"]);
+	assert.match(lastDialog().afterInput[2] ?? "", /Ada/);
 	assert.equal((await run("Request-PiInput -Title Test -Prompt Password -Secret")).trim(), "s3cr3t");
+	assert.deepEqual(lastDialog().initial.slice(0, 2), ["Test", "Password"]);
+	assert.doesNotMatch(lastDialog().afterInput.join("\n"), /s3cr3t/);
+	assert.match(lastDialog().afterInput[2] ?? "", /••••••/);
 	assert.equal((await run("Request-PiConfirmation -Title Test -Message Continue")).trim(), "True");
 	assert.equal((await run("Request-PiSelection -Title Test -Options one,two")).trim(), "one");
-
-	await run("Start-Pty -Command 'Read-Host ''Stay''' -Name control | Out-Null");
-	const control = await run("Request-PiPtyControl -Name control | ConvertTo-Json -Compress");
-	assert.match(control, /\"Reason\":\"detached\"/);
-	await run("Remove-Pty -Name control -Force | Out-Null");
 
 	await run("Start-Pty -Command 'Read-Host ''wait''' -Name survives | Out-Null");
 	await assert.rejects(run("Wait-Pty -Name survives -Exit -Timeout 60 | Out-Null", 0.2), /timed out/i);

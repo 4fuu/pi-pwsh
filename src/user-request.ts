@@ -15,7 +15,7 @@ class UserRequestError extends Error {
 	}
 }
 
-class SecretInputComponent implements Component, Focusable {
+class InputDialogComponent implements Component, Focusable {
 	private readonly input = new Input();
 	private cachedWidth: number | undefined;
 	private cachedLines: string[] | undefined;
@@ -24,6 +24,7 @@ class SecretInputComponent implements Component, Focusable {
 	constructor(
 		private readonly title: string,
 		private readonly prompt: string,
+		private readonly secret: boolean,
 		private readonly requestRender: () => void,
 		onSubmit: (value: string | undefined) => void,
 	) {
@@ -45,12 +46,16 @@ class SecretInputComponent implements Component, Focusable {
 
 	render(width: number): string[] {
 		if (this.cachedLines && this.cachedWidth === width) return this.cachedLines;
-		const count = [...this.input.getValue()].length;
-		const cursor = this.focused ? CURSOR_MARKER : "";
+		// pi's built-in ui.input dialog never renders the prompt, so draw our own.
+		// Secret entry masks the value manually; plain entry reuses Input.render
+		// for full cursor/scroll/IME fidelity.
+		const inputLine = this.secret
+			? truncateToWidth(`> ${"•".repeat([...this.input.getValue()].length)}${this.focused ? CURSOR_MARKER : ""}\x1b[7m \x1b[27m`, width)
+			: this.input.render(width)[0];
 		this.cachedLines = [
 			truncateToWidth(this.title, width),
 			truncateToWidth(this.prompt, width),
-			truncateToWidth(`> ${"•".repeat(count)}${cursor}\x1b[7m \x1b[27m`, width),
+			inputLine,
 			truncateToWidth("Enter submit • Esc cancel", width),
 		];
 		this.cachedWidth = width;
@@ -76,8 +81,9 @@ export class UserRequestManager {
 	requestInput(title: string, prompt: string, secret: boolean, signal?: AbortSignal): Promise<string> {
 		return this.enqueue(signal, async () => {
 			if (!this.ctx.hasUI) throw new UserRequestError("User input requires an interactive UI", "UI_UNAVAILABLE");
-			const value = secret
-				? await this.secretInput(title, prompt, signal)
+			if (secret && this.ctx.mode !== "tui") throw new UserRequestError("Secret input requires pi's TUI mode", "UI_UNAVAILABLE");
+			const value = this.ctx.mode === "tui"
+				? await this.customInput(title, prompt, secret, signal)
 				: await this.ctx.ui.input(title, prompt, { signal });
 			if (value === undefined) throw new UserRequestError("User cancelled the input request", "CANCELLED");
 			return value;
@@ -111,14 +117,15 @@ export class UserRequestManager {
 
 	private requestInputDirect(title: string, prompt: string, secret: boolean, signal?: AbortSignal): Promise<string> {
 		if (!this.ctx.hasUI) return Promise.reject(new UserRequestError("User input requires an interactive UI", "UI_UNAVAILABLE"));
-		return secret ? this.secretInput(title, prompt, signal) : this.ctx.ui.input(title, prompt, { signal }).then((value) => {
+		if (secret && this.ctx.mode !== "tui") return Promise.reject(new UserRequestError("Secret input requires pi's TUI mode", "UI_UNAVAILABLE"));
+		if (this.ctx.mode === "tui") return this.customInput(title, prompt, secret, signal);
+		return this.ctx.ui.input(title, prompt, { signal }).then((value) => {
 			if (value === undefined) throw new UserRequestError("User cancelled the input request", "CANCELLED");
 			return value;
 		});
 	}
 
-	private secretInput(title: string, prompt: string, signal?: AbortSignal): Promise<string> {
-		if (this.ctx.mode !== "tui") throw new UserRequestError("Secret input requires pi's TUI mode", "UI_UNAVAILABLE");
+	private customInput(title: string, prompt: string, secret: boolean, signal?: AbortSignal): Promise<string> {
 		return this.ctx.ui.custom<string | undefined>((tui, _theme, _kb, done) => {
 			let finished = false;
 			const finish = (value: string | undefined) => {
@@ -126,7 +133,7 @@ export class UserRequestManager {
 				finished = true;
 				done(value);
 			};
-			const component = new SecretInputComponent(title, prompt, () => tui.requestRender(), finish);
+			const component = new InputDialogComponent(title, prompt, secret, () => tui.requestRender(), finish);
 			const onAbort = () => finish(undefined);
 			signal?.addEventListener("abort", onAbort, { once: true });
 			return {
@@ -138,7 +145,7 @@ export class UserRequestManager {
 				dispose: () => signal?.removeEventListener("abort", onAbort),
 			};
 		}).then((value) => {
-			if (value === undefined) throw new UserRequestError("User cancelled the secret input request", "CANCELLED");
+			if (value === undefined) throw new UserRequestError("User cancelled the input request", "CANCELLED");
 			return value;
 		});
 	}
