@@ -78,7 +78,6 @@ interface PtySession {
 	readOffset: number;
 	lastOutputAt: number;
 	outputVersion: number;
-	listeners: Set<() => void>;
 	writeQueue: Promise<void>;
 }
 
@@ -261,14 +260,12 @@ export class PtySessionManager {
 			readOffset: 0,
 			lastOutputAt: Date.now(),
 			outputVersion: 0,
-			listeners: new Set(),
 			writeQueue: Promise.resolve(),
 		};
 		session.dataDisposable = pty.onData((data) => this.handleData(session, data));
 		session.exitDisposable = pty.onExit(({ exitCode }) => {
 			session.exitCode = exitCode;
 			if (session.state === "Running") session.state = exitCode === 0 ? "Completed" : "Failed";
-			session.listeners.forEach((listener) => listener());
 		});
 		this.sessions.set(id, session);
 		return this.metadata(session);
@@ -300,10 +297,6 @@ export class PtySessionManager {
 		const session = this.resolve(ref);
 		await new Promise<void>((resolveWrite) => session.terminal.write("", resolveWrite));
 		return this.screenSync(session);
-	}
-
-	getScreenSync(ref: PtyRef): PtyScreen {
-		return this.screenSync(this.resolve(ref));
 	}
 
 	write(ref: PtyRef, data: string): Promise<PtyMetadata> {
@@ -352,7 +345,6 @@ export class PtySessionManager {
 		if (session.state === "Running") {
 			session.state = "Stopped";
 			terminatePty(session.pty);
-			session.listeners.forEach((listener) => listener());
 		}
 		return this.metadata(session);
 	}
@@ -369,12 +361,6 @@ export class PtySessionManager {
 		session.exitDisposable.dispose();
 		session.terminal.dispose();
 		return this.metadata(session);
-	}
-
-	subscribe(ref: PtyRef, listener: () => void): () => void {
-		const session = this.resolve(ref);
-		session.listeners.add(listener);
-		return () => session.listeners.delete(listener);
 	}
 
 	async close(): Promise<void> {
@@ -423,7 +409,7 @@ export class PtySessionManager {
 				session.readOffset = Math.max(0, session.readOffset - remove);
 			}
 		}
-		session.terminal.write(data, () => session.listeners.forEach((listener) => listener()));
+		session.terminal.write(data);
 	}
 
 	private screenSync(session: PtySession): PtyScreen {

@@ -74,29 +74,6 @@ function Request-PiPtyInput {
 	}
 }
 
-function Request-PiPtyControl {
-	[CmdletBinding(DefaultParameterSetName = 'Pty')]
-	param(
-		[Parameter(Mandatory = $true, Position = 0, ParameterSetName = 'Pty', ValueFromPipeline = $true)]
-		[object[]]$Pty,
-		[Parameter(Mandatory = $true, ParameterSetName = 'Name')][string]$Name,
-		[Parameter(Mandatory = $true, ParameterSetName = 'Id')][int]$Id
-	)
-	process {
-		$targets = if ($PSCmdlet.ParameterSetName -eq 'Pty') { @($Pty) } else { @(0) }
-		foreach ($target in $targets) {
-			$ref = if ($PSCmdlet.ParameterSetName -eq 'Name') { @{ name = $Name } } elseif ($PSCmdlet.ParameterSetName -eq 'Id') { @{ id = $Id } } else { ConvertTo-PiRequestPtyRef $target $null $null }
-			$result = Invoke-PiPwshRpc -Method 'user.ptyControl' -Parameters $ref
-			[pscustomobject]@{
-				Name = [string]$result.metadata.name
-				Reason = [string]$result.reason
-				State = [string]$result.metadata.state
-				ExitCode = if ($null -eq $result.metadata.exitCode) { $null } else { [int]$result.metadata.exitCode }
-			}
-		}
-	}
-}
-
 function Get-PiRequestHelp {
 	[CmdletBinding()]
 	param()
@@ -106,8 +83,7 @@ pi-pwsh user requests — full reference
 ========================================
 
 Ask the user for input, confirmation, or selection while the current pwsh call
-waits. User input can also be written directly to a PTY or the PTY can be
-handed to the user temporarily.
+waits. User input can also be written directly to a PTY.
 
 QUICK START
 -----------
@@ -115,7 +91,6 @@ QUICK START
   Request-PiConfirmation -Title 'Deploy' -Message 'Continue?'
   Request-PiSelection -Title 'Region' -Options @('cn', 'us', 'eu')
   Request-PiPtyInput -Name login -Prompt 'Password' -Secret -Enter
-  Request-PiPtyControl -Name login
 
 GENERAL REQUESTS
 ----------------
@@ -137,8 +112,6 @@ Request-PiPtyInput (pty | -Name | -Id) -Prompt <prompt> [-Title <title>]
     NOT returned to PowerShell or the model — only an acknowledgement.
   - -Secret is safer than Request-PiInput -Secret for terminal logins: the
     extension writes the password directly into the PTY.
-Request-PiPtyControl (pty | -Name | -Id)
-  - Gives the user the live terminal. Ctrl+] detaches without stopping the PTY.
 
 SECURITY
 --------
@@ -148,7 +121,7 @@ SECURITY
   - The RPC pipe is authenticated per pi session; its credentials are removed
     from the environment after helper initialization. Programs launched later
     do not inherit those credentials.
-  - Secret dialogs and full PTY control require TUI mode.
+  - Secret dialogs require TUI mode.
 
 For PTY lifecycle and model-driven input, run Get-PtyHelp.
 
@@ -161,9 +134,5 @@ EXAMPLES
   Get-PtyScreen login
   Request-PiPtyInput -Name login -Prompt 'Password' -Secret -Enter
   Wait-Pty -Name login | Get-PtyScreen
-
-  Start-Pty 'interactive-installer' -Name setup
-  Request-PiPtyControl setup
-  Get-PtyScreen setup
 '@
 }

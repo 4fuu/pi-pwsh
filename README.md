@@ -16,7 +16,7 @@ This extension disables `bash`, `ls`, `find`, and `grep`, then registers a `pwsh
 - Spawns `pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command <cmd>`.
 - Lazily loads the background-job, PTY, and user-request PowerShell helpers only when their command names are referenced. Ordinary commands avoid parsing and initializing the helper scripts, substantially reducing per-call startup overhead.
 - Provides persistent ConPTY sessions through PowerShell functions (`Start-Pty`, `Get-PtyScreen`, `Send-PtyInput`, etc.) without adding another model tool; run `Get-PtyHelp` for the progressive reference.
-- Provides TUI-backed user request functions for input, confirmation, selection, masked secrets, direct secret injection into a PTY, and temporary user terminal control; run `Get-PiRequestHelp` for the progressive reference.
+- Provides TUI-backed user request functions for input, confirmation, selection, masked secrets, and direct secret injection into a PTY; run `Get-PiRequestHelp` for the progressive reference.
 - Forces plain UTF-8 output without a BOM (non-ASCII output is not mangled, PowerShell formatting does not leak ANSI escapes, and piped native-command input is not prefixed with `EF BB BF`).
 - Defaults Python subprocesses to `PYTHONIOENCODING=utf-8`, `PYTHONUTF8=1`, and `PYTHONUNBUFFERED=1` so stdio and implicit text-file reads use UTF-8 and long-running logs stream promptly. Existing environment values are respected, and the defaults are scoped to processes launched by the tool.
 - Preserves real native exit codes: `pwsh -Command` would otherwise flatten them to 0/1, which breaks `rg` (1 = no match vs 2 = error) and `git diff --quiet`-style semantics. An exit-code epilogue restores them — identically for foreground commands and background jobs.
@@ -72,10 +72,9 @@ For terminal logins, input can go directly from the TUI to a PTY without being r
 
 ```powershell
 Request-PiPtyInput -Name login -Prompt 'Password' -Secret -Enter
-Request-PiPtyControl -Name login   # Ctrl+] returns control to pi
 ```
 
-`Request-PiInput -Secret` uses a masked editor but returns plaintext to the current PowerShell process, so assign it immediately and never print it. `Request-PiPtyInput -Secret` is safer for PTY logins because only a submission acknowledgement is returned. Secret entry and full PTY control require TUI mode; normal input, confirmation, and selection also work through pi's RPC UI.
+`Request-PiInput -Secret` uses a masked editor but returns plaintext to the current PowerShell process, so assign it immediately and never print it. `Request-PiPtyInput -Secret` is safer for PTY logins because only a submission acknowledgement is returned. Secret entry requires TUI mode; normal input, confirmation, and selection also work through pi's RPC UI.
 
 The helpers communicate with the extension over an authenticated, random, session-scoped named pipe. Pipe credentials are supplied only to helper calls and removed from the environment before the requested command runs.
 

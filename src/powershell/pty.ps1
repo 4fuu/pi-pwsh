@@ -315,8 +315,7 @@ they do NOT survive /reload or pi restart. PTYs are cleaned up automatically
 on session_shutdown. An aborted or timed-out pwsh call does NOT kill its
 PTYs — only Stop-Pty does.
 
-For user dialogs, secret injection, or temporary terminal control, run
-Get-PiRequestHelp.
+For user dialogs and secret injection, run Get-PiRequestHelp.
 
 EXAMPLES
 --------
@@ -325,7 +324,7 @@ EXAMPLES
 
   Start-Pty 'gh auth login' -Name login
   Get-PtyScreen login
-  Request-PiPtyControl -Name login
+  Send-PtyInput -Name login -Text '...' -Enter
   Get-PtyScreen login
 
   Start-Pty 'some-login' -Name login

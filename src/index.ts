@@ -43,7 +43,7 @@ const USER_REQUEST_PATH = join(SOURCE_DIR, "powershell", "user-request.ps1");
 
 const JOB_HELPER_PATTERN = /\b(?:Start-Job|Get-Job|Receive-Job|Wait-Job|Stop-Job|Remove-Job|Suspend-Job|Resume-Job|Debug-Job|Get-JobHelp)\b/i;
 const PTY_HELPER_PATTERN = /\b(?:Start-Pty|Get-Pty(?:Screen|Help)?|Receive-Pty|Send-PtyInput|Wait-Pty|Resize-Pty|Stop-Pty|Remove-Pty)\b/i;
-const USER_REQUEST_PATTERN = /\b(?:Request-Pi(?:Input|Confirmation|Selection|PtyInput|PtyControl)|Get-PiRequestHelp)\b/i;
+const USER_REQUEST_PATTERN = /\b(?:Request-Pi(?:Input|Confirmation|Selection|PtyInput)|Get-PiRequestHelp)\b/i;
 
 /** Single-quote a string for embedding in PowerShell source. */
 function psQuote(value: string): string {
@@ -160,7 +160,7 @@ GET-CHILDITEM / SELECT-STRING: Recursive searches built from these cmdlets do no
 
 BACKGROUND JOBS: Never run long-lived commands (dev servers, watchers, builds) in the foreground — they block your work. Run them as detached background jobs instead: append \` &\` (\`npm run dev &\`) or use Start-Job (\`Start-Job -ScriptBlock { npm run dev } -Name dev\`). Note: the standard PowerShell job cmdlets (Start-Job, Get-Job, etc.) are overridden — jobs run as detached processes that survive across pwsh calls (and /reload); do not assume native PowerShell job semantics. Manage them with Get-Job / Receive-Job / Stop-Job / Remove-Job / Wait-Job (pipeline support, e.g. \`Get-Job | Stop-Job\`). Jobs don't share variables with your pwsh call. Run Get-JobHelp for usage and examples.
 
-PTY SESSIONS: PowerShell helper functions manage persistent interactive processes across pwsh calls; invoke them through pwsh and run Get-PtyHelp for commands, lifecycle, and examples. USER REQUESTS: PowerShell helper functions can request input, confirmation, selection, secret PTY input, or temporary terminal control from the user; invoke them through pwsh and run Get-PiRequestHelp for details.`;
+PTY SESSIONS: PowerShell helper functions manage persistent interactive processes across pwsh calls; invoke them through pwsh and run Get-PtyHelp for commands, lifecycle, and examples. USER REQUESTS: PowerShell helper functions can request input, confirmation, selection, or secret PTY input from the user; invoke them through pwsh and run Get-PiRequestHelp for details.`;
 
 const ELEVATION_SECTION = `\n\nELEVATION: \`sudo\` is available. Prefix a command with \`sudo\` to run it as administrator (e.g. \`sudo <command>\`); a UAC prompt will appear and wait for the user to approve.`;
 

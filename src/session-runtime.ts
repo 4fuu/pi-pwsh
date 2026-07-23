@@ -167,7 +167,6 @@ export class PwshSessionRuntime {
 				optionalBoolean(params.enter),
 				signal,
 			);
-			case "user.ptyControl": return this.users.requestPtyControl(ptyRef(params), signal);
 			default: throw new Error(`Unknown pi-pwsh RPC method: ${request.method}`);
 		}
 	}
