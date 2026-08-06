@@ -7,14 +7,14 @@ A PowerShell-native shell tool for [pi](https://github.com/badlogic/pi-mono) on 
 Windows shell work is more reliable when the tool name, syntax, process model, and paths all agree. `pi-pwsh` gives the model a real `pwsh` tool instead of asking it to translate bash assumptions at runtime.
 
 - **PowerShell-native** — commands use PowerShell 7 syntax and Windows paths from the start.
-- **Small integration footprint** — one model tool reuses pi's built-in execution contract and renderer; only the process layer is PowerShell-specific.
-- **Low prompt overhead** — the base prompt stays compact. Background jobs, interactive terminals, and user requests expose only a short entry point, then load detailed guidance progressively through `Get-JobHelp`, `Get-PtyHelp`, and `Get-PiRequestHelp`.
-- **Reliable long-running work** — detached jobs survive tool calls, `/reload`, timeouts, and aborts.
+- **One tool, all capabilities** — jobs, interactive terminals, and user requests are exposed as PowerShell functions from `.ps1` scripts inside the same `pwsh` tool, rather than as additional model-facing tools.
+- **Progressive loading, low prompt overhead** — ordinary commands carry only compact guidance. Each helper script is loaded only when one of its functions is used, and the full reference is returned only when the model explicitly calls `Get-JobHelp`, `Get-PtyHelp`, or `Get-PiRequestHelp`.
+- **Truly detached background jobs** — familiar commands such as `Start-Job`, `Get-Job`, and `Receive-Job` are overridden with process-backed implementations. Jobs are independent of the launching PowerShell process and survive later tool calls, `/reload`, timeouts, and aborts.
 - **Real interactive sessions** — Windows ConPTY sessions persist across independent tool calls.
 - **Correct Windows behavior** — UTF-8 output, native exit codes, `.cmd` fallback, process-tree cleanup, and streaming output are handled for you.
 - **Optional elevation** — automatically injects a [Windows Sudo](https://learn.microsoft.com/windows/advanced-settings/sudo/) hint when available.
 
-The three optional helper families and their references are lazily loaded when their commands are used. They remain PowerShell functions, so no extra model tools are added.
+This keeps the base tool schema and system prompt small: pi sees one `pwsh` tool plus concise usage guidance, while implementation scripts and detailed help are introduced progressively only when a task needs them.
 
 ## Features
 
@@ -31,7 +31,7 @@ Stop-Job -Name dev | Remove-Job
 Get-JobHelp
 ```
 
-The familiar job commands (`Start-Job`, `Get-Job`, `Receive-Job`, `Wait-Job`, `Stop-Job`, and `Remove-Job`) support pipelines and record state under `%TEMP%\pi-pwsh-jobs`.
+The familiar job commands (`Start-Job`, `Get-Job`, `Receive-Job`, `Wait-Job`, `Stop-Job`, and `Remove-Job`) are overridden rather than delegated to PowerShell's in-process job system. They launch detached OS processes, support pipelines, and record state under `%TEMP%\pi-pwsh-jobs`, so work remains discoverable and controllable after the original `pwsh` invocation exits.
 
 ### Interactive terminals
 
