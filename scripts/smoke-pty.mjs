@@ -12,6 +12,8 @@ const pi = {
 		handlers.set(event, values);
 	},
 	registerTool(definition) { tool = definition; },
+	registerMessageRenderer() {},
+	sendMessage() {},
 	getActiveTools() { return [...activeTools]; },
 	setActiveTools(names) { activeTools = [...names]; },
 };
@@ -22,8 +24,13 @@ const ctx = {
 	cwd: process.cwd(),
 	mode: "tui",
 	hasUI: true,
+	sessionManager: {
+		getSessionId() { return "pty-smoke-session"; },
+		getSessionFile() { return undefined; },
+	},
 	ui: {
 		notify(message, type) { notifications.push({ message, type }); },
+		setStatus() {},
 		async input() { return "Ada"; },
 		async confirm() { return true; },
 		async select(_title, options) { return options[0]; },
@@ -50,6 +57,24 @@ const ctx = {
 	},
 };
 
+const previousConfigPath = process.env.PI_PWSH_CONFIG;
+process.env.PI_PWSH_CONFIG = "C:\\definitely-missing-pi-pwsh-config.json";
+const fallbackHandlers = new Map();
+let fallbackTools = ["pwsh", "read"];
+extension({
+	on(event, handler) { fallbackHandlers.set(event, [...(fallbackHandlers.get(event) ?? []), handler]); },
+	registerMessageRenderer() {},
+	getActiveTools() { return [...fallbackTools]; },
+	setActiveTools(names) { fallbackTools = [...names]; },
+});
+if (previousConfigPath === undefined) delete process.env.PI_PWSH_CONFIG;
+else process.env.PI_PWSH_CONFIG = previousConfigPath;
+for (const handler of fallbackHandlers.get("session_start") ?? []) {
+	await handler({ type: "session_start", reason: "startup" }, ctx);
+}
+assert.ok(fallbackTools.includes("bash"));
+assert.ok(!fallbackTools.includes("pwsh"));
+
 extension(pi);
 for (const handler of handlers.get("session_start") ?? []) {
 	await handler({ type: "session_start", reason: "startup" }, ctx);
@@ -60,6 +85,9 @@ assert.ok(!activeTools.includes("bash"));
 assert.ok(activeTools.includes("ls"));
 assert.ok(activeTools.includes("find"));
 assert.ok(activeTools.includes("grep"));
+assert.match(tool.description, /\n\nUSER REQUESTS:/);
+const userBash = await (handlers.get("user_bash")?.[0]?.());
+assert.equal(typeof userBash?.operations?.exec, "function");
 
 let call = 0;
 async function run(command, timeout) {

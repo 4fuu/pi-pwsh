@@ -1,7 +1,7 @@
 {
   "name": "@4fu/pi-pwsh",
-  "version": "0.6.3",
-  "description": "Route pi's shell, directory listing, and search tasks through PowerShell 7 on Windows",
+  "version": "0.7.0",
+  "description": "A PowerShell-native shell tool for pi on Windows, with persistent jobs, ConPTY sessions, and user requests.",
   "license": "MIT",
   "author": "4fuu",
   "repository": {
@@ -9,6 +9,9 @@
     "url": "git+https://github.com/4fuu/pi-pwsh.git"
   },
   "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "keywords": [
     "pi-package",
     "pi-extension",
@@ -28,16 +31,24 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
+    "test": "npm run typecheck && npm run test:config && npm run test:runtime && npm run test:transport && npm run test:exitcode && npm run test:background && npm run test:notifications && npm run test:jobs && npm run test:timeout && npm run test:pty",
+    "test:background": "node --experimental-transform-types scripts/smoke-background.mjs",
+    "test:config": "node --experimental-transform-types scripts/smoke-config.mjs",
+    "test:exitcode": "node --experimental-transform-types scripts/smoke-exitcode.mjs",
+    "test:jobs": "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-jobs.ps1",
+    "test:notifications": "node --experimental-transform-types scripts/smoke-notifications.mjs",
     "test:pty": "node --experimental-transform-types scripts/smoke-pty.mjs",
-    "test:timeout": "node scripts/smoke-timeout.mjs"
+    "test:runtime": "node --experimental-transform-types scripts/smoke-runtime.mjs",
+    "test:timeout": "node --experimental-transform-types scripts/smoke-timeout.mjs",
+    "test:transport": "node --experimental-transform-types scripts/smoke-transport.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.80.10",
-    "@earendil-works/pi-tui": "^0.80.10",
+    "@earendil-works/pi-coding-agent": "^0.84.0",
+    "@earendil-works/pi-tui": "^0.84.0",
     "@types/node": "^24.0.0",
     "typescript": "^5.5.0"
   },

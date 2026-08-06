@@ -4,10 +4,14 @@
 
 import { spawn, type ChildProcess } from "child_process";
 
-const RUNTIME_ENV_DEFAULTS: Readonly<Record<string, string>> = {
-	PYTHONIOENCODING: "utf-8",
-	PYTHONUTF8: "1",
-	PYTHONUNBUFFERED: "1",
+export interface RuntimeEnvironmentConfig {
+	pythonUtf8: boolean;
+	pythonUnbuffered: boolean;
+}
+
+const DEFAULT_RUNTIME_ENVIRONMENT_CONFIG: Readonly<RuntimeEnvironmentConfig> = {
+	pythonUtf8: true,
+	pythonUnbuffered: true,
 };
 
 function findEnvKey(env: NodeJS.ProcessEnv, name: string): string | undefined {
@@ -26,9 +30,16 @@ function findEnvKey(env: NodeJS.ProcessEnv, name: string): string | undefined {
 export function createRuntimeEnv(
 	extra: Readonly<Record<string, string>> = {},
 	baseEnv: NodeJS.ProcessEnv = process.env,
+	config: RuntimeEnvironmentConfig = DEFAULT_RUNTIME_ENVIRONMENT_CONFIG,
 ): NodeJS.ProcessEnv {
 	const env = { ...baseEnv };
-	for (const [name, value] of Object.entries(RUNTIME_ENV_DEFAULTS)) {
+	const defaults: Record<string, string> = {};
+	if (config.pythonUtf8) {
+		defaults.PYTHONIOENCODING = "utf-8";
+		defaults.PYTHONUTF8 = "1";
+	}
+	if (config.pythonUnbuffered) defaults.PYTHONUNBUFFERED = "1";
+	for (const [name, value] of Object.entries(defaults)) {
 		const existing = findEnvKey(env, name);
 		if (existing === undefined || env[existing] === undefined) env[name] = value;
 	}
@@ -44,11 +55,16 @@ export function createRuntimeEnv(
 export const UTF8_PREFIX =
 	"$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $PSStyle.OutputRendering = 'PlainText'; ";
 
+/** Fixed ASCII bootstrap; the complete UTF-8 source is base64-encoded on stdin. */
+export const SOURCE_BOOTSTRAP =
+	"$__pipwsh_source = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String([Console]::In.ReadToEnd())); & ([ScriptBlock]::Create($__pipwsh_source))";
+
 /**
  * `pwsh -Command` flattens native exit codes to 0/1 unless the script ends
  * with an explicit `exit` (e.g. `cmd /c exit 3` makes the process exit 1).
- * Appending this epilogue preserves the real code: $LASTEXITCODE when a
- * native command ran, otherwise 0/1 derived from $? (cmdlet failures).
+ * Appending this epilogue reports the final command's status. A successful
+ * final command wins over a stale LASTEXITCODE; on failure, a nonzero native
+ * code is retained when present, and failures without one map to 1.
  * Mirrors the epilogue in the job wrapper (jobs.ps1) so foreground and
  * background execution report exit codes identically.
  *
@@ -57,7 +73,7 @@ export const UTF8_PREFIX =
  * otherwise glue the epilogue into the last command's arguments).
  */
 export const EXIT_EPILOGUE =
-	"\n; $__pipwsh_ok = $?; if ($null -ne $global:LASTEXITCODE) { exit $global:LASTEXITCODE } else { exit ($__pipwsh_ok ? 0 : 1) }";
+	"\n; $__pipwsh_ok = $?; if ($__pipwsh_ok) { exit 0 } elseif ($null -ne $global:LASTEXITCODE -and $global:LASTEXITCODE -ne 0) { exit $global:LASTEXITCODE } else { exit 1 }";
 
 const MAX_TIMEOUT_MS = 2_147_483_647;
 const EXIT_STDIO_GRACE_MS = 100;
@@ -158,6 +174,18 @@ export interface ExecOptions {
 	signal?: AbortSignal;
 	timeout?: number;
 	env?: NodeJS.ProcessEnv;
+	stdin?: string;
+}
+
+function timeoutMilliseconds(timeout: number | undefined): number | undefined {
+	if (timeout === undefined) return undefined;
+	if (!Number.isFinite(timeout) || timeout <= 0) {
+		throw new Error("Invalid timeout: must be a finite number of seconds greater than zero");
+	}
+	if (timeout > MAX_TIMEOUT_MS / 1000) {
+		throw new Error(`Invalid timeout: maximum is ${MAX_TIMEOUT_MS / 1000} seconds`);
+	}
+	return timeout * 1000;
 }
 
 /** Spawn a process and stream combined stdout/stderr into onData, following bash.ts error conventions. */
@@ -165,18 +193,23 @@ export async function spawnAndStream(
 	exe: string,
 	args: string[],
 	cwd: string,
-	{ onData, signal, timeout, env }: ExecOptions,
+	{ onData, signal, timeout, env, stdin }: ExecOptions,
 ): Promise<{ exitCode: number | null; stderrText: string }> {
 	if (signal?.aborted) throw new Error("aborted");
-	const timeoutMs =
-		timeout === undefined ? undefined : Math.min(Math.max(timeout, 0.001), MAX_TIMEOUT_MS / 1000) * 1000;
+	const timeoutMs = timeoutMilliseconds(timeout);
 
 	const child = spawn(exe, args, {
 		cwd,
 		env: env ?? process.env,
-		stdio: ["ignore", "pipe", "pipe"],
+		stdio: [stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
 		windowsHide: true,
 	});
+	if (stdin !== undefined) {
+		child.stdin?.on("error", () => {
+			// Startup/termination failures are reported through child events.
+		});
+		child.stdin?.end(stdin, "utf8");
+	}
 
 	let stderrText = "";
 	let timedOut = false;

@@ -6,6 +6,7 @@ import type * as XtermHeadless from "@xterm/headless";
 import type * as NodePty from "node-pty";
 import type { IDisposable, IPty } from "node-pty";
 import { createRuntimeEnv, EXIT_EPILOGUE } from "./spawn.ts";
+import { userPowerShellArguments, type ResolvedPwshRuntime } from "./runtime.ts";
 
 const require = createRequire(import.meta.url);
 let dependencies: { Terminal: typeof XtermHeadless.Terminal; spawn: typeof NodePty.spawn } | undefined;
@@ -198,7 +199,7 @@ export class PtySessionManager {
 	private nextId = 1;
 
 	constructor(
-		private readonly pwshExecutable: string,
+		private readonly pwsh: ResolvedPwshRuntime,
 		private readonly defaultCwd: string,
 	) {}
 
@@ -228,11 +229,12 @@ export class PtySessionManager {
 			TERM: "xterm-256color",
 			COLORTERM: "truecolor",
 			...(options.environment ?? {}),
-		});
-		const prefix = "[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false); [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $OutputEncoding = [System.Text.UTF8Encoding]::new($false); if ($null -ne $PSStyle) { $PSStyle.OutputRendering = 'Ansi' }; ";
+		}, process.env, this.pwsh);
+		const strict = this.pwsh.stopOnError ? "$ErrorActionPreference = 'Stop'; " : "";
+		const prefix = `[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false); [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $OutputEncoding = [System.Text.UTF8Encoding]::new($false); if ($null -ne $PSStyle) { $PSStyle.OutputRendering = 'Ansi' }; ${strict}$global:LASTEXITCODE = $null; `;
 		const pty = spawn(
-			this.pwshExecutable,
-			["-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", `${prefix}${command}${EXIT_EPILOGUE}`],
+			this.pwsh.executable,
+			[...userPowerShellArguments(this.pwsh, { nonInteractive: false }), "-Command", `${prefix}${command}${EXIT_EPILOGUE}`],
 			{
 				name: "xterm-256color",
 				cols: columns,

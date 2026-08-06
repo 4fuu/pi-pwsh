@@ -29,11 +29,15 @@ import { dirname, join } from "path";
 import { fileURLToPath } from "url";
 import {
 	createBashToolDefinition,
+	getAgentDir,
 	type BashOperations,
 	type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
-import { createRuntimeEnv, spawnAndStream, EXIT_EPILOGUE, UTF8_PREFIX } from "./spawn.ts";
-import { rewriteBackgroundOperator } from "./background.ts";
+import { createRuntimeEnv, spawnAndStream, EXIT_EPILOGUE, SOURCE_BOOTSTRAP, UTF8_PREFIX } from "./spawn.ts";
+import { rewriteBackgroundOperatorWithRuntime } from "./background.ts";
+import { loadConfig, type PwshConfig } from "./config.ts";
+import { registerJobNotificationRenderer } from "./job-notifications.ts";
+import { resolvePowerShellRuntime, userPowerShellArguments } from "./runtime.ts";
 import { PwshSessionRuntime } from "./session-runtime.ts";
 
 const SOURCE_DIR = dirname(fileURLToPath(import.meta.url));
@@ -59,13 +63,14 @@ function isBatchFileSpawnError(stderrText: string): boolean {
 	);
 }
 
-function helperPrelude(command: string, backgroundRewritten: boolean): { source: string; needsRpc: boolean } {
+function helperPrelude(command: string, backgroundRewritten: boolean): { source: string; needsJobs: boolean; needsRpc: boolean } {
 	const paths: string[] = [];
 	if (backgroundRewritten || JOB_HELPER_PATTERN.test(command)) paths.push(JOBS_PATH);
 	if (PTY_HELPER_PATTERN.test(command)) paths.push(PTY_PATH);
 	if (USER_REQUEST_PATTERN.test(command)) paths.push(USER_REQUEST_PATH);
 	return {
 		source: paths.map((path) => `. ${psQuote(path)}; `).join(""),
+		needsJobs: paths.includes(JOBS_PATH),
 		needsRpc: paths.includes(PTY_PATH) || paths.includes(USER_REQUEST_PATH),
 	};
 }
@@ -74,21 +79,30 @@ function createPwshOperations(runtime: PwshSessionRuntime): BashOperations {
 	return {
 		exec: async (command, cwd, options) => {
 			// bash-style `cmd &` → Start-Job (detached), via the PowerShell parser.
-			const rewritten = await rewriteBackgroundOperator(command, cwd, options.signal);
+			const rewritten = await rewriteBackgroundOperatorWithRuntime(command, cwd, runtime.pwsh.executable, options.signal);
 			// Helper families are loaded only when their literal command names are
 			// referenced. Ordinary commands therefore avoid parsing and initializing
 			// the large job/PTY prelude on every fresh pwsh process.
 			const helper = helperPrelude(rewritten, rewritten !== command);
-			const injected = `${UTF8_PREFIX}${helper.source}${rewritten}${EXIT_EPILOGUE}`;
-			const pwshArgs = ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", injected];
+			const strict = runtime.pwsh.stopOnError ? "$ErrorActionPreference = 'Stop'; " : "";
+			const injected = `${UTF8_PREFIX}${helper.source}${strict}$global:LASTEXITCODE = $null; ${rewritten}${EXIT_EPILOGUE}`;
+			const pwshArgs = [
+				...userPowerShellArguments(runtime.pwsh, { nonInteractive: true }),
+				"-Command",
+				SOURCE_BOOTSTRAP,
+			];
 			// PIPWSH_NODE lets the job prelude launch via a fast Node helper. RPC
 			// credentials are exposed only to calls that load an interactive helper;
 			// rpc.ps1 captures and removes them before the user command runs.
 			const env = createRuntimeEnv({
-				PIPWSH_NODE: process.execPath,
+				...(helper.needsJobs ? runtime.jobEnv : {}),
 				...(helper.needsRpc ? runtime.env : {}),
+			}, options.env ?? process.env, runtime.pwsh);
+			const first = await spawnAndStream(runtime.pwsh.executable, pwshArgs, cwd, {
+				...options,
+				env,
+				stdin: Buffer.from(injected, "utf8").toString("base64"),
 			});
-			const first = await spawnAndStream("pwsh", pwshArgs, cwd, { ...options, env });
 
 			// Fallback for "not a valid Win32 application" (npm/yarn/pnpm are .cmd
 			// batch files on Windows). Skipped for rewritten background commands and
@@ -114,27 +128,6 @@ function createPwshOperations(runtime: PwshSessionRuntime): BashOperations {
 	};
 }
 
-/** Check that pwsh (PowerShell 7+) is available. */
-function detectPwsh(): Promise<{ ok: boolean; version?: string; executable?: string }> {
-	return new Promise((resolve) => {
-		let out = "";
-		const child = spawn(
-			"pwsh",
-			["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "[Console]::WriteLine($PSVersionTable.PSVersion.ToString()); [Console]::WriteLine((Join-Path $PSHOME 'pwsh.exe'))"],
-			{ stdio: ["ignore", "pipe", "ignore"], windowsHide: true },
-		);
-		child.stdout?.on("data", (d: Buffer) => {
-			out += d.toString("utf-8");
-		});
-		child.on("error", () => resolve({ ok: false }));
-		child.on("close", (code) => {
-			const [version = "", executable = ""] = out.trim().split(/\r?\n/, 2);
-			const major = Number.parseInt(version.split(".")[0] ?? "", 10);
-			resolve(code === 0 && major >= 7 && executable ? { ok: true, version, executable } : { ok: false });
-		});
-	});
-}
-
 /** Check that Windows Sudo is available and runs inline (stdio comes back to us). */
 function detectSudo(): Promise<boolean> {
 	return new Promise((resolve) => {
@@ -150,7 +143,7 @@ function detectSudo(): Promise<boolean> {
 	});
 }
 
-const DESCRIPTION = `Execute a PowerShell 7 (pwsh) command on Windows in the current working directory. Returns stdout and stderr. Output is truncated to the last 2000 lines or 50KB (whichever is hit first); if truncated, full output is saved to a temp file. For completeness and accuracy, prefer filtering and truncating the output yourself. Optionally provide a timeout in seconds (no default timeout).
+export const DESCRIPTION = `Execute a PowerShell 7 (pwsh) command on Windows in the current working directory. Returns stdout and stderr. Output is truncated to the last 2000 lines or 50KB (whichever is hit first); if truncated, full output is saved to a temp file. For completeness and accuracy, prefer filtering and truncating the output yourself. Optionally provide a timeout in seconds (no default timeout).
 
 QUOTING: PowerShell quoting differs from bash. Single quotes are literal strings (escape with ''). Double quotes allow variable expansion. Backtick (\`) is the escape character, not backslash.
 
@@ -158,45 +151,79 @@ ENVIRONMENT VARIABLES: Use PowerShell syntax: $env:NODE_ENV = 'production'; npm 
 
 GET-CHILDITEM / SELECT-STRING: Recursive searches built from these cmdlets do not honor .gitignore or automatically prune heavy directories. Keep the path, depth, and output limits tight; never recursively scan any location that should not be searched.
 
-BACKGROUND JOBS: Never run long-lived commands (dev servers, watchers, builds) in the foreground — they block your work. Run them as detached background jobs instead: append \` &\` (\`npm run dev &\`) or use Start-Job (\`Start-Job -ScriptBlock { npm run dev } -Name dev\`). Note: the standard PowerShell job cmdlets (Start-Job, Get-Job, etc.) are overridden — jobs run as detached processes that survive across pwsh calls (and /reload); do not assume native PowerShell job semantics. Manage them with Get-Job / Receive-Job / Stop-Job / Remove-Job / Wait-Job (pipeline support, e.g. \`Get-Job | Stop-Job\`). Jobs don't share variables with your pwsh call. Run Get-JobHelp for usage and examples.
+BACKGROUND JOBS: Run long-lived commands as detached jobs: append \` &\` (\`npm run dev &\`) or use \`Start-Job -ScriptBlock { npm run dev } -Name dev\`. Jobs survive later pwsh calls and /reload, and completion is reported automatically. For a long-running server, pass \`-NotifyOn '<ready text>'\` to report its first matching output. Continue other work while jobs run; use Wait-Job only when the next step requires a result. Manage jobs with Get-Job / Receive-Job / Stop-Job / Remove-Job / Wait-Job, and run Get-JobHelp for the full reference.
 
-PTY SESSIONS: PowerShell helper functions manage persistent interactive processes across pwsh calls; invoke them through pwsh and run Get-PtyHelp for commands, lifecycle, and examples. USER REQUESTS: PowerShell helper functions can request input, confirmation, selection, or secret PTY input from the user; invoke them through pwsh and run Get-PiRequestHelp for details.`;
+PTY SESSIONS: Use Start-Pty and the related PowerShell functions for interactive processes that must persist across pwsh calls. Run Get-PtyHelp for commands, lifecycle, and examples.
+
+USER REQUESTS: Use Request-PiInput, Request-PiConfirmation, Request-PiSelection, or Request-PiPtyInput when a command needs user input. Run Get-PiRequestHelp for details.`;
 
 const ELEVATION_SECTION = `\n\nELEVATION: \`sudo\` is available. Prefix a command with \`sudo\` to run it as administrator (e.g. \`sudo <command>\`); a UAC prompt will appear and wait for the user to approve.`;
 
 export default function (pi: ExtensionAPI) {
 	let runtime: PwshSessionRuntime | undefined;
+	let operations: BashOperations | undefined;
+	let config: PwshConfig | undefined;
+	let setupError: string | undefined;
+	try {
+		config = loadConfig({ agentDir: getAgentDir() }).config;
+	} catch (error) {
+		setupError = error instanceof Error ? error.message : String(error);
+	}
+
+	registerJobNotificationRenderer(pi);
+	if (config?.replaceUserBash) {
+		pi.on("user_bash", () => operations ? { operations } : undefined);
+	}
 
 	pi.on("session_shutdown", async () => {
 		const current = runtime;
+		operations = undefined;
 		runtime = undefined;
 		await current?.close();
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
+		operations = undefined;
+		const current = runtime;
+		runtime = undefined;
+		await current?.close();
+		if (setupError || !config) {
+			activateBuiltInBash(pi);
+			ctx.ui.notify(`pi-pwsh: ${setupError ?? "configuration could not be loaded"} The built-in bash tool was left active.`, "error");
+			return;
+		}
 		// Probe pwsh and sudo concurrently once per session; the tool description
 		// is then stable for the rest of that session.
-		const [detection, sudoAvailable] = await Promise.all([detectPwsh(), detectSudo()]);
-		if (!detection.ok || !detection.executable) {
+		let detection;
+		let sudoAvailable: boolean;
+		try {
+			[detection, sudoAvailable] = await Promise.all([resolvePowerShellRuntime(config), detectSudo()]);
+		} catch (error) {
+			activateBuiltInBash(pi);
 			ctx.ui.notify(
-				"pi-pwsh: `pwsh` (PowerShell 7+) was not found on PATH. Install PowerShell 7 (https://github.com/PowerShell/PowerShell) or disable this extension. The built-in bash tool was left active.",
+				`pi-pwsh: ${error instanceof Error ? error.message : String(error)} The built-in bash tool was left active.`,
 				"error",
 			);
 			return;
 		}
 
-		await runtime?.close();
-		const nextRuntime = new PwshSessionRuntime(ctx, detection.executable);
+		const nextRuntime = new PwshSessionRuntime(pi, ctx, detection);
 		try {
-			await nextRuntime.start();
+			await nextRuntime.notifications.start();
+		} catch (error) {
+			ctx.ui.notify(`pi-pwsh: job notification startup failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+		}
+		try {
+			await nextRuntime.rpc.start();
 		} catch (error) {
 			ctx.ui.notify(`pi-pwsh: interactive service startup failed: ${error instanceof Error ? error.message : String(error)}`, "error");
 		}
 		runtime = nextRuntime;
+		operations = createPwshOperations(nextRuntime);
 
 		// Reuse the built-in bash tool definition (truncation, temp files, exit-code
 		// errors, streaming, renderer) with only the spawn layer swapped to pwsh.
-		const bashDef = createBashToolDefinition(ctx.cwd, { operations: createPwshOperations(nextRuntime) });
+		const bashDef = createBashToolDefinition(ctx.cwd, { operations });
 		pi.registerTool({
 			...bashDef,
 			name: "pwsh",
@@ -208,8 +235,18 @@ export default function (pi: ExtensionAPI) {
 			],
 		});
 
-		const active = pi.getActiveTools();
-		const replaced = new Set(["bash", "pwsh"]);
-		pi.setActiveTools([...active.filter((name) => !replaced.has(name)), "pwsh"]);
+		activatePwsh(pi);
 	});
+}
+
+function activatePwsh(pi: ExtensionAPI): void {
+	const active = pi.getActiveTools();
+	const replaced = new Set(["bash", "pwsh"]);
+	pi.setActiveTools([...active.filter((name) => !replaced.has(name)), "pwsh"]);
+}
+
+function activateBuiltInBash(pi: ExtensionAPI): void {
+	const active = pi.getActiveTools().filter((name) => name !== "pwsh");
+	if (!active.includes("bash")) active.push("bash");
+	pi.setActiveTools(active);
 }

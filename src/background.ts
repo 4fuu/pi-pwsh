@@ -46,12 +46,22 @@ if ($errors.Count -eq 0 -and $s.Count -eq 1 -and $s[0] -is [System.Management.Au
  * otherwise (and on any detection failure).
  */
 export async function rewriteBackgroundOperator(command: string, cwd: string, signal?: AbortSignal): Promise<string> {
+	return rewriteBackgroundOperatorWithRuntime(command, cwd, "pwsh", signal);
+}
+
+/** Same rewrite using an already validated absolute PowerShell executable. */
+export async function rewriteBackgroundOperatorWithRuntime(
+	command: string,
+	cwd: string,
+	pwshExecutable: string,
+	signal?: AbortSignal,
+): Promise<string> {
 	if (!isCandidate(command)) return command;
 
 	let out = "";
 	try {
 		const r = await spawnAndStream(
-			"pwsh",
+			pwshExecutable,
 			["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", PROBE],
 			cwd,
 			{

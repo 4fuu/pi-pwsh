@@ -68,15 +68,29 @@ function PiPwshEnsureFile([string]$path, [string]$content) {
 
 $script:PiPwshLauncher = Join-Path $script:PiPwshJobDir '_launcher.ps1'
 PiPwshEnsureFile $script:PiPwshLauncher @'
-param([string]$WrapFile, [string]$PidFile, [string]$WorkingDirectory)
-$p = Start-Process -FilePath (Join-Path $PSHOME 'pwsh.exe') -ArgumentList @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $WrapFile + '"')) -WorkingDirectory $WorkingDirectory -WindowStyle Hidden -PassThru
-[System.IO.File]::WriteAllText($PidFile, [string]$p.Id, [System.Text.Encoding]::ASCII)
+param([string]$PowerShellExecutable, [string]$WrapFile, [string]$PidFile, [string]$PendingMetaFile, [string]$MetaFile, [string]$InstanceId, [string]$WorkingDirectory)
+$p = Start-Process -FilePath $PowerShellExecutable -ArgumentList @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $WrapFile + '"')) -WorkingDirectory $WorkingDirectory -WindowStyle Hidden -PassThru
+try {
+	$meta = Get-Content -LiteralPath $PendingMetaFile -Raw -Encoding UTF8 | ConvertFrom-Json
+	if ($meta.InstanceId -ne $InstanceId) { throw 'Job metadata instance changed during launch.' }
+	$meta.Pid = $p.Id
+	$meta.LaunchProcessId = $PID
+	$temp = "$MetaFile.$PID.tmp"
+	[System.IO.File]::WriteAllText($temp, ($meta | ConvertTo-Json), [System.Text.UTF8Encoding]::new($false))
+	[System.IO.File]::Move($temp, $MetaFile)
+	Remove-Item -LiteralPath $PendingMetaFile -Force -ErrorAction SilentlyContinue
+	[System.IO.File]::WriteAllText($PidFile, [string]$p.Id, [System.Text.Encoding]::ASCII)
+} catch {
+	& taskkill /pid $p.Id /T /F *> $null
+	throw
+}
 '@
 $script:PiPwshLauncherNode = Join-Path $script:PiPwshJobDir '_launcher.cjs'
 PiPwshEnsureFile $script:PiPwshLauncherNode @'
 // pi-pwsh job launcher: spawn the job, record its PID, exit.
 // Env contract (set by Start-Job): PI_PWSH_L_EXE, PI_PWSH_L_ARGS (JSON
-// array), PI_PWSH_L_WD, PI_PWSH_L_PID. The child inherits THIS process env
+// array), PI_PWSH_L_WD, PI_PWSH_L_PID, PI_PWSH_L_PENDING_META,
+// PI_PWSH_L_META, and PI_PWSH_L_INSTANCE. The child inherits THIS process env
 // (= the calling pwsh session env) — full environment inheritance for jobs.
 // NOTE: no `detached: true` — on Windows that creates the child with
 // DETACHED_PROCESS (no console), and console apps like pwsh die instantly.
@@ -89,7 +103,20 @@ const child = spawn(process.env.PI_PWSH_L_EXE, JSON.parse(process.env.PI_PWSH_L_
 	windowsHide: true,
 	stdio: "ignore",
 });
-fs.writeFileSync(process.env.PI_PWSH_L_PID, String(child.pid), "ascii");
+try {
+	const meta = JSON.parse(fs.readFileSync(process.env.PI_PWSH_L_PENDING_META, "utf8"));
+	if (meta.InstanceId !== process.env.PI_PWSH_L_INSTANCE) throw new Error("Job metadata instance changed during launch");
+	meta.Pid = child.pid;
+	meta.LaunchProcessId = process.pid;
+	const temporary = `${process.env.PI_PWSH_L_META}.${process.pid}.tmp`;
+	fs.writeFileSync(temporary, JSON.stringify(meta), "utf8");
+	fs.renameSync(temporary, process.env.PI_PWSH_L_META);
+	fs.rmSync(process.env.PI_PWSH_L_PENDING_META, { force: true });
+	fs.writeFileSync(process.env.PI_PWSH_L_PID, String(child.pid), "ascii");
+} catch (error) {
+	require("node:child_process").spawnSync("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
+	throw error;
+}
 child.unref();
 '@
 
@@ -105,9 +132,18 @@ function PiPwshReadMeta([string]$name) {
 	try { Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $null }
 }
 
+function PiPwshWriteJsonAtomic([string]$path, $value) {
+	$temp = "$path.$PID.$([guid]::NewGuid().ToString('N')).tmp"
+	try {
+		[System.IO.File]::WriteAllText($temp, ($value | ConvertTo-Json), [System.Text.UTF8Encoding]::new($false))
+		[System.IO.File]::Move($temp, $path, $true)
+	} finally {
+		Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue
+	}
+}
+
 function PiPwshWriteMeta($meta) {
-	$path = Join-Path $script:PiPwshJobDir ($meta.Name + '.meta.json')
-	[System.IO.File]::WriteAllText($path, ($meta | ConvertTo-Json), [System.Text.Encoding]::UTF8)
+	PiPwshWriteJsonAtomic (Join-Path $script:PiPwshJobDir ($meta.Name + '.meta.json')) $meta
 }
 
 function PiPwshAllMeta() {
@@ -136,7 +172,17 @@ function PiPwshState($meta) {
 	if ([int]$meta.Pid -gt 0) {
 		$alive = $null -ne (Get-Process -Id ([int]$meta.Pid) -ErrorAction SilentlyContinue)
 	}
-	if ($alive) { return @{ State = 'Running'; ExitCode = $null } }
+	if ($alive) {
+		if ($meta.LaunchPending -eq $true -and [int]$meta.LaunchProcessId -gt 0) {
+			$launcherAlive = $null -ne (Get-Process -Id ([int]$meta.LaunchProcessId) -ErrorAction SilentlyContinue)
+			if ($launcherAlive) { return @{ State = 'Starting'; ExitCode = $null } }
+		}
+		return @{ State = 'Running'; ExitCode = $null }
+	}
+	if ($meta.LaunchPending -eq $true -and [int]$meta.Pid -le 0 -and [int]$meta.LaunchProcessId -gt 0) {
+		$launcherAlive = $null -ne (Get-Process -Id ([int]$meta.LaunchProcessId) -ErrorAction SilentlyContinue)
+		if ($launcherAlive) { return @{ State = 'Starting'; ExitCode = $null } }
+	}
 	# Killed via Stop-Job: taskkill prevents the wrapper from writing the exit file.
 	return @{ State = 'Stopped'; ExitCode = $null }
 }
@@ -208,12 +254,72 @@ function PiPwshReadLogText($meta, [long]$fromOffset) {
 	return $result
 }
 
-function PiPwshWait($metas, [int]$timeoutSec) {
+function PiPwshReadLogChunk($meta, [long]$fromOffset, $decoder, [int]$maxBytes = 65536) {
+	$result = @{ Text = ''; Position = $fromOffset; BytesRead = 0 }
+	if (-not (Test-Path -LiteralPath $meta.LogFile)) { return $result }
+	try {
+		$fs = [System.IO.FileStream]::new($meta.LogFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+		try {
+			if ($fromOffset -gt $fs.Length) { $fromOffset = 0 }
+			$null = $fs.Seek($fromOffset, [System.IO.SeekOrigin]::Begin)
+			$buffer = [byte[]]::new([Math]::Min([long]$maxBytes, $fs.Length - $fromOffset))
+			$count = $fs.Read($buffer, 0, $buffer.Length)
+			$result.Position = $fromOffset + $count
+			$result.BytesRead = $count
+			if ($count -gt 0) {
+				$chars = [char[]]::new([System.Text.Encoding]::UTF8.GetMaxCharCount($count))
+				$charCount = $decoder.GetChars($buffer, 0, $count, $chars, 0, $false)
+				$result.Text = [string]::new($chars, 0, $charCount)
+			}
+		} finally { $fs.Dispose() }
+	} catch { }
+	return $result
+}
+
+function PiPwshWait($metas, [int]$timeoutSec, [string]$pattern) {
 	$deadline = if ($timeoutSec -gt 0) { (Get-Date).AddSeconds($timeoutSec) } else { [DateTime]::MaxValue }
+	$regex = $null
+	$pending = @{}
+	if ($pattern) {
+		try {
+			$regex = [regex]::new($pattern, [System.Text.RegularExpressions.RegexOptions]::CultureInvariant, [TimeSpan]::FromMilliseconds(250))
+		} catch { throw "Wait-Job: invalid -Pattern regex: $($_.Exception.Message)" }
+		foreach ($m in $metas) {
+			$pending[[string]$m.InstanceId] = @{
+				Meta = $m
+				Position = [long]0
+				Window = ''
+				Decoder = [System.Text.Encoding]::UTF8.GetDecoder()
+			}
+		}
+	}
 	while ($true) {
 		$running = 0
-		foreach ($m in $metas) { if ((PiPwshState $m).State -eq 'Running') { $running++ } }
-		if ($running -eq 0) { return }
+		foreach ($m in $metas) {
+			$state = (PiPwshState $m).State
+			if ($state -eq 'Running') { $running++ }
+			if (-not $regex) { continue }
+			$key = [string]$m.InstanceId
+			$scan = $pending[$key]
+			if ($null -eq $scan) { continue }
+			try {
+				do {
+					$chunk = PiPwshReadLogChunk $m ([long]$scan.Position) $scan.Decoder
+					$scan.Position = $chunk.Position
+					if ($chunk.Text) {
+						$scan.Window = ($scan.Window + $chunk.Text)
+						if ($scan.Window.Length -gt 65536) { $scan.Window = $scan.Window.Substring($scan.Window.Length - 65536) }
+						if ($regex.IsMatch($scan.Window)) { $pending.Remove($key); break }
+					}
+				} while ($chunk.BytesRead -ge 65536)
+			} catch [System.Text.RegularExpressions.RegexMatchTimeoutException] {
+				throw 'Wait-Job: -Pattern evaluation timed out. Use a simpler regex.'
+			}
+			if ($state -ne 'Running') { $pending.Remove($key) }
+		}
+		if ($regex) {
+			if ($pending.Count -eq 0) { return }
+		} elseif ($running -eq 0) { return }
 		if ((Get-Date) -ge $deadline) { return }
 		Start-Sleep -Milliseconds 400
 	}
@@ -246,7 +352,10 @@ function Start-Job {
 		# Explicit env overrides/additions, written into the job's wrap script.
 		# (The calling session's environment itself is inherited in memory via
 		# the launcher — no need to re-inject PATH & friends.)
-		[hashtable]$Environment
+		[hashtable]$Environment,
+
+		[ValidateLength(1, 256)]
+		[string]$NotifyOn
 	)
 
 	$jobDir = $script:PiPwshJobDir
@@ -260,6 +369,9 @@ function Start-Job {
 		$ScriptBlock.ToString().Trim()
 	}
 	if ([string]::IsNullOrWhiteSpace($command)) { throw 'Start-Job: empty command.' }
+	if ($NotifyOn -and [System.Text.Encoding]::UTF8.GetByteCount($NotifyOn) -gt 256) {
+		throw 'Start-Job: -NotifyOn must be at most 256 UTF-8 bytes.'
+	}
 
 	$wd = if ($WorkingDirectory) {
 		$ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($WorkingDirectory)
@@ -289,6 +401,8 @@ function Start-Job {
 		if ($Name -notmatch '^[A-Za-z0-9][A-Za-z0-9_.-]*$') {
 			throw "Start-Job: invalid name '$Name'. Use letters, digits, '-', '_' and '.'."
 		}
+		Get-ChildItem -LiteralPath $jobDir -Filter "$Name.meta.pending.*.json" -File -ErrorAction SilentlyContinue |
+			Remove-Item -Force -ErrorAction SilentlyContinue
 
 		$innerFile = Join-Path $jobDir "$Name.cmd.ps1"
 		$wrapFile  = Join-Path $jobDir "$Name.wrap.ps1"
@@ -310,21 +424,68 @@ function Start-Job {
 		# Exit-code epilogue: preserve the real native exit code (pwsh flattens it
 		# to 0/1 otherwise); $? covers cmdlet-only failures. Mirrors the epilogue
 		# the pwsh tool appends to foreground commands (src/spawn.ts).
-		$inner = "$utf8`n$command`n; `$__pipwsh_ok = `$?; if (`$null -ne `$global:LASTEXITCODE) { exit `$global:LASTEXITCODE } else { exit (`$__pipwsh_ok ? 0 : 1) }`n"
+		$strict = if ($env:PIPWSH_STOP_ON_ERROR -eq '1') { "`$ErrorActionPreference = 'Stop';`n" } else { '' }
+		$inner = "$utf8`n$strict`$global:LASTEXITCODE = `$null`n$command`n; `$__pipwsh_ok = `$?; `$__pipwsh_native = `$global:LASTEXITCODE; if (`$__pipwsh_ok) { exit 0 }; if (`$null -ne `$__pipwsh_native -and `$__pipwsh_native -ne 0) { exit `$__pipwsh_native }; exit 1`n"
+		$pwshExe = if ($env:PIPWSH_EXECUTABLE -and (Test-Path -LiteralPath $env:PIPWSH_EXECUTABLE -PathType Leaf)) { $env:PIPWSH_EXECUTABLE } else { Join-Path $PSHOME 'pwsh.exe' }
+		$userArgs = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass')
+		if ($env:PIPWSH_USER_ARGS) {
+			try {
+				$json = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:PIPWSH_USER_ARGS))
+				$parsedArgs = @($json | ConvertFrom-Json)
+				if ($parsedArgs.Count -gt 0 -and @($parsedArgs | Where-Object { $_ -isnot [string] }).Count -eq 0) { $userArgs = [string[]]$parsedArgs }
+			} catch { }
+		}
+		$innerArgsJson = (@($userArgs) + @('-File', $innerFile) | ConvertTo-Json -Compress)
 		$wrap = @"
 $utf8
 $envLines`$ec = 1
 try {
 	Set-Location -LiteralPath $(PiPwshQuote $wd) -ErrorAction Stop
-	pwsh -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $(PiPwshQuote $innerFile) *> $(PiPwshQuote $logFile)
-	if (`$null -ne `$global:LASTEXITCODE) { `$ec = `$global:LASTEXITCODE } else { `$ec = 0 }
+	`$__pipwsh_args = @($(PiPwshQuote $innerArgsJson) | ConvertFrom-Json)
+	`$global:LASTEXITCODE = `$null
+	& $(PiPwshQuote $pwshExe) @__pipwsh_args *> $(PiPwshQuote $logFile)
+	`$__pipwsh_ok = `$?
+	`$__pipwsh_native = `$global:LASTEXITCODE
+	if (`$__pipwsh_ok) { `$ec = 0 } elseif (`$null -ne `$__pipwsh_native -and `$__pipwsh_native -ne 0) { `$ec = `$__pipwsh_native }
 } catch {
 	`$_ | Out-String | Add-Content -LiteralPath $(PiPwshQuote $logFile)
 }
-Set-Content -LiteralPath $(PiPwshQuote $exitFile) -Value `$ec -NoNewline
+`$__pipwsh_exit_temp = $(PiPwshQuote $exitFile) + '.' + `$PID + '.tmp'
+try {
+	[System.IO.File]::WriteAllText(`$__pipwsh_exit_temp, [string]`$ec, [System.Text.Encoding]::ASCII)
+	[System.IO.File]::Move(`$__pipwsh_exit_temp, $(PiPwshQuote $exitFile), `$true)
+} finally {
+	Remove-Item -LiteralPath `$__pipwsh_exit_temp -Force -ErrorAction SilentlyContinue
+}
 "@
 		[System.IO.File]::WriteAllText($innerFile, $inner, [System.Text.Encoding]::UTF8)
 		[System.IO.File]::WriteAllText($wrapFile, $wrap, [System.Text.Encoding]::UTF8)
+		$instanceId = [guid]::NewGuid().ToString('N')
+		$metaFile = Join-Path $jobDir "$Name.meta.json"
+		$pendingMetaFile = Join-Path $jobDir "$Name.meta.pending.$instanceId.json"
+		$meta = [ordered]@{
+			Id               = $id
+			Name             = $Name
+			InstanceId       = $instanceId
+			SessionId        = [string]$env:PIPWSH_SESSION_ID
+			Pid              = 0
+			LaunchPending    = $true
+			LaunchProcessId  = $PID
+			Command          = $command
+			WorkingDirectory = $wd
+			LogFile          = $logFile
+			ExitFile         = $exitFile
+			StartedAt        = [DateTime]::UtcNow.ToString('o')
+			ReadOffset       = 0
+			NotifyOnExit     = $true
+			NotifyOn         = if ($NotifyOn) { $NotifyOn } else { $null }
+			PowerShell       = $pwshExe
+			PowerShellArgs   = $userArgs
+		}
+		# Stage the identity before launch. The short-lived launcher adds the PID
+		# and atomically publishes the registry entry before it exits, so every
+		# process that can become detached is already manageable if this call aborts.
+		PiPwshWriteJsonAtomic $pendingMetaFile $meta
 
 		# Launch DETACHED via double-spawn: a short-lived launcher (child of this
 		# pwsh, so it inherits the FULL session environment) spawns the job and
@@ -337,13 +498,15 @@ Set-Content -LiteralPath $(PiPwshQuote $exitFile) -Value `$ec -NoNewline
 		$procId = 0
 		$pidFile = Join-Path $jobDir "$Name.pid"
 		Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue
-		$pwshExe = Join-Path $PSHOME 'pwsh.exe'
 		try {
 			if ($env:PIPWSH_NODE -and (Test-Path -LiteralPath $env:PIPWSH_NODE)) {
 				$env:PI_PWSH_L_EXE = $pwshExe
 				$env:PI_PWSH_L_ARGS = (@('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $wrapFile) | ConvertTo-Json -Compress)
 				$env:PI_PWSH_L_WD = $wd
 				$env:PI_PWSH_L_PID = $pidFile
+				$env:PI_PWSH_L_PENDING_META = $pendingMetaFile
+				$env:PI_PWSH_L_META = $metaFile
+				$env:PI_PWSH_L_INSTANCE = $instanceId
 				# Start-Process (ShellExecuteEx) is LOAD-BEARING here: it starts the
 				# launcher WITHOUT inheriting handles from this process. A plain
 				# `& node ...` child inherits EVERY inheritable handle — including the
@@ -360,10 +523,10 @@ Set-Content -LiteralPath $(PiPwshQuote $exitFile) -Value `$ec -NoNewline
 					$launcher = Start-Process -FilePath $env:PIPWSH_NODE -ArgumentList ('"' + $script:PiPwshLauncherNode + '"') -WindowStyle Hidden -PassThru
 					if (-not $launcher.WaitForExit(5000)) { try { $launcher.Kill() } catch { } }
 				} finally {
-					Remove-Item Env:PI_PWSH_L_EXE, Env:PI_PWSH_L_ARGS, Env:PI_PWSH_L_WD, Env:PI_PWSH_L_PID -ErrorAction SilentlyContinue
+					Remove-Item Env:PI_PWSH_L_EXE, Env:PI_PWSH_L_ARGS, Env:PI_PWSH_L_WD, Env:PI_PWSH_L_PID, Env:PI_PWSH_L_PENDING_META, Env:PI_PWSH_L_META, Env:PI_PWSH_L_INSTANCE -ErrorAction SilentlyContinue
 				}
 			} else {
-				& $pwshExe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $script:PiPwshLauncher -WrapFile $wrapFile -PidFile $pidFile -WorkingDirectory $wd *> $null
+				& $pwshExe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $script:PiPwshLauncher -PowerShellExecutable $pwshExe -WrapFile $wrapFile -PidFile $pidFile -PendingMetaFile $pendingMetaFile -MetaFile $metaFile -InstanceId $instanceId -WorkingDirectory $wd *> $null
 			}
 			if (Test-Path -LiteralPath $pidFile) {
 				$null = [int]::TryParse(((Get-Content -LiteralPath $pidFile -Raw).Trim()), [ref]$procId)
@@ -376,19 +539,10 @@ Set-Content -LiteralPath $(PiPwshQuote $exitFile) -Value `$ec -NoNewline
 			$p = Start-Process -FilePath $pwshExe -ArgumentList @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $wrapFile + '"')) -WorkingDirectory $wd -WindowStyle Hidden -PassThru
 			$procId = $p.Id
 		}
-
-		$meta = [ordered]@{
-			Id               = $id
-			Name             = $Name
-			Pid              = $procId
-			Command          = $command
-			WorkingDirectory = $wd
-			LogFile          = $logFile
-			ExitFile         = $exitFile
-			StartedAt        = [DateTime]::UtcNow.ToString('o')
-			ReadOffset       = 0
-		}
-		[System.IO.File]::WriteAllText((Join-Path $jobDir "$Name.meta.json"), ($meta | ConvertTo-Json), [System.Text.Encoding]::UTF8)
+		$meta.Pid = $procId
+		$meta.LaunchPending = $false
+		PiPwshWriteMeta $meta
+		Remove-Item -LiteralPath $pendingMetaFile -Force -ErrorAction SilentlyContinue
 	} finally {
 		if ($locked) { $mutex.ReleaseMutex() }
 		$mutex.Dispose()
@@ -406,7 +560,7 @@ function Get-Job {
 
 		[int[]]$Id,
 
-		[ValidateSet('Running', 'Completed', 'Failed', 'Stopped')]
+		[ValidateSet('Starting', 'Running', 'Completed', 'Failed', 'Stopped')]
 		[string]$State,
 
 		[int]$Newest
@@ -482,13 +636,17 @@ function Wait-Job {
 		[Parameter(Mandatory = $true, ParameterSetName = 'Id')]
 		[int[]]$Id,
 
-		[int]$Timeout
+		[ValidateRange(0, 86400)]
+		[int]$Timeout,
+
+		[ValidateLength(1, 1024)]
+		[string]$Pattern
 	)
 
 	begin { $targets = @() }
 	process { $targets += @(PiPwshResolve $Job $Name $Id) }
 	end {
-		PiPwshWait $targets $Timeout
+		PiPwshWait $targets $Timeout $Pattern
 		$targets | ForEach-Object { PiPwshToObject (PiPwshReadMeta $_.Name) }
 	}
 }
@@ -509,8 +667,10 @@ function Stop-Job {
 
 	process {
 		foreach ($m in @(PiPwshResolve $Job $Name $Id)) {
-			if ((PiPwshState $m).State -eq 'Running') {
-				PiPwshKillTree ([int]$m.Pid)
+			$state = (PiPwshState $m).State
+			if ($state -in 'Starting', 'Running') {
+				$killPid = if ($state -eq 'Starting') { [int]$m.LaunchProcessId } else { [int]$m.Pid }
+				PiPwshKillTree $killPid
 			}
 			PiPwshToObject (PiPwshReadMeta $m.Name)
 		}
@@ -535,15 +695,22 @@ function Remove-Job {
 
 	process {
 		foreach ($m in @(PiPwshResolve $Job $Name $Id)) {
-			if ((PiPwshState $m).State -eq 'Running') {
+			$state = (PiPwshState $m).State
+			if ($state -in 'Starting', 'Running') {
 				if (-not $Force) {
 					Write-Error "Job '$($m.Name)' is still running. Use Stop-Job first or Remove-Job -Force."
 					continue
 				}
-				PiPwshKillTree ([int]$m.Pid)
+				$killPid = if ($state -eq 'Starting') { [int]$m.LaunchProcessId } else { [int]$m.Pid }
+				PiPwshKillTree $killPid
 			}
 			foreach ($suffix in '.meta.json', '.cmd.ps1', '.wrap.ps1', '.log', '.exit', '.pid') {
 				Remove-Item -LiteralPath (Join-Path $script:PiPwshJobDir ($m.Name + $suffix)) -Force -ErrorAction SilentlyContinue
+			}
+			if ([string]$m.InstanceId -match '^[0-9a-f]{32}$') {
+				foreach ($kind in 'ready', 'exit') {
+					Remove-Item -LiteralPath (Join-Path $script:PiPwshJobDir ("$($m.InstanceId).$kind.notified")) -Force -ErrorAction SilentlyContinue
+				}
 			}
 			PiPwshToObject $m
 		}
@@ -588,10 +755,13 @@ QUICK START
 
   Start-Job -ScriptBlock { npm run build } -Name build | Wait-Job | Receive-Job
 
+Completion is reported automatically, so continue other work after starting a
+job. For a server, use -NotifyOn to also report when its first ready line appears.
+
 STARTING JOBS
 -------------
-Start-Job -ScriptBlock <scriptblock> [-Name <name>] [-WorkingDirectory <dir>] [-Environment @{NAME='value'}]
-Start-Job -FilePath <script.ps1>    [-Name <name>] [-WorkingDirectory <dir>] [-Environment @{NAME='value'}]
+Start-Job -ScriptBlock <scriptblock> [-Name <name>] [-WorkingDirectory <dir>] [-Environment @{NAME='value'}] [-NotifyOn <literal>]
+Start-Job -FilePath <script.ps1>    [-Name <name>] [-WorkingDirectory <dir>] [-Environment @{NAME='value'}] [-NotifyOn <literal>]
   - Returns immediately with a job object. Names are auto-allocated (Job1, Job2, ...)
     when -Name is omitted; reuse of an existing name is an error.
   - Appending ` &` to any single-pipeline command is rewritten to Start-Job
@@ -606,12 +776,14 @@ Start-Job -FilePath <script.ps1>    [-Name <name>] [-WorkingDirectory <dir>] [-E
     the command itself.
   - All output streams (stdout, stderr, verbose, warnings, native output) are
     merged into one log: $env:TEMP\pi-pwsh-jobs\<name>.log
+  - -NotifyOn is a bounded literal text match, not a regex. Use it for a stable
+    readiness line such as "Listening on"; it reports the first match once.
 
 CHECKING STATUS
 ---------------
 Get-Job [[-Name] <patterns>] [-Id <ints>] [-State <state>] [-Newest <n>]
   - -Name accepts wildcards: Get-Job dev*
-  - State: Running | Completed | Failed | Stopped (killed).
+  - State: Starting | Running | Completed | Failed | Stopped (killed).
   - ExitCode is on the object: Get-Job | Select-Object Name, State, ExitCode
     Completed = exit 0, Failed = exit code != 0.
   - HasMoreData = there is unread log output.
@@ -625,16 +797,19 @@ Receive-Job [-Job <jobs>] | -Name <patterns> | -Id <ints> [-Keep] [-Wait] [-Tail
   - -Keep: read without consuming (next read returns it again).
   - -Tail N: peek at the last N lines, ignores read offset.
   - -Wait: block until the job finishes, then read.
-  - Output is plain text lines, so it composes:
+  - Keep model context bounded: prefer -Tail and Select-String over reading an
+    entire large log. Output is plain text lines, so it composes:
       Receive-Job -Name dev | Select-Object -Last 20
       Receive-Job -Name dev | Select-String 'ERROR'
 
 WAITING
 -------
-Wait-Job [-Job <jobs>] | -Name <patterns> | -Id <ints> [-Timeout <seconds>]
-  - Blocks the current pwsh call until the jobs finish (or timeout).
-    Prefer polling with Get-Job / Receive-Job when possible; if you do wait,
-    set the pwsh tool's timeout accordingly.
+Wait-Job [-Job <jobs>] | -Name <patterns> | -Id <ints> [-Timeout <seconds>] [-Pattern <regex>]
+  - Blocks until each job finishes, or until -Timeout expires.
+  - With -Pattern, each job is also released when its output matches the regex.
+    Matching uses a bounded rolling window and a regex evaluation timeout.
+  - Use Wait-Job only when the next action requires the result, and set the pwsh
+    tool timeout long enough to cover the requested wait.
 
 STOPPING / CLEANUP
 ------------------

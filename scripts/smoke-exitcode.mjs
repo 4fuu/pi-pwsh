@@ -13,6 +13,8 @@ const cases = [
 	["Write-Output 'x'", 0], // cmdlet success with output
 	["Get-Item C:\\definitely-missing-pipwsh", 1], // cmdlet failure, no native call
 	["cmd /c exit 0", 0], // native success
+	["cmd /c exit 9; Get-Date | Out-Null", 0], // final success beats stale native failure
+	["cmd /c exit 0; Get-Item C:\\definitely-missing-pipwsh", 1], // final cmdlet failure beats native success
 	["Get-ChildItem `", 0], // trailing backtick (line continuation): epilogue must not glue into the command
 ];
 

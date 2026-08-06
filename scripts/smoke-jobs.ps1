@@ -2,6 +2,8 @@
 # Every Invoke-Pwsh call is a fresh pwsh process — exactly like a pwsh tool call —
 # so this verifies that jobs genuinely persist across calls via the file registry.
 $ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 $prelude = Join-Path $PSScriptRoot '..' 'src' 'jobs.ps1'
 $jobDir = Join-Path $env:TEMP 'pi-pwsh-jobs'
 
@@ -9,6 +11,7 @@ $script:pass = 0; $script:fail = 0
 # Exercise the Node launcher path (the extension passes process.execPath the same way).
 $nodeExe = (Get-Command node.exe -ErrorAction SilentlyContinue).Source
 if ($nodeExe) { $env:PIPWSH_NODE = $nodeExe }
+$env:PIPWSH_SESSION_ID = 'pi-pwsh-smoke-session'
 function Invoke-Pwsh([string]$cmd) {
     $q = "'" + ($prelude -replace "'", "''") + "'"
     $full = "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(`$false); `$OutputEncoding = [System.Text.UTF8Encoding]::new(`$false); if (`$null -ne `$PSStyle) { `$PSStyle.OutputRendering = 'PlainText' }; . $q; $cmd"
@@ -54,6 +57,10 @@ Assert 'failed-7-keeps-log' ($r.Output -match 'x') $r.Output
 Invoke-Pwsh "Start-Job { Get-Item C:\definitely-missing-pipwsh } -Name ecmdlet" | Out-Null
 $r = Invoke-Pwsh "Wait-Job -Name ecmdlet | Out-Null; Get-Job -Name ecmdlet | Select-Object State, ExitCode | Out-String"
 Assert 'failed-cmdlet' ($r.Output -match 'Failed' -and $r.Output -match '1') $r.Output
+# A later successful command must beat a stale native failure code.
+Invoke-Pwsh "Start-Job { cmd /c exit 9; Write-Output 'recovered' } -Name stale" | Out-Null
+$r = Invoke-Pwsh "Wait-Job -Name stale | Out-Null; Get-Job -Name stale | Select-Object State, ExitCode | Out-String"
+Assert 'stale-native-code-cleared' ($r.Output -match 'Completed' -and $r.Output -match '0') $r.Output
 
 # --- 3. duplicate name, CJK, Get-Job filters ---------------------------------
 Invoke-Pwsh "Start-Job { Write-Output 'keep-me-content' } -Name dup" | Out-Null
@@ -142,6 +149,31 @@ Assert 'start-long-job-returns-fast' ($elapsed -lt 15) ("took ${elapsed}s")
 # pwsh launcher fallback (PIPWSH_NODE unset) still launches jobs fine.
 $r = Invoke-Pwsh "`$env:PIPWSH_NODE = ''; Start-Job { 'via-ps-launcher' } -Name psl | Out-Null; Wait-Job -Name psl | Out-Null; Receive-Job -Name psl"
 Assert 'pwsh-launcher-fallback' ($r.Output -match 'via-ps-launcher') $r.Output
+
+# --- 5e. readiness wait + durable notification metadata ----------------------
+Invoke-Pwsh "Start-Job { Write-Output 'booting'; Start-Sleep -Milliseconds 300; Write-Output 'READY on 4321'; Start-Sleep 60 } -Name ready -NotifyOn 'READY on'" | Out-Null
+$t = Get-Date
+$r = Invoke-Pwsh "Wait-Job -Name ready -Pattern 'READY\s+on' -Timeout 10 | Out-Null; Get-Job -Name ready | Select-Object -ExpandProperty State"
+$elapsed = ((Get-Date) - $t).TotalSeconds
+Assert 'wait-pattern-releases-running-job' ($elapsed -lt 8 -and $r.Output -match 'Running') ("elapsed=${elapsed}s " + $r.Output)
+$meta = Get-Content -LiteralPath (Join-Path $jobDir 'ready.meta.json') -Raw | ConvertFrom-Json
+Assert 'notification-metadata' (
+	$meta.SessionId -eq 'pi-pwsh-smoke-session' -and
+	$meta.InstanceId -match '^[0-9a-f]{32}$' -and
+	$meta.NotifyOn -eq 'READY on' -and
+	$meta.NotifyOnExit -eq $true -and
+	[System.IO.Path]::IsPathFullyQualified([string]$meta.PowerShell)
+) ($meta | ConvertTo-Json -Compress)
+Invoke-Pwsh "Remove-Job -Name ready -Force" | Out-Null
+$boundaryCommand = "Write-Output (('x' * 65535) + '中文READY'); Start-Sleep 60"
+Invoke-Pwsh "Start-Job { $boundaryCommand } -Name utf8boundary" | Out-Null
+$t = Get-Date
+$r = Invoke-Pwsh "Wait-Job -Name utf8boundary -Pattern '中文READY' -Timeout 10 | Out-Null; Get-Job -Name utf8boundary | Select-Object -ExpandProperty State"
+$elapsed = ((Get-Date) - $t).TotalSeconds
+Assert 'wait-pattern-utf8-chunk-boundary' ($elapsed -lt 8 -and $r.Output -match 'Running') ("elapsed=${elapsed}s " + $r.Output)
+Invoke-Pwsh "Remove-Job -Name utf8boundary -Force" | Out-Null
+$r = Invoke-Pwsh "Start-Job { 1 } -Name notifylong -NotifyOn '$('中' * 100)'"
+Assert 'notify-pattern-byte-limit' ($r.Output -match '256 UTF-8 bytes') $r.Output
 
 # --- 6. stubs, FilePath, Get-JobHelp ------------------------------------------
 $r = Invoke-Pwsh "Suspend-Job"
