@@ -1,10 +1,10 @@
 /**
- * pi-pwsh — Route pi's shell, directory listing, and search tasks through
- * PowerShell 7 (`pwsh`), including background jobs that survive tool calls.
+ * pi-pwsh — Route pi's shell tasks through PowerShell 7 (`pwsh`), including
+ * background jobs that survive tool calls.
  *
  * Why: Windows has no reliable bash. A tool named "bash" also primes the model
- * to emit POSIX syntax. This extension disables `bash`, `ls`, `find`, and `grep`,
- * then registers a `pwsh` tool that reuses pi's built-in bash tool definition
+ * to emit POSIX syntax. This extension replaces `bash` with a `pwsh` tool that
+ * reuses pi's built-in bash tool definition
  * (tail truncation, temp files for full output, non-zero exit codes as tool errors, streaming preview,
  * built-in renderer) with only the spawn layer swapped to pwsh.
  *
@@ -209,7 +209,7 @@ export default function (pi: ExtensionAPI) {
 		});
 
 		const active = pi.getActiveTools();
-		const disabled = new Set(["bash", "ls", "find", "grep", "pwsh"]);
-		pi.setActiveTools([...active.filter((name) => !disabled.has(name)), "pwsh"]);
+		const replaced = new Set(["bash", "pwsh"]);
+		pi.setActiveTools([...active.filter((name) => !replaced.has(name)), "pwsh"]);
 	});
 }

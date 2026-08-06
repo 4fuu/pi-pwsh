@@ -57,6 +57,9 @@ for (const handler of handlers.get("session_start") ?? []) {
 assert.ok(tool, `pwsh tool was not registered: ${JSON.stringify(notifications)}`);
 assert.ok(activeTools.includes("pwsh"));
 assert.ok(!activeTools.includes("bash"));
+assert.ok(activeTools.includes("ls"));
+assert.ok(activeTools.includes("find"));
+assert.ok(activeTools.includes("grep"));
 
 let call = 0;
 async function run(command, timeout) {
