@@ -18,6 +18,8 @@ This file is injected only for job-related commands and must produce NO output.
 #>
 
 $script:PiPwshJobDir = Join-Path $env:TEMP 'pi-pwsh-jobs'
+$script:PiPwshJobObjects = @{}
+$script:PiPwshJobSnapshots = @{}
 
 # ---------------------------------------------------------------------------
 # Formatting: native-like table view for job objects.
@@ -187,23 +189,85 @@ function PiPwshState($meta) {
 	return @{ State = 'Stopped'; ExitCode = $null }
 }
 
-function PiPwshToObject($meta) {
+function PiPwshObjectKey($value) {
+	$instanceId = [string]$value.InstanceId
+	$compactId = $instanceId.Replace('-', '').ToLowerInvariant()
+	if (-not [string]::IsNullOrWhiteSpace($instanceId) -and $compactId -ne ('0' * 32)) {
+		return $compactId
+	}
+	return "legacy:$([string]$value.Name):$([string]$value.StartedAt)"
+}
+
+function PiPwshCreateSnapshot($meta) {
 	$st = PiPwshState $meta
 	$logLen = 0
 	try { if (Test-Path -LiteralPath $meta.LogFile) { $logLen = (Get-Item -LiteralPath $meta.LogFile).Length } } catch { }
+	[pscustomobject]@{
+		State       = [string]$st.State
+		HasMoreData = $logLen -gt [long]$meta.ReadOffset
+		Pid         = [int]$meta.Pid
+		ExitCode    = $st.ExitCode
+	}
+}
+
+function PiPwshObjectSnapshot($job) {
+	$key = PiPwshObjectKey $job
+	$current = PiPwshReadMeta ([string]$job.Name)
+	if ($current -and (PiPwshObjectKey $current) -eq $key) {
+		$script:PiPwshJobSnapshots[$key] = PiPwshCreateSnapshot $current
+	}
+	if ($script:PiPwshJobSnapshots.ContainsKey($key)) {
+		return $script:PiPwshJobSnapshots[$key]
+	}
+	return $null
+}
+
+function PiPwshToObject($meta) {
+	$key = PiPwshObjectKey $meta
+	$current = PiPwshReadMeta ([string]$meta.Name)
+	if ($current -and (PiPwshObjectKey $current) -eq $key) {
+		$script:PiPwshJobSnapshots[$key] = PiPwshCreateSnapshot $current
+	} elseif (-not $script:PiPwshJobSnapshots.ContainsKey($key)) {
+		$script:PiPwshJobSnapshots[$key] = PiPwshCreateSnapshot $meta
+	}
+	if ($script:PiPwshJobObjects.ContainsKey($key)) {
+		return $script:PiPwshJobObjects[$key]
+	}
+
+	$instanceId = [guid]::Empty
+	$null = [guid]::TryParse([string]$meta.InstanceId, [ref]$instanceId)
 	$o = [pscustomobject]@{
 		Id          = [int]$meta.Id
 		Name        = [string]$meta.Name
-		State       = $st.State
-		HasMoreData = ($logLen -gt [long]$meta.ReadOffset)
+		InstanceId  = $instanceId
 		Location    = [string]$meta.WorkingDirectory
 		Command     = [string]$meta.Command
-		Pid         = [int]$meta.Pid
-		ExitCode    = $st.ExitCode
 		LogFile     = [string]$meta.LogFile
 		StartedAt   = [string]$meta.StartedAt
 	}
+	$o | Add-Member -MemberType ScriptProperty -Name State -Value {
+		$snapshot = PiPwshObjectSnapshot $this
+		return $(if ($snapshot) { [string]$snapshot.State } else { 'Stopped' })
+	}
+	$o | Add-Member -MemberType ScriptProperty -Name JobStateInfo -Value {
+		$name = if ([string]$this.State -eq 'Starting') { 'NotStarted' } else { [string]$this.State }
+		$state = [System.Enum]::Parse([System.Management.Automation.JobState], $name)
+		return [System.Management.Automation.JobStateInfo]::new($state)
+	}
+	$o | Add-Member -MemberType ScriptProperty -Name HasMoreData -Value {
+		$snapshot = PiPwshObjectSnapshot $this
+		return $null -ne $snapshot -and [bool]$snapshot.HasMoreData
+	}
+	$o | Add-Member -MemberType ScriptProperty -Name Pid -Value {
+		$snapshot = PiPwshObjectSnapshot $this
+		return $(if ($snapshot) { [int]$snapshot.Pid } else { 0 })
+	}
+	$o | Add-Member -MemberType ScriptProperty -Name ExitCode -Value {
+		$snapshot = PiPwshObjectSnapshot $this
+		return $(if ($snapshot) { $snapshot.ExitCode } else { $null })
+	}
 	$o.PSObject.TypeNames.Insert(0, 'PiPwsh.Job')
+	$script:PiPwshJobObjects[$key] = $o
 	$o
 }
 
@@ -213,8 +277,16 @@ function PiPwshResolve($jobs, $names, $ids) {
 	foreach ($j in @($jobs)) {
 		if ($null -eq $j) { continue }
 		$m = $null
-		if ($j -is [string]) { $m = PiPwshReadMeta $j }
-		elseif ($j.PSObject.Properties['Name']) { $m = PiPwshReadMeta ([string]$j.Name) }
+		if ($j -is [string]) {
+			$m = PiPwshReadMeta $j
+		} elseif ($j.PSObject.Properties['Name']) {
+			$m = PiPwshReadMeta ([string]$j.Name)
+			$instanceId = if ($j.PSObject.Properties['InstanceId']) { [string]$j.InstanceId } else { '' }
+			$compactId = $instanceId.Replace('-', '')
+			if ($m -and -not [string]::IsNullOrWhiteSpace($instanceId) -and $compactId -ne ('0' * 32) -and (PiPwshObjectKey $m) -ne (PiPwshObjectKey $j)) {
+				$m = $null
+			}
+		}
 		if ($m) { $found += $m } else { Write-Error "Job '$j' not found." }
 	}
 	foreach ($n in @($names)) {
@@ -646,8 +718,9 @@ function Wait-Job {
 	begin { $targets = @() }
 	process { $targets += @(PiPwshResolve $Job $Name $Id) }
 	end {
+		$targets | ForEach-Object { $null = PiPwshToObject $_ }
 		PiPwshWait $targets $Timeout $Pattern
-		$targets | ForEach-Object { PiPwshToObject (PiPwshReadMeta $_.Name) }
+		$targets | ForEach-Object { PiPwshToObject $_ }
 	}
 }
 
@@ -667,12 +740,13 @@ function Stop-Job {
 
 	process {
 		foreach ($m in @(PiPwshResolve $Job $Name $Id)) {
+			$object = PiPwshToObject $m
 			$state = (PiPwshState $m).State
 			if ($state -in 'Starting', 'Running') {
 				$killPid = if ($state -eq 'Starting') { [int]$m.LaunchProcessId } else { [int]$m.Pid }
 				PiPwshKillTree $killPid
 			}
-			PiPwshToObject (PiPwshReadMeta $m.Name)
+			PiPwshToObject $m
 		}
 	}
 }
@@ -695,6 +769,7 @@ function Remove-Job {
 
 	process {
 		foreach ($m in @(PiPwshResolve $Job $Name $Id)) {
+			$object = PiPwshToObject $m
 			$state = (PiPwshState $m).State
 			if ($state -in 'Starting', 'Running') {
 				if (-not $Force) {
@@ -703,6 +778,7 @@ function Remove-Job {
 				}
 				$killPid = if ($state -eq 'Starting') { [int]$m.LaunchProcessId } else { [int]$m.Pid }
 				PiPwshKillTree $killPid
+				$object = PiPwshToObject $m
 			}
 			foreach ($suffix in '.meta.json', '.cmd.ps1', '.wrap.ps1', '.log', '.exit', '.pid') {
 				Remove-Item -LiteralPath (Join-Path $script:PiPwshJobDir ($m.Name + $suffix)) -Force -ErrorAction SilentlyContinue
@@ -712,7 +788,7 @@ function Remove-Job {
 					Remove-Item -LiteralPath (Join-Path $script:PiPwshJobDir ("$($m.InstanceId).$kind.notified")) -Force -ErrorAction SilentlyContinue
 				}
 			}
-			PiPwshToObject $m
+			$object
 		}
 	}
 }
@@ -784,6 +860,8 @@ CHECKING STATUS
 Get-Job [[-Name] <patterns>] [-Id <ints>] [-State <state>] [-Newest <n>]
   - -Name accepts wildcards: Get-Job dev*
   - State: Starting | Running | Completed | Failed | Stopped (killed).
+  - Returned PiPwsh.Job objects refresh State, JobStateInfo, HasMoreData, Pid,
+    and ExitCode from durable state while the current pwsh call remains alive.
   - ExitCode is on the object: Get-Job | Select-Object Name, State, ExitCode
     Completed = exit 0, Failed = exit code != 0.
   - HasMoreData = there is unread log output.

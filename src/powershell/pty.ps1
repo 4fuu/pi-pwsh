@@ -3,20 +3,53 @@
 
 . (Join-Path $PSScriptRoot 'rpc.ps1')
 
+$script:PiPwshPtyObjects = @{}
+$script:PiPwshPtySnapshots = @{}
+$script:PiPwshRemovedPtys = @{}
+
+function Get-PiPtyValue($pty) {
+	$id = [int]$pty.Id
+	if ($script:PiPwshRemovedPtys.ContainsKey($id)) {
+		return $script:PiPwshPtySnapshots[$id]
+	}
+	$value = Invoke-PiPwshRpc -Method 'pty.get' -Parameters @{ id = $id }
+	$script:PiPwshPtySnapshots[$id] = $value
+	return $value
+}
+
 function ConvertTo-PiPtyObject($value) {
 	if ($null -eq $value) { return $null }
+	$id = [int]$value.id
+	$script:PiPwshPtySnapshots[$id] = $value
+	if ($script:PiPwshPtyObjects.ContainsKey($id)) {
+		return $script:PiPwshPtyObjects[$id]
+	}
+
 	$o = [pscustomobject]@{
-		Id               = [int]$value.id
+		Id               = $id
 		Name             = [string]$value.name
-		State            = [string]$value.state
-		HasMoreData      = [bool]$value.hasMoreData
-		Pid              = [int]$value.pid
-		ExitCode         = if ($null -eq $value.exitCode) { $null } else { [int]$value.exitCode }
 		Location         = [string]$value.workingDirectory
-		Columns          = [int]$value.columns
-		Rows             = [int]$value.rows
 		Command          = [string]$value.command
 		StartedAt        = [string]$value.startedAt
+	}
+	$o | Add-Member -MemberType ScriptProperty -Name State -Value {
+		[string](Get-PiPtyValue $this).state
+	}
+	$o | Add-Member -MemberType ScriptProperty -Name HasMoreData -Value {
+		[bool](Get-PiPtyValue $this).hasMoreData
+	}
+	$o | Add-Member -MemberType ScriptProperty -Name Pid -Value {
+		[int](Get-PiPtyValue $this).pid
+	}
+	$o | Add-Member -MemberType ScriptProperty -Name ExitCode -Value {
+		$value = (Get-PiPtyValue $this).exitCode
+		return $(if ($null -eq $value) { $null } else { [int]$value })
+	}
+	$o | Add-Member -MemberType ScriptProperty -Name Columns -Value {
+		[int](Get-PiPtyValue $this).columns
+	}
+	$o | Add-Member -MemberType ScriptProperty -Name Rows -Value {
+		[int](Get-PiPtyValue $this).rows
 	}
 	$o.PSObject.TypeNames.Insert(0, 'PiPwsh.Pty')
 	$display = [System.Management.Automation.PSPropertySet]::new(
@@ -24,6 +57,7 @@ function ConvertTo-PiPtyObject($value) {
 		[string[]]@('Id', 'Name', 'State', 'HasMoreData', 'Pid', 'ExitCode', 'Command')
 	)
 	$o | Add-Member -MemberType MemberSet -Name PSStandardMembers -Value ([System.Management.Automation.PSMemberInfo[]]@($display))
+	$script:PiPwshPtyObjects[$id] = $o
 	$o
 }
 
@@ -234,7 +268,10 @@ function Remove-Pty {
 			$ref = if ($PSCmdlet.ParameterSetName -eq 'Name') { @{ name = $Name } } elseif ($PSCmdlet.ParameterSetName -eq 'Id') { @{ id = $Id } } else { ConvertTo-PiPtyRef $target $null $null }
 			$params = @{} + $ref
 			if ($Force) { $params.force = $true }
-			ConvertTo-PiPtyObject (Invoke-PiPwshRpc -Method 'pty.remove' -Parameters $params)
+			$value = Invoke-PiPwshRpc -Method 'pty.remove' -Parameters $params
+			$object = ConvertTo-PiPtyObject $value
+			$script:PiPwshRemovedPtys[[int]$value.id] = $true
+			$object
 		}
 	}
 }
@@ -271,6 +308,8 @@ STATUS
 Get-Pty [[-Name] <patterns>] [-Id <ids>] [-State <state>] [-Newest <n>]
   - -Name accepts wildcards: Get-Pty dev*
   - State: Running | Completed | Failed | Stopped.
+  - Returned PiPwsh.Pty objects refresh State, HasMoreData, Pid, ExitCode,
+    Columns, and Rows from the live PTY while the current pwsh call remains alive.
   - ExitCode is on the object.
   - HasMoreData = there is unread output.
 

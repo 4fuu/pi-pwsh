@@ -129,6 +129,23 @@ try {
 	assert.match(output, /Hello Ada/);
 	await run("Remove-Pty -Name smoke | Out-Null");
 
+	const livePty = await run("$pty = Start-Pty -Command 'Start-Sleep -Milliseconds 400; Write-Output live-output' -Name livepty; $before = [string]$pty.State; Resize-Pty $pty -Columns 88 -Rows 22 | Out-Null; $same = [object]::ReferenceEquals($pty, (Get-Pty -Id $pty.Id)); Wait-Pty $pty -Exit -Timeout 10 | Out-Null; $hasDataBefore = $pty.HasMoreData; Receive-Pty $pty | Out-Null; [pscustomobject]@{ Before = $before; After = [string]$pty.State; ExitCode = $pty.ExitCode; Same = $same; HasDataBefore = $hasDataBefore; HasDataAfter = $pty.HasMoreData; Columns = $pty.Columns; Rows = $pty.Rows } | ConvertTo-Json -Compress");
+	assert.match(livePty, /"Before":"Running"/);
+	assert.match(livePty, /"After":"Completed"/);
+	assert.match(livePty, /"ExitCode":0/);
+	assert.match(livePty, /"Same":true/);
+	assert.match(livePty, /"HasDataBefore":true/);
+	assert.match(livePty, /"HasDataAfter":false/);
+	assert.match(livePty, /"Columns":88/);
+	assert.match(livePty, /"Rows":22/);
+	const removedLivePty = await run("$pty = Get-Pty -Name livepty; $removed = Remove-Pty $pty; [pscustomobject]@{ Same = [object]::ReferenceEquals($pty, $removed); State = [string]$pty.State; ExitCode = $pty.ExitCode } | ConvertTo-Json -Compress");
+	assert.match(removedLivePty, /"Same":true/);
+	assert.match(removedLivePty, /"State":"Completed"/);
+	assert.match(removedLivePty, /"ExitCode":0/);
+	const missingPtyFailure = await run("$pty = Start-Pty -Command 'Start-Sleep 60' -Name missingpty; $null = Invoke-PiPwshRpc -Method 'pty.remove' -Parameters @{ id = $pty.Id; force = $true }; $Error.Clear(); $state = $pty.State; [pscustomobject]@{ ReturnedStaleState = $null -ne $state; ErrorCount = $Error.Count } | ConvertTo-Json -Compress");
+	assert.match(missingPtyFailure, /"ReturnedStaleState":false/);
+	assert.match(missingPtyFailure, /"ErrorCount":[1-9][0-9]*/);
+
 	const requestHelp = await run("Get-PiRequestHelp");
 	assert.match(requestHelp, /Ask the user for input, confirmation, or selection/);
 	assert.equal((await run("Request-PiInput -Title Test -Prompt Name")).trim(), "Ada");

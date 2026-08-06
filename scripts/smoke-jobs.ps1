@@ -44,6 +44,29 @@ Assert 'receive-consumed-empty' ($r.Output.Trim() -eq '') $r.Output
 $r = Invoke-Pwsh "Receive-Job -Name Job1 -Tail 5"
 Assert 'receive-tail-ignores-offset' ($r.Output -match 'hello world') $r.Output
 
+# A returned job object remains live for the rest of the current pwsh call.
+$r = Invoke-Pwsh '$job = Start-Job { Start-Sleep -Milliseconds 1200 } -Name liveobj; $before = [string]$job.State; Start-Sleep -Milliseconds 2200; $same = [object]::ReferenceEquals($job, (Get-Job -Name liveobj)); [pscustomobject]@{ Before = $before; After = [string]$job.State; JobState = [string]$job.JobStateInfo.State; Same = $same; InstanceId = [string]$job.InstanceId; InstanceIdType = $job.InstanceId.GetType().FullName } | ConvertTo-Json -Compress'
+Assert 'live-job-object' (
+	$r.Output -match '"Before":"Running"' -and
+	$r.Output -match '"After":"Completed"' -and
+	$r.Output -match '"JobState":"Completed"' -and
+	$r.Output -match '"Same":true' -and
+	$r.Output -match '"InstanceId":"[0-9a-f-]{36}"' -and
+	$r.Output -match '"InstanceIdType":"System.Guid"'
+) $r.Output
+Invoke-Pwsh 'Remove-Job -Name liveobj' | Out-Null
+
+# Removed wrappers keep their final state and cannot target a reused name/Id.
+$r = Invoke-Pwsh '$old = Start-Job { Write-Output old-output } -Name reuse; Wait-Job $old | Out-Null; $removed = Remove-Job $old; $same = [object]::ReferenceEquals($old, $removed); $removedState = [string]$old.State; $removedExit = $old.ExitCode; $new = Start-Job { Start-Sleep 60 } -Name reuse; Stop-Job $old -ErrorAction SilentlyContinue | Out-Null; Remove-Job $old -ErrorAction SilentlyContinue | Out-Null; $newState = [string]((Get-Job -Name reuse).State); $oldStateAfterReuse = [string]$old.State; $oldExitAfterReuse = $old.ExitCode; Remove-Job $new -Force | Out-Null; [pscustomobject]@{ Same = $same; RemovedState = $removedState; RemovedExit = $removedExit; NewState = $newState; OldStateAfterReuse = $oldStateAfterReuse; OldExitAfterReuse = $oldExitAfterReuse } | ConvertTo-Json -Compress'
+Assert 'removed-job-instance-isolation' (
+	$r.Output -match '"Same":true' -and
+	$r.Output -match '"RemovedState":"Completed"' -and
+	$r.Output -match '"RemovedExit":0' -and
+	$r.Output -match '"NewState":"Running"' -and
+	$r.Output -match '"OldStateAfterReuse":"Completed"' -and
+	$r.Output -match '"OldExitAfterReuse":0'
+) $r.Output
+
 # --- 2. exit code propagation: native 42, explicit exit 7 --------------------
 Invoke-Pwsh "Start-Job { cmd /c exit 42 } -Name e42" | Out-Null
 $r = Invoke-Pwsh "Wait-Job -Name e42 | Out-Null; Get-Job -Name e42 | Select-Object State, ExitCode | Out-String"
