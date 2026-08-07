@@ -74,6 +74,8 @@ Get-PiRequestHelp
 
 For terminal logins, `Request-PiPtyInput -Secret` sends input directly from the UI to a PTY without returning the secret to PowerShell or the model.
 
+![Example of user requests in the pi TUI](docs/request_tui.png)
+
 ## Configuration
 
 Configuration is optional. Create `~/.pi/agent/pwsh.json` and run `/reload` after changing it:
