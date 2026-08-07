@@ -8,7 +8,7 @@ const directory = mkdtempSync(join(tmpdir(), "pi-pwsh-notify-"));
 const messages = [];
 const widgets = [];
 const pi = { sendMessage: (message, options) => messages.push({ message, options }) };
-const ctx = { hasUI: true, ui: { setWidget: (key, content, options) => widgets.push({ key, content, options }) } };
+const ctx = { mode: "tui", hasUI: true, ui: { setWidget: (key, content, options) => widgets.push({ key, content, options }) } };
 const sessionId = "session-a";
 const manager = new JobNotificationManager(pi, ctx, sessionId, {
 	registryDir: directory,
@@ -51,11 +51,32 @@ try {
 	assert.equal(messages.length, 1);
 	assert.equal(messages[0].message.details.jobs[0].kind, "ready");
 	assert.deepEqual(messages[0].options, { deliverAs: "steer", triggerTurn: true });
-	assert.deepEqual(widgets.at(-1), {
-		key: "pi-pwsh-jobs",
-		content: ["1 pwsh job running"],
-		options: { placement: "aboveEditor" },
+	const runningWidget = widgets.at(-1);
+	assert.equal(runningWidget.key, "pi-pwsh-jobs");
+	assert.equal(typeof runningWidget.content, "function");
+	assert.deepEqual(runningWidget.options, { placement: "belowEditor" });
+	const widgetComponent = runningWidget.content({}, {
+		bold: (text) => text,
+		fg: (_tone, text) => text,
 	});
+	assert.deepEqual(widgetComponent.render(100).map((line) => line.trimEnd()), ["pwsh jobs · 1 running"]);
+	const rpcWidgets = [];
+	const rpcManager = new JobNotificationManager(pi, {
+		mode: "rpc",
+		hasUI: true,
+		ui: { setWidget: (key, content, options) => rpcWidgets.push({ key, content, options }) },
+	}, sessionId, {
+		registryDir: directory,
+		pollIntervalMs: 0,
+		batchIntervalMs: 60_000,
+	});
+	await rpcManager.start();
+	assert.deepEqual(rpcWidgets.at(-1), {
+		key: "pi-pwsh-jobs",
+		content: ["pwsh jobs · 1 running"],
+		options: { placement: "belowEditor" },
+	});
+	await rpcManager.close();
 	const widgetUpdates = widgets.length;
 	await manager.scanNow();
 	assert.equal(widgets.length, widgetUpdates);

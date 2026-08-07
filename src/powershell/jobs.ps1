@@ -507,11 +507,11 @@ function Start-Job {
 		}
 
 		$utf8 = '[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $OutputEncoding = [System.Text.UTF8Encoding]::new($false); if ($null -ne $PSStyle) { $PSStyle.OutputRendering = "PlainText" };'
-		# Exit-code epilogue: preserve the real native exit code (pwsh flattens it
-		# to 0/1 otherwise); $? covers cmdlet-only failures. Mirrors the epilogue
-		# the pwsh tool appends to foreground commands (src/spawn.ts).
+		# Capture the exact exit code, drain PowerShell's object formatter, then
+		# exit. Exiting directly after the user command drops unformatted objects.
+		# This mirrors wrapPowerShellCommand in src/spawn.ts.
 		$strict = if ($env:PIPWSH_STOP_ON_ERROR -eq '1') { "`$ErrorActionPreference = 'Stop';`n" } else { '' }
-		$inner = "$utf8`n$strict`$global:LASTEXITCODE = `$null`n$command`n; `$__pipwsh_ok = `$?; `$__pipwsh_native = `$global:LASTEXITCODE; if (`$__pipwsh_ok) { exit 0 }; if (`$null -ne `$__pipwsh_native -and `$__pipwsh_native -ne 0) { exit `$__pipwsh_native }; exit 1`n"
+		$inner = "$utf8`n$strict`$global:LASTEXITCODE = `$null`n`$global:__pipwsh_exit_code = 0`n. {`n$command`n; `$__pipwsh_ok = `$?; `$__pipwsh_native = `$global:LASTEXITCODE; if (`$__pipwsh_ok) { `$global:__pipwsh_exit_code = 0 } elseif (`$null -ne `$__pipwsh_native -and `$__pipwsh_native -ne 0) { `$global:__pipwsh_exit_code = `$__pipwsh_native } else { `$global:__pipwsh_exit_code = 1 }`n} | Out-Default`nexit `$global:__pipwsh_exit_code`n"
 		$pwshExe = if ($env:PIPWSH_EXECUTABLE -and (Test-Path -LiteralPath $env:PIPWSH_EXECUTABLE -PathType Leaf)) { $env:PIPWSH_EXECUTABLE } else { Join-Path $PSHOME 'pwsh.exe' }
 		$userArgs = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass')
 		if ($env:PIPWSH_USER_ARGS) {

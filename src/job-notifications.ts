@@ -498,7 +498,19 @@ export class JobNotificationManager {
 		if (!this.ctx.hasUI || this.closed) return;
 		if (this.widgetRunningCount === running) return;
 		this.widgetRunningCount = running;
-		const content = running > 0 ? [`${running} pwsh job${running === 1 ? "" : "s"} running`] : undefined;
-		this.ctx.ui.setWidget(WIDGET_KEY, content, { placement: "aboveEditor" });
+		if (running === 0) {
+			this.ctx.ui.setWidget(WIDGET_KEY, undefined, { placement: "belowEditor" });
+			return;
+		}
+		const label = `pwsh jobs · ${running} running`;
+		if (this.ctx.mode !== "tui") {
+			this.ctx.ui.setWidget(WIDGET_KEY, [label], { placement: "belowEditor" });
+			return;
+		}
+		this.ctx.ui.setWidget(
+			WIDGET_KEY,
+			(_tui, theme) => new Text(theme.fg("accent", theme.bold(label)), 0, 0),
+			{ placement: "belowEditor" },
+		);
 	}
 }

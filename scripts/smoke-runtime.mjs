@@ -1,7 +1,7 @@
 // Smoke test for the runtime baseline in src/spawn.ts.
 // Run: node scripts/smoke-runtime.mjs   (Node >= 22.6, type stripping)
 import { spawnSync } from "node:child_process";
-import { createRuntimeEnv, EXIT_EPILOGUE, UTF8_PREFIX } from "../src/spawn.ts";
+import { createRuntimeEnv, UTF8_PREFIX, wrapPowerShellCommand } from "../src/spawn.ts";
 
 const PYTHON_DEFAULTS = {
 	PYTHONIOENCODING: "utf-8",
@@ -22,7 +22,7 @@ function getEnv(env, name) {
 function run(command, env) {
 	return spawnSync(
 		"pwsh",
-		["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", `${UTF8_PREFIX}${command}${EXIT_EPILOGUE}`],
+		["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", `${UTF8_PREFIX}${wrapPowerShellCommand(command)}`],
 		{ encoding: "utf8", env },
 	);
 }

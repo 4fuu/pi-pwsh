@@ -32,7 +32,7 @@ import {
 	type BashOperations,
 	type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
-import { createRuntimeEnv, spawnAndStream, EXIT_EPILOGUE, SOURCE_BOOTSTRAP, UTF8_PREFIX } from "./spawn.ts";
+import { createRuntimeEnv, spawnAndStream, SOURCE_BOOTSTRAP, UTF8_PREFIX, wrapPowerShellCommand } from "./spawn.ts";
 import { hasUnsupportedBackgroundOperatorWithRuntime } from "./background.ts";
 import { loadConfig, type PwshConfig } from "./config.ts";
 import { registerJobNotificationRenderer } from "./job-notifications.ts";
@@ -89,7 +89,10 @@ function createPwshOperations(runtime: PwshSessionRuntime): BashOperations {
 				// the large job/PTY prelude on every fresh pwsh process.
 				const helper = helperPrelude(command);
 				const strict = runtime.pwsh.stopOnError ? "$ErrorActionPreference = 'Stop'; " : "";
-				const injected = `${UTF8_PREFIX}${helper.source}${strict}$global:LASTEXITCODE = $null; ${command}${EXIT_EPILOGUE}`;
+				// Keep helper functions in the formatter's scope so dynamic Job/PTY
+				// properties remain callable while Out-Default renders returned objects.
+				const injected =
+					`${UTF8_PREFIX}${helper.source}${strict}$global:LASTEXITCODE = $null; ${wrapPowerShellCommand(command)}`;
 				const pwshArgs = [
 					...userPowerShellArguments(runtime.pwsh, { nonInteractive: true }),
 					"-Command",

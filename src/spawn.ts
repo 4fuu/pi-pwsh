@@ -62,18 +62,23 @@ export const SOURCE_BOOTSTRAP =
 /**
  * `pwsh -Command` flattens native exit codes to 0/1 unless the script ends
  * with an explicit `exit` (e.g. `cmd /c exit 3` makes the process exit 1).
- * Appending this epilogue reports the final command's status. A successful
- * final command wins over a stale LASTEXITCODE; on failure, a nonzero native
- * code is retained when present, and failures without one map to 1.
- * Mirrors the epilogue in the job wrapper (jobs.ps1) so foreground and
- * background execution report exit codes identically.
+ * This epilogue captures the final command's status without exiting yet. A
+ * successful final command wins over a stale LASTEXITCODE; on failure, a
+ * nonzero native code is retained when present, and failures without one map
+ * to 1. wrapPowerShellCommand drains PowerShell's object formatter before it
+ * exits with the captured code. Mirrors the job wrapper in jobs.ps1.
  *
  * Starts with "\n; " — the newline detaches from a trailing line comment,
  * and the `;` neutralizes a trailing backtick (line continuation would
  * otherwise glue the epilogue into the last command's arguments).
  */
 export const EXIT_EPILOGUE =
-	"\n; $__pipwsh_ok = $?; if ($__pipwsh_ok) { exit 0 } elseif ($null -ne $global:LASTEXITCODE -and $global:LASTEXITCODE -ne 0) { exit $global:LASTEXITCODE } else { exit 1 }";
+	"\n; $__pipwsh_ok = $?; $__pipwsh_native = $global:LASTEXITCODE; if ($__pipwsh_ok) { $global:__pipwsh_exit_code = 0 } elseif ($null -ne $__pipwsh_native -and $__pipwsh_native -ne 0) { $global:__pipwsh_exit_code = $__pipwsh_native } else { $global:__pipwsh_exit_code = 1 }";
+
+/** Format all success output before the explicit exit needed for exact native codes. */
+export function wrapPowerShellCommand(source: string): string {
+	return `$global:__pipwsh_exit_code = 0; . {\n${source}${EXIT_EPILOGUE}\n} | Out-Default\nexit $global:__pipwsh_exit_code`;
+}
 
 const MAX_TIMEOUT_MS = 2_147_483_647;
 const EXIT_STDIO_GRACE_MS = 100;

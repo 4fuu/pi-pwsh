@@ -5,7 +5,7 @@ import { resolve } from "node:path";
 import type * as XtermHeadless from "@xterm/headless";
 import type * as NodePty from "node-pty";
 import type { IDisposable, IPty } from "node-pty";
-import { createRuntimeEnv, EXIT_EPILOGUE } from "./spawn.ts";
+import { createRuntimeEnv, wrapPowerShellCommand } from "./spawn.ts";
 import { userPowerShellArguments, type ResolvedPwshRuntime } from "./runtime.ts";
 
 const require = createRequire(import.meta.url);
@@ -234,7 +234,11 @@ export class PtySessionManager {
 		const prefix = `[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false); [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $OutputEncoding = [System.Text.UTF8Encoding]::new($false); if ($null -ne $PSStyle) { $PSStyle.OutputRendering = 'Ansi' }; ${strict}$global:LASTEXITCODE = $null; `;
 		const pty = spawn(
 			this.pwsh.executable,
-			[...userPowerShellArguments(this.pwsh, { nonInteractive: false }), "-Command", `${prefix}${command}${EXIT_EPILOGUE}`],
+			[
+				...userPowerShellArguments(this.pwsh, { nonInteractive: false }),
+				"-Command",
+				`${prefix}${wrapPowerShellCommand(command)}`,
+			],
 			{
 				name: "xterm-256color",
 				cols: columns,

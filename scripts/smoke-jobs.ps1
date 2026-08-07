@@ -119,6 +119,9 @@ Assert 'duplicate-name-errors' ($r.Output -match 'already exists') $r.Output
 Invoke-Pwsh "Start-Job { Write-Output '中文输出测试' } -Name cjk" | Out-Null
 $r = Invoke-Pwsh "Wait-Job -Name cjk | Out-Null; Receive-Job -Name cjk"
 Assert 'cjk-utf8' ($r.Output -match '中文输出测试') $r.Output
+Invoke-Pwsh "Start-Job { [pscustomobject]@{ Name = 'structured-output'; State = 'ready' } } -Name objectout" | Out-Null
+$r = Invoke-Pwsh "Wait-Job -Name objectout | Out-Null; Receive-Job -Name objectout"
+Assert 'job-formats-object-output' ($r.Output -match 'structured-output' -and $r.Output -match 'ready') $r.Output
 $r = Invoke-Pwsh "Get-Job -Name 'e*' | Select-Object -ExpandProperty Name"
 Assert 'wildcard-name' ($r.Output -match 'e42' -and $r.Output -match 'e7') $r.Output
 $r = Invoke-Pwsh "Get-Job -State Failed | Select-Object -ExpandProperty Name"

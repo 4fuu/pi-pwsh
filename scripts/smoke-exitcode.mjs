@@ -1,9 +1,10 @@
 // Smoke test for the foreground exit-code epilogue (src/spawn.ts).
 // `pwsh -Command` flattens native exit codes to 0/1 unless the script ends
-// with an explicit `exit`; EXIT_EPILOGUE must restore the real codes.
+// with an explicit `exit`; the wrapper must restore the real codes after
+// draining PowerShell's object formatter.
 // Run: node scripts/smoke-exitcode.mjs   (Node >= 22.6, type stripping)
 import { spawnSync } from "node:child_process";
-import { EXIT_EPILOGUE, UTF8_PREFIX } from "../src/spawn.ts";
+import { UTF8_PREFIX, wrapPowerShellCommand } from "../src/spawn.ts";
 
 const cases = [
 	// [command, expectedExit]
@@ -23,7 +24,7 @@ let pass = 0,
 for (const [cmd, expected] of cases) {
 	const r = spawnSync(
 		"pwsh",
-		["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", `${UTF8_PREFIX}${cmd}${EXIT_EPILOGUE}`],
+		["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", `${UTF8_PREFIX}${wrapPowerShellCommand(cmd)}`],
 		{ stdio: "ignore" },
 	);
 	const ok = r.status === expected;

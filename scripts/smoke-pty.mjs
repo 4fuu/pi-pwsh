@@ -103,7 +103,25 @@ function lastDialog() {
 	return dialog;
 }
 
+async function assertPtyExitCode(name, command, expected) {
+	await run(`Start-Pty -Command '${command.replaceAll("'", "''")}' -Name ${name} | Out-Null`);
+	const result = await run(`Wait-Pty -Name ${name} -Exit -Timeout 5 | Select-Object ExitCode | ConvertTo-Json -Compress`);
+	assert.match(result, new RegExp(`"ExitCode":${expected}`));
+	await run(`Remove-Pty -Name ${name} | Out-Null`);
+}
+
 try {
+	const selectedObject = await run("Write-Output 'before'; [pscustomobject]@{Name='x';State='y'} | Select-Object Name, State; Write-Output 'after'");
+	assert.match(selectedObject, /before/);
+	assert.match(selectedObject, /Name\s+State[\s\S]*x\s+y/);
+	assert.match(selectedObject, /after/);
+
+	await run("Get-Job -Name formatview | Remove-Job -Force | Out-Null");
+	await run("Start-Job { Write-Output format-output } -Name formatview | Out-Null; Wait-Job -Name formatview | Out-Null");
+	const formattedJob = await run("Get-Job -Name formatview");
+	assert.match(formattedJob, /formatview\s+Completed\s+True/);
+	await run("Remove-Job -Name formatview | Out-Null");
+
 	const jobHelp = await run("Get-JobHelp");
 	assert.match(jobHelp, /pi-pwsh background jobs/);
 	await assert.rejects(
@@ -133,6 +151,17 @@ try {
 	const output = await run("Receive-Pty -Name smoke");
 	assert.match(output, /Hello Ada/);
 	await run("Remove-Pty -Name smoke | Out-Null");
+
+	await run(`Start-Pty -Command '[pscustomobject]@{Name="pty-object";State="ready"}' -Name objectpty | Out-Null`);
+	await run("Wait-Pty -Name objectpty -Exit -Timeout 5 | Out-Null");
+	const objectPtyOutput = await run("Receive-Pty -Name objectpty");
+	assert.match(objectPtyOutput, /pty-object/);
+	assert.match(objectPtyOutput, /ready/);
+	await run("Remove-Pty -Name objectpty | Out-Null");
+	await assertPtyExitCode("nativeexit", "cmd /c exit 42", 42);
+	await assertPtyExitCode("explicitexit", "exit 7", 7);
+	await assertPtyExitCode("cmdletfailure", "Get-Item C:\\definitely-missing-pipwsh", 1);
+	await assertPtyExitCode("stalecode", "cmd /c exit 9; Get-Date | Out-Null", 0);
 
 	const livePty = await run("$pty = Start-Pty -Command 'Start-Sleep -Milliseconds 400; Write-Output live-output' -Name livepty; $before = [string]$pty.State; Resize-Pty $pty -Columns 88 -Rows 22 | Out-Null; $same = [object]::ReferenceEquals($pty, (Get-Pty -Id $pty.Id)); Wait-Pty $pty -Exit -Timeout 10 | Out-Null; $hasDataBefore = $pty.HasMoreData; Receive-Pty $pty | Out-Null; [pscustomobject]@{ Before = $before; After = [string]$pty.State; ExitCode = $pty.ExitCode; Same = $same; HasDataBefore = $hasDataBefore; HasDataAfter = $pty.HasMoreData; Columns = $pty.Columns; Rows = $pty.Rows } | ConvertTo-Json -Compress");
 	assert.match(livePty, /"Before":"Running"/);
