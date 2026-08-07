@@ -85,6 +85,7 @@ assert.ok(!activeTools.includes("bash"));
 assert.ok(activeTools.includes("ls"));
 assert.ok(activeTools.includes("find"));
 assert.ok(activeTools.includes("grep"));
+assert.match(tool.description, /BACKGROUND JOBS: Start-Job, Get-Job, Receive-Job, Wait-Job, Stop-Job, and Remove-Job are overridden/);
 assert.match(tool.description, /\n\nUSER REQUESTS:/);
 const userBash = await (handlers.get("user_bash")?.[0]?.());
 assert.equal(typeof userBash?.operations?.exec, "function");
@@ -105,6 +106,10 @@ function lastDialog() {
 try {
 	const jobHelp = await run("Get-JobHelp");
 	assert.match(jobHelp, /pi-pwsh background jobs/);
+	await assert.rejects(
+		() => run("Write-Output 'must-not-run' &"),
+		/background operator '&' is not supported/,
+	);
 	const help = await run("Get-PtyHelp");
 	assert.match(help, /Persistent interactive processes backed by Windows ConPTY/);
 

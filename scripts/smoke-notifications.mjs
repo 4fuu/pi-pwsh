@@ -67,6 +67,8 @@ try {
 	assert.equal(messages.length, 2);
 	assert.equal(messages[1].message.details.jobs[0].kind, "exit");
 	assert.equal(messages[1].message.details.jobs[0].ok, true);
+	assert.match(messages[1].message.details.jobs[0].output, /Listening on 4321/);
+	assert.equal(messages[1].message.details.jobs[0].outputAlreadyReceived, undefined);
 	await manager.scanNow();
 	await manager.flushNow();
 	assert.equal(messages.length, 2);
@@ -109,6 +111,52 @@ try {
 	assert.equal(messages[4].message.details.jobs[0].ok, false);
 	console.log("PASS [partial-exit-file-is-not-success]");
 
+	const raced = metadata("raced", "9".repeat(32));
+	writeFileSync(join(directory, "raced.log"), "raced output\n");
+	writeFileSync(join(directory, "raced.exit"), "0");
+	writeMeta(raced);
+	await manager.scanNow();
+	const originalMetadataState = manager.metadataState.bind(manager);
+	let continueMetadata;
+	const metadataMayContinue = new Promise((resolve) => { continueMetadata = resolve; });
+	let metadataStarted;
+	const metadataDidStart = new Promise((resolve) => { metadataStarted = resolve; });
+	manager.metadataState = async (meta) => {
+		metadataStarted();
+		await metadataMayContinue;
+		return originalMetadataState(meta);
+	};
+	const racedFlush = manager.flushNow();
+	await metadataDidStart;
+	const releaseRacedNotifications = manager.deferDuringPwshCall();
+	continueMetadata();
+	await racedFlush;
+	assert.equal(messages.length, 5);
+	manager.metadataState = originalMetadataState;
+	releaseRacedNotifications();
+	await manager.flushNow();
+	assert.equal(messages.length, 6);
+	assert.match(messages[5].message.details.jobs[0].output, /raced output/);
+	console.log("PASS [foreground-call-starting-during-flush-defers-delivery]");
+
+	const manual = metadata("manual", "f".repeat(32));
+	writeFileSync(join(directory, "manual.log"), "large final output that should not be repeated\n");
+	writeFileSync(join(directory, "manual.exit"), "0");
+	writeMeta(manual);
+	const releaseNotifications = manager.deferDuringPwshCall();
+	await manager.scanNow();
+	await manager.flushNow();
+	assert.equal(messages.length, 6);
+	writeFileSync(join(directory, `${manual.InstanceId}.exit.presented`), "");
+	releaseNotifications();
+	await manager.flushNow();
+	assert.equal(messages.length, 7);
+	assert.equal(messages[6].message.details.jobs[0].outputAlreadyReceived, true);
+	assert.equal(messages[6].message.details.jobs[0].output, "");
+	assert.doesNotMatch(messages[6].message.content, /large final output/);
+	assert.match(messages[6].message.content, /already returned by Receive-Job/);
+	console.log("PASS [manual-read-defers-and-reduces-completion]");
+
 	await manager.close();
 	assert.equal(widgets.at(-1)?.content, undefined);
 	console.log("PASS [shutdown-clears-widget]");
@@ -119,10 +167,10 @@ try {
 	});
 	await resumed.start();
 	await resumed.flushNow();
-	assert.equal(messages.length, 5);
+	assert.equal(messages.length, 7);
 	await resumed.close();
 	console.log("PASS [reload-does-not-duplicate-notifications]");
-	console.log("\n=== 8 passed, 0 failed ===");
+	console.log("\n=== 10 passed, 0 failed ===");
 } finally {
 	await manager.close();
 	rmSync(directory, { recursive: true, force: true });

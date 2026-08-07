@@ -38,7 +38,7 @@ Get-JobHelp
 
 The familiar job commands (`Start-Job`, `Get-Job`, `Receive-Job`, `Wait-Job`, `Stop-Job`, and `Remove-Job`) launch detached OS processes, support pipelines, and record state under `%TEMP%\pi-pwsh-jobs`. Work remains discoverable and controllable after the original `pwsh` invocation exits, after `/reload`, and after pi restarts.
 
-Completion notifications are automatic for jobs started by the current pi session. `-NotifyOn` adds a one-time readiness notification using a bounded literal match. `Wait-Job -Pattern` accepts a regex and waits until matching output appears or the job exits; use it when the next step actually depends on that result. Notification output is bounded before it is returned to the model.
+Completion notifications are automatic, while `-NotifyOn` optionally reports a one-time readiness match. If `Receive-Job` returns final output first, the pending completion notification is reduced to a status summary; notifications never consume output. The complete merged log remains available through `LogFile` until `Remove-Job`.
 
 ### Interactive terminals
 

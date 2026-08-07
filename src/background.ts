@@ -1,62 +1,55 @@
 /**
- * Intercept the PowerShell background operator: `some-command &`.
+ * Detect PowerShell's background operator so the one-shot pwsh tool can reject
+ * it with guidance to use the durable Start-Job override. It is intentionally
+ * never rewritten: background work must be explicit.
  *
- * In PowerShell 7, a trailing `&` creates a ThreadJob inside the current pwsh
- * process — which dies when the one-shot tool call ends, so it is useless
- * here. Models also type `&` out of bash habit, where it means "run detached".
- * Both intents are served by rewriting a trailing background `&` to a call to
- * the prelude's Start-Job override (real detached OS process).
- *
- * Detection uses PowerShell's own parser
- * ([System.Management.Automation.Language.Parser]) so strings, comments, the
- * call operator `& { }`, and `&&` are never mistaken for the background
- * operator. Only a single top-level pipeline ending with `&` is rewritten;
- * anything else runs as-is (fail-open).
- *
- * Cost: a cheap JS pre-filter skips the parser round-trip for ~all commands.
+ * Detection uses PowerShell's own parser so strings, comments, the call
+ * operator `& { }`, and `&&` are never mistaken for background execution.
+ * A cheap JS pre-filter skips the parser round-trip for commands without `&`.
  */
 
 import { spawnAndStream } from "./spawn.ts";
 
-/** Trailing `&` (optionally followed by whitespace/one line comment), but not `&&`. */
+/** A standalone ampersand candidate, excluding `&&`; the parser decides its role. */
 function isCandidate(command: string): boolean {
-	return /&(\s|#[^\r\n]*)*$/.test(command) && !/&&(\s|#[^\r\n]*)*$/.test(command);
+	return /(?<!&)&(?!&)/.test(command);
 }
 
 /**
- * PowerShell probe: parse the command passed via the PIPWSH_PROBE env var
- * (base64 UTF-8) and report whether it is a single background pipeline.
- * Prints `background:<offset>` (start offset of the `&` token) or `normal`.
+ * PowerShell probe: parse the base64 UTF-8 command received on stdin and report
+ * whether it contains a background pipeline.
  */
 const PROBE = `
-$code = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:PIPWSH_PROBE))
+$code = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([Console]::In.ReadToEnd()))
 $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseInput($code, [ref]$tokens, [ref]$errors)
-$s = $ast.EndBlock.Statements
-if ($errors.Count -eq 0 -and $s.Count -eq 1 -and $s[0] -is [System.Management.Automation.Language.PipelineAst] -and $s[0].Background) {
-	$amp = $tokens | Where-Object { $_.Kind -eq [System.Management.Automation.Language.TokenKind]::Ampersand } | Select-Object -Last 1
-	if ($amp) { [Console]::WriteLine("background:" + $amp.Extent.StartOffset); exit 0 }
+if ($errors.Count -eq 0) {
+	$background = $ast.FindAll({
+		param($node)
+		$node -is [System.Management.Automation.Language.PipelineBaseAst] -and $node.Background
+	}, $true)
+	if ($background.Count -gt 0) { [Console]::WriteLine('background'); exit 0 }
 }
 [Console]::WriteLine('normal')
 `;
 
 /**
- * Rewrite `cmd &` to `Start-Job -ScriptBlock { cmd }` when the whole command is
- * a single pipeline with the background operator. Returns the input unchanged
- * otherwise (and on any detection failure).
+ * Return whether the command uses PowerShell background execution. Detection
+ * failures are treated as unsupported for ampersand candidates so they cannot
+ * silently fall back to short-lived native jobs.
  */
-export async function rewriteBackgroundOperator(command: string, cwd: string, signal?: AbortSignal): Promise<string> {
-	return rewriteBackgroundOperatorWithRuntime(command, cwd, "pwsh", signal);
+export async function hasUnsupportedBackgroundOperator(command: string, cwd: string, signal?: AbortSignal): Promise<boolean> {
+	return hasUnsupportedBackgroundOperatorWithRuntime(command, cwd, "pwsh", signal);
 }
 
-/** Same rewrite using an already validated absolute PowerShell executable. */
-export async function rewriteBackgroundOperatorWithRuntime(
+/** Same detection using an already validated absolute PowerShell executable. */
+export async function hasUnsupportedBackgroundOperatorWithRuntime(
 	command: string,
 	cwd: string,
 	pwshExecutable: string,
 	signal?: AbortSignal,
-): Promise<string> {
-	if (!isCandidate(command)) return command;
+): Promise<boolean> {
+	if (!isCandidate(command)) return false;
 
 	let out = "";
 	try {
@@ -68,17 +61,13 @@ export async function rewriteBackgroundOperatorWithRuntime(
 				onData: (d) => (out += d.toString("utf-8")),
 				signal,
 				timeout: 15,
-				env: { ...process.env, PIPWSH_PROBE: Buffer.from(command, "utf-8").toString("base64") },
+				stdin: Buffer.from(command, "utf-8").toString("base64"),
 			},
 		);
-		if (r.exitCode !== 0) return command;
+		if (r.exitCode !== 0) return !signal?.aborted;
 	} catch {
-		return command; // fail-open: run as-is
+		return !signal?.aborted;
 	}
 
-	const m = out.match(/background:(\d+)/);
-	if (!m) return command;
-	const head = command.slice(0, Number(m[1])).trim();
-	if (!head) return command;
-	return `Start-Job -ScriptBlock { ${head} }`;
+	return /^background\s*$/m.test(out);
 }

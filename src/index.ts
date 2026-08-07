@@ -9,12 +9,11 @@
  * built-in renderer) with only the spawn layer swapped to pwsh.
  *
  * Background jobs: every pwsh call is a fresh pwsh process, so native
- * PowerShell jobs (Start-Job, trailing `&`) die when the call ends. Commands
- * that reference job helpers lazily load jobs.ps1, which overrides the job
- * cmdlets with implementations backed by real detached OS processes
- * (file-based registry in %TEMP%\pi-pwsh-jobs). A trailing ` &` is rewritten
- * to Start-Job via PowerShell's own parser (background.ts), so bash-style
- * `npm run dev &` works as expected.
+ * PowerShell jobs die when the call ends. Commands that reference job helpers
+ * lazily load jobs.ps1, which overrides the job cmdlets with implementations
+ * backed by real detached OS processes (file-based registry in
+ * %TEMP%\pi-pwsh-jobs). PowerShell's background `&` is rejected rather than
+ * rewritten so durable background work is always explicit via Start-Job.
  *
  * Interactive processes: session-scoped node-pty/ConPTY sessions and user UI
  * requests are exposed as lazily loaded PowerShell functions over a private
@@ -34,14 +33,14 @@ import {
 	type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
 import { createRuntimeEnv, spawnAndStream, EXIT_EPILOGUE, SOURCE_BOOTSTRAP, UTF8_PREFIX } from "./spawn.ts";
-import { rewriteBackgroundOperatorWithRuntime } from "./background.ts";
+import { hasUnsupportedBackgroundOperatorWithRuntime } from "./background.ts";
 import { loadConfig, type PwshConfig } from "./config.ts";
 import { registerJobNotificationRenderer } from "./job-notifications.ts";
 import { resolvePowerShellRuntime, userPowerShellArguments } from "./runtime.ts";
 import { PwshSessionRuntime } from "./session-runtime.ts";
 
 const SOURCE_DIR = dirname(fileURLToPath(import.meta.url));
-const JOBS_PATH = join(SOURCE_DIR, "jobs.ps1");
+const JOBS_PATH = join(SOURCE_DIR, "powershell", "jobs.ps1");
 const PTY_PATH = join(SOURCE_DIR, "powershell", "pty.ps1");
 const USER_REQUEST_PATH = join(SOURCE_DIR, "powershell", "user-request.ps1");
 
@@ -63,9 +62,9 @@ function isBatchFileSpawnError(stderrText: string): boolean {
 	);
 }
 
-function helperPrelude(command: string, backgroundRewritten: boolean): { source: string; needsJobs: boolean; needsRpc: boolean } {
+function helperPrelude(command: string): { source: string; needsJobs: boolean; needsRpc: boolean } {
 	const paths: string[] = [];
-	if (backgroundRewritten || JOB_HELPER_PATTERN.test(command)) paths.push(JOBS_PATH);
+	if (JOB_HELPER_PATTERN.test(command)) paths.push(JOBS_PATH);
 	if (PTY_HELPER_PATTERN.test(command)) paths.push(PTY_PATH);
 	if (USER_REQUEST_PATTERN.test(command)) paths.push(USER_REQUEST_PATH);
 	return {
@@ -78,52 +77,59 @@ function helperPrelude(command: string, backgroundRewritten: boolean): { source:
 function createPwshOperations(runtime: PwshSessionRuntime): BashOperations {
 	return {
 		exec: async (command, cwd, options) => {
-			// bash-style `cmd &` → Start-Job (detached), via the PowerShell parser.
-			const rewritten = await rewriteBackgroundOperatorWithRuntime(command, cwd, runtime.pwsh.executable, options.signal);
-			// Helper families are loaded only when their literal command names are
-			// referenced. Ordinary commands therefore avoid parsing and initializing
-			// the large job/PTY prelude on every fresh pwsh process.
-			const helper = helperPrelude(rewritten, rewritten !== command);
-			const strict = runtime.pwsh.stopOnError ? "$ErrorActionPreference = 'Stop'; " : "";
-			const injected = `${UTF8_PREFIX}${helper.source}${strict}$global:LASTEXITCODE = $null; ${rewritten}${EXIT_EPILOGUE}`;
-			const pwshArgs = [
-				...userPowerShellArguments(runtime.pwsh, { nonInteractive: true }),
-				"-Command",
-				SOURCE_BOOTSTRAP,
-			];
-			// PIPWSH_NODE lets the job prelude launch via a fast Node helper. RPC
-			// credentials are exposed only to calls that load an interactive helper;
-			// rpc.ps1 captures and removes them before the user command runs.
-			const env = createRuntimeEnv({
-				...(helper.needsJobs ? runtime.jobEnv : {}),
-				...(helper.needsRpc ? runtime.env : {}),
-			}, options.env ?? process.env, runtime.pwsh);
-			const first = await spawnAndStream(runtime.pwsh.executable, pwshArgs, cwd, {
-				...options,
-				env,
-				stdin: Buffer.from(injected, "utf8").toString("base64"),
-			});
+			const releaseNotifications = runtime.notifications.deferDuringPwshCall();
+			try {
+				if (await hasUnsupportedBackgroundOperatorWithRuntime(command, cwd, runtime.pwsh.executable, options.signal)) {
+					options.onData(Buffer.from("[pi-pwsh] PowerShell background operator '&' is not supported because native jobs do not survive pwsh tool calls. Use Start-Job and run Get-JobHelp for details.\n"));
+					return { exitCode: 1 };
+				}
 
-			// Fallback for "not a valid Win32 application" (npm/yarn/pnpm are .cmd
-			// batch files on Windows). Skipped for rewritten background commands and
-			// helper calls, whose semantics cannot be reproduced by cmd.exe.
-			if (
-				first.exitCode !== 0 &&
-				rewritten === command &&
-				!helper.source &&
-				isBatchFileSpawnError(first.stderrText) &&
-				!options.signal?.aborted
-			) {
-				options.onData(Buffer.from("\n[pi-pwsh] direct spawn failed; retrying via cmd /c.\n"));
-				const retry = await spawnAndStream(
-					"cmd",
-					["/d", "/s", "/c", `chcp 65001>nul & ${command}`],
-					cwd,
-					{ ...options, env },
-				);
-				return { exitCode: retry.exitCode };
+				// Helper families are loaded only when their literal command names are
+				// referenced. Ordinary commands therefore avoid parsing and initializing
+				// the large job/PTY prelude on every fresh pwsh process.
+				const helper = helperPrelude(command);
+				const strict = runtime.pwsh.stopOnError ? "$ErrorActionPreference = 'Stop'; " : "";
+				const injected = `${UTF8_PREFIX}${helper.source}${strict}$global:LASTEXITCODE = $null; ${command}${EXIT_EPILOGUE}`;
+				const pwshArgs = [
+					...userPowerShellArguments(runtime.pwsh, { nonInteractive: true }),
+					"-Command",
+					SOURCE_BOOTSTRAP,
+				];
+				// PIPWSH_NODE lets the job prelude launch via a fast Node helper. RPC
+				// credentials are exposed only to calls that load an interactive helper;
+				// rpc.ps1 captures and removes them before the user command runs.
+				const env = createRuntimeEnv({
+					...(helper.needsJobs ? runtime.jobEnv : {}),
+					...(helper.needsRpc ? runtime.env : {}),
+				}, options.env ?? process.env, runtime.pwsh);
+				const first = await spawnAndStream(runtime.pwsh.executable, pwshArgs, cwd, {
+					...options,
+					env,
+					stdin: Buffer.from(injected, "utf8").toString("base64"),
+				});
+
+				// Fallback for "not a valid Win32 application" (npm/yarn/pnpm are .cmd
+				// batch files on Windows). Helper calls are skipped because their
+				// semantics cannot be reproduced by cmd.exe.
+				if (
+					first.exitCode !== 0 &&
+					!helper.source &&
+					isBatchFileSpawnError(first.stderrText) &&
+					!options.signal?.aborted
+				) {
+					options.onData(Buffer.from("\n[pi-pwsh] direct spawn failed; retrying via cmd /c.\n"));
+					const retry = await spawnAndStream(
+						"cmd",
+						["/d", "/s", "/c", `chcp 65001>nul & ${command}`],
+						cwd,
+						{ ...options, env },
+					);
+					return { exitCode: retry.exitCode };
+				}
+				return { exitCode: first.exitCode };
+			} finally {
+				releaseNotifications();
 			}
-			return { exitCode: first.exitCode };
 		},
 	};
 }
@@ -151,7 +157,7 @@ ENVIRONMENT VARIABLES: Use PowerShell syntax: $env:NODE_ENV = 'production'; npm 
 
 GET-CHILDITEM / SELECT-STRING: Recursive searches built from these cmdlets do not honor .gitignore or automatically prune heavy directories. Keep the path, depth, and output limits tight; never recursively scan any location that should not be searched.
 
-BACKGROUND JOBS: Run long-lived commands as detached jobs: append \` &\` (\`npm run dev &\`) or use \`Start-Job -ScriptBlock { npm run dev } -Name dev\`. Jobs survive later pwsh calls and /reload, and completion is reported automatically. For a long-running server, pass \`-NotifyOn '<ready text>'\` to report its first matching output. Continue other work while jobs run; use Wait-Job only when the next step requires a result. Manage jobs with Get-Job / Receive-Job / Stop-Job / Remove-Job / Wait-Job, and run Get-JobHelp for the full reference.
+BACKGROUND JOBS: Start-Job, Get-Job, Receive-Job, Wait-Job, Stop-Job, and Remove-Job are overridden with detached implementations that persist across pwsh calls and /reload. Use Start-Job for background work. Completion is reported automatically; continue other work unless the next step requires the result. Run Get-JobHelp for lifecycle, output, notification behavior, and examples.
 
 PTY SESSIONS: Use Start-Pty and the related PowerShell functions for interactive processes that must persist across pwsh calls. Run Get-PtyHelp for commands, lifecycle, and examples.
 

@@ -3,9 +3,9 @@
 pi-pwsh background-job helpers — loaded lazily when a job cmdlet is used.
 
 Overrides the PowerShell job cmdlets with implementations backed by REAL
-detached OS processes. Native PowerShell jobs (Start-Job, the `&` background
-operator) live inside the one-shot pwsh process and die when the tool call
-ends; these persist across calls.
+detached OS processes. Native PowerShell jobs live inside the one-shot pwsh
+process and die when the tool call ends; these persist across calls. Use the
+functions below explicitly; the PowerShell background operator is unsupported.
 
 Storage: $env:TEMP\pi-pwsh-jobs\ — one set of files per job:
   <name>.meta.json  registry entry (id, pid, command, paths, read offset)
@@ -146,6 +146,20 @@ function PiPwshWriteJsonAtomic([string]$path, $value) {
 
 function PiPwshWriteMeta($meta) {
 	PiPwshWriteJsonAtomic (Join-Path $script:PiPwshJobDir ($meta.Name + '.meta.json')) $meta
+}
+
+function PiPwshMarkFinalOutputPresented($meta) {
+	$instanceId = [string]$meta.InstanceId
+	if ($instanceId -notmatch '^[0-9a-f]{32}$') { return }
+	$path = Join-Path $script:PiPwshJobDir ("$instanceId.exit.presented")
+	$stream = $null
+	try {
+		$stream = [System.IO.File]::Open($path, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
+	} catch [System.IO.IOException] {
+		# Another final read already created the marker.
+	} finally {
+		if ($stream) { $stream.Dispose() }
+	}
 }
 
 function PiPwshAllMeta() {
@@ -672,10 +686,12 @@ function Receive-Job {
 	process {
 		foreach ($m in @(PiPwshResolve $Job $Name $Id)) {
 			if ($Wait) { PiPwshWait @($m) 0 }
+			$finalBeforeRead = (PiPwshState $m).State -in 'Completed', 'Failed'
 
 			if ($Tail -gt 0) {
 				# Peek at the last N lines without touching the read offset.
 				$all = (PiPwshReadLogText $m 0).Text.TrimEnd()
+				if ($finalBeforeRead) { PiPwshMarkFinalOutputPresented $m }
 				if (-not $all) { continue }
 				$lines = $all -split "\r?\n"
 				$skip = [Math]::Max(0, $lines.Count - $Tail)
@@ -688,6 +704,7 @@ function Receive-Job {
 				$m.ReadOffset = $r.Position
 				PiPwshWriteMeta $m
 			}
+			if ($finalBeforeRead) { PiPwshMarkFinalOutputPresented $m }
 			if ($r.Text) {
 				$r.Text.TrimEnd() -split "\r?\n"
 			}
@@ -787,6 +804,7 @@ function Remove-Job {
 				foreach ($kind in 'ready', 'exit') {
 					Remove-Item -LiteralPath (Join-Path $script:PiPwshJobDir ("$($m.InstanceId).$kind.notified")) -Force -ErrorAction SilentlyContinue
 				}
+				Remove-Item -LiteralPath (Join-Path $script:PiPwshJobDir ("$($m.InstanceId).exit.presented")) -Force -ErrorAction SilentlyContinue
 			}
 			$object
 		}
@@ -815,24 +833,27 @@ function Get-JobHelp {
 pi-pwsh background jobs — full reference
 =========================================
 
+OVERVIEW
+--------
 Every pwsh tool call is a fresh pwsh process. The job cmdlets in this shell
 (Start-Job, Get-Job, Receive-Job, Stop-Job, Remove-Job, Wait-Job) are
 OVERRIDDEN so jobs run as detached OS processes that persist across calls —
 including across /reload and pi restarts. Do not assume native PowerShell
 job semantics.
 
+Use Start-Job for background work. Do not use PowerShell's background operator
+(`command &`): it creates a native job owned by the current one-shot pwsh
+process, so it does not persist across pwsh tool calls.
+
 QUICK START
 -----------
-  npm run dev &                      # trailing & is auto-converted to Start-Job
+  Start-Job { npm run dev } -Name dev -NotifyOn 'Listening on'
   Get-Job                            # list jobs (Id, Name, State, HasMoreData, ...)
-  Receive-Job -Name Job1             # read NEW output since the last read
-  Stop-Job -Name Job1                # kill the whole process tree
-  Remove-Job -Name Job1              # delete the job and its temp files
+  Receive-Job -Name dev              # read NEW output since the last read
+  Stop-Job -Name dev                 # kill the whole process tree
+  Remove-Job -Name dev               # delete the job and its temp files
 
   Start-Job -ScriptBlock { npm run build } -Name build | Wait-Job | Receive-Job
-
-Completion is reported automatically, so continue other work after starting a
-job. For a server, use -NotifyOn to also report when its first ready line appears.
 
 STARTING JOBS
 -------------
@@ -840,11 +861,6 @@ Start-Job -ScriptBlock <scriptblock> [-Name <name>] [-WorkingDirectory <dir>] [-
 Start-Job -FilePath <script.ps1>    [-Name <name>] [-WorkingDirectory <dir>] [-Environment @{NAME='value'}] [-NotifyOn <literal>]
   - Returns immediately with a job object. Names are auto-allocated (Job1, Job2, ...)
     when -Name is omitted; reuse of an existing name is an error.
-  - Appending ` &` to any single-pipeline command is rewritten to Start-Job
-    automatically (bash-style). Multi-statement scripts with `&` in the middle
-    are NOT intercepted.
-  - A job keeps running even if the pwsh call that started it is aborted or
-    times out — Stop-Job is the only way to kill it.
   - Jobs are separate OS processes: they do NOT share variables, functions, or
     session state with your pwsh call — but they DO inherit the session's
     full environment (PATH, proxies, VIRTUAL_ENV, ...). -Environment @{...}
@@ -852,8 +868,19 @@ Start-Job -FilePath <script.ps1>    [-Name <name>] [-WorkingDirectory <dir>] [-E
     the command itself.
   - All output streams (stdout, stderr, verbose, warnings, native output) are
     merged into one log: $env:TEMP\pi-pwsh-jobs\<name>.log
-  - -NotifyOn is a bounded literal text match, not a regex. Use it for a stable
-    readiness line such as "Listening on"; it reports the first match once.
+
+NOTIFICATIONS
+-------------
+  - Completion notifications are automatic; -NotifyOn is optional and is not
+    required for completion reporting.
+  - -NotifyOn adds an earlier one-time readiness notification when the log first
+    contains its bounded, case-sensitive literal text. Use a stable server line
+    such as "Listening on". The job continues running after the match.
+  - Continue other work after starting a job. Use Wait-Job only when the next
+    action depends on completion or readiness.
+  - If Receive-Job returns a finished job's output before its completion
+    notification is delivered, the notification is reduced to a status summary.
+    A notification delivered first never consumes or limits later reads.
 
 CHECKING STATUS
 ---------------
@@ -875,6 +902,8 @@ Receive-Job [-Job <jobs>] | -Name <patterns> | -Id <ints> [-Keep] [-Wait] [-Tail
   - -Keep: read without consuming (next read returns it again).
   - -Tail N: peek at the last N lines, ignores read offset.
   - -Wait: block until the job finishes, then read.
+  - The complete merged log remains available at (Get-Job <name>).LogFile until
+    Remove-Job. Read that file directly to inspect an arbitrary line range.
   - Keep model context bounded: prefer -Tail and Select-String over reading an
     entire large log. Output is plain text lines, so it composes:
       Receive-Job -Name dev | Select-Object -Last 20
@@ -886,8 +915,7 @@ Wait-Job [-Job <jobs>] | -Name <patterns> | -Id <ints> [-Timeout <seconds>] [-Pa
   - Blocks until each job finishes, or until -Timeout expires.
   - With -Pattern, each job is also released when its output matches the regex.
     Matching uses a bounded rolling window and a regex evaluation timeout.
-  - Use Wait-Job only when the next action requires the result, and set the pwsh
-    tool timeout long enough to cover the requested wait.
+  - Set the pwsh tool timeout long enough to cover the requested wait.
 
 STOPPING / CLEANUP
 ------------------

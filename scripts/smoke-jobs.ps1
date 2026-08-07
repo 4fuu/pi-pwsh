@@ -1,10 +1,10 @@
-# Smoke test for the pi-pwsh job helpers (src/jobs.ps1).
+# Smoke test for the pi-pwsh job helpers (src/powershell/jobs.ps1).
 # Every Invoke-Pwsh call is a fresh pwsh process — exactly like a pwsh tool call —
 # so this verifies that jobs genuinely persist across calls via the file registry.
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-$prelude = Join-Path $PSScriptRoot '..' 'src' 'jobs.ps1'
+$prelude = Join-Path $PSScriptRoot '..' 'src' 'powershell' 'jobs.ps1'
 $jobDir = Join-Path $env:TEMP 'pi-pwsh-jobs'
 
 $script:pass = 0; $script:fail = 0
@@ -37,12 +37,35 @@ $r = Invoke-Pwsh "Get-Job -Name Job1 | Select-Object -ExpandProperty HasMoreData
 Assert 'hasmoredata-true' ($r.Output.Trim() -eq 'True') $r.Output
 $r = Invoke-Pwsh "Receive-Job -Name Job1"
 Assert 'receive-content' ($r.Output -match 'hello world') $r.Output
+$job1Meta = Get-Content -LiteralPath (Join-Path $jobDir 'Job1.meta.json') -Raw | ConvertFrom-Json
+Assert 'receive-final-marks-output-presented' (Test-Path -LiteralPath (Join-Path $jobDir ("$($job1Meta.InstanceId).exit.presented")))
 $r = Invoke-Pwsh "Get-Job -Name Job1 | Select-Object -ExpandProperty HasMoreData"
 Assert 'hasmoredata-consumed' ($r.Output.Trim() -eq 'False') $r.Output
 $r = Invoke-Pwsh "Receive-Job -Name Job1"
 Assert 'receive-consumed-empty' ($r.Output.Trim() -eq '') $r.Output
 $r = Invoke-Pwsh "Receive-Job -Name Job1 -Tail 5"
 Assert 'receive-tail-ignores-offset' ($r.Output -match 'hello world') $r.Output
+
+Invoke-Pwsh "Start-Job { Write-Output 'partial output'; Start-Sleep 60 } -Name progress" | Out-Null
+Start-Sleep -Seconds 1
+Invoke-Pwsh "Receive-Job -Name progress -Keep" | Out-Null
+$progressMeta = Get-Content -LiteralPath (Join-Path $jobDir 'progress.meta.json') -Raw | ConvertFrom-Json
+Assert 'receive-running-does-not-mark-final-output' (-not (Test-Path -LiteralPath (Join-Path $jobDir ("$($progressMeta.InstanceId).exit.presented"))))
+Invoke-Pwsh "Remove-Job -Name progress -Force" | Out-Null
+
+$raceSignal = Join-Path $env:TEMP 'pi-pwsh-receive-race.signal'
+Remove-Item -LiteralPath $raceSignal -Force -ErrorAction SilentlyContinue
+Invoke-Pwsh "Start-Job { Write-Output 'before race'; while (-not (Test-Path -LiteralPath '$raceSignal')) { Start-Sleep -Milliseconds 20 }; Write-Output 'after race' } -Name receiverace" | Out-Null
+Start-Sleep -Seconds 1
+$qRaceSignal = "'" + ($raceSignal -replace "'", "''") + "'"
+Invoke-Pwsh "`$script:originalReadLog = `${function:PiPwshReadLogText}; function PiPwshReadLogText(`$meta, [long]`$fromOffset) { `$result = & `$script:originalReadLog `$meta `$fromOffset; [System.IO.File]::WriteAllText($qRaceSignal, 'continue'); while ((PiPwshState `$meta).State -in 'Starting', 'Running') { Start-Sleep -Milliseconds 20 }; return `$result }; Receive-Job -Name receiverace -Keep" | Out-Null
+$receiveraceMeta = Get-Content -LiteralPath (Join-Path $jobDir 'receiverace.meta.json') -Raw | ConvertFrom-Json
+Assert 'receive-completing-during-read-does-not-mark-final-output' (-not (Test-Path -LiteralPath (Join-Path $jobDir ("$($receiveraceMeta.InstanceId).exit.presented"))))
+$r = Invoke-Pwsh "Receive-Job -Name receiverace -Keep"
+Assert 'receive-after-race-gets-complete-output' ($r.Output -match 'before race' -and $r.Output -match 'after race') $r.Output
+Assert 'receive-after-race-marks-final-output' (Test-Path -LiteralPath (Join-Path $jobDir ("$($receiveraceMeta.InstanceId).exit.presented")))
+Invoke-Pwsh "Remove-Job -Name receiverace" | Out-Null
+Remove-Item -LiteralPath $raceSignal -Force -ErrorAction SilentlyContinue
 
 # A returned job object remains live for the rest of the current pwsh call.
 $r = Invoke-Pwsh '$job = Start-Job { Start-Sleep -Milliseconds 1200 } -Name liveobj; $before = [string]$job.State; Start-Sleep -Milliseconds 2200; $same = [object]::ReferenceEquals($job, (Get-Job -Name liveobj)); [pscustomobject]@{ Before = $before; After = [string]$job.State; JobState = [string]$job.JobStateInfo.State; Same = $same; InstanceId = [string]$job.InstanceId; InstanceIdType = $job.InstanceId.GetType().FullName } | ConvertTo-Json -Compress'
@@ -89,6 +112,8 @@ Assert 'stale-native-code-cleared' ($r.Output -match 'Completed' -and $r.Output 
 Invoke-Pwsh "Start-Job { Write-Output 'keep-me-content' } -Name dup" | Out-Null
 $r = Invoke-Pwsh "Wait-Job -Name dup | Out-Null; Receive-Job -Name dup -Keep; Write-Host '---'; Receive-Job -Name dup -Keep"
 Assert 'receive-keep-rereads' (($r.Output -split '---')[0] -match 'keep-me-content' -and ($r.Output -split '---')[1] -match 'keep-me-content') $r.Output
+$dupMeta = Get-Content -LiteralPath (Join-Path $jobDir 'dup.meta.json') -Raw | ConvertFrom-Json
+Assert 'receive-keep-marks-output-presented' (Test-Path -LiteralPath (Join-Path $jobDir ("$($dupMeta.InstanceId).exit.presented")))
 $r = Invoke-Pwsh "Start-Job { 'dup2' } -Name dup"
 Assert 'duplicate-name-errors' ($r.Output -match 'already exists') $r.Output
 Invoke-Pwsh "Start-Job { Write-Output '中文输出测试' } -Name cjk" | Out-Null
@@ -123,6 +148,8 @@ $r = Invoke-Pwsh "Get-Job | Remove-Job -Force | Out-Null; Get-Job"
 Assert 'remove-all' ($r.Output.Trim() -eq '') $r.Output
 $leftover = Get-ChildItem $jobDir -Filter '*.meta.json' -ErrorAction SilentlyContinue
 Assert 'no-leftover-files' ($null -eq $leftover) ($leftover | Out-String)
+$leftoverMarkers = Get-ChildItem $jobDir -Filter '*.exit.presented' -ErrorAction SilentlyContinue
+Assert 'no-leftover-output-markers' ($null -eq $leftoverMarkers) ($leftoverMarkers | Out-String)
 
 # --- 5b. env: full session inheritance + explicit -Environment override ------
 # Session PATH changes (fnm/scoop shims) are inherited by the job.
@@ -207,7 +234,7 @@ Invoke-Pwsh "Start-Job -FilePath '$tmpScript' -Name filejob" | Out-Null
 $r = Invoke-Pwsh "Wait-Job -Name filejob | Out-Null; Receive-Job -Name filejob"
 Assert 'start-filepath' ($r.Output -match 'from-file') $r.Output
 Remove-Item $tmpScript -Force
-$r = Invoke-Pwsh "Get-Job | Remove-Job -Force | Out-Null; (Get-JobHelp) -match 'QUICK START'"
+$r = Invoke-Pwsh "Get-Job | Remove-Job -Force | Out-Null; `$help = Get-JobHelp; (`$help -match 'QUICK START') -and (`$help -match 'background operator') -and (`$help -match 'does not persist') -and (`$help -match 'Completion notifications are automatic') -and (`$help -match '-NotifyOn is optional') -and (`$help -match 'status summary')"
 Assert 'job-help' ($r.Output.Trim() -eq 'True') $r.Output
 Invoke-Pwsh 'Get-Job | Remove-Job -Force' | Out-Null
 
