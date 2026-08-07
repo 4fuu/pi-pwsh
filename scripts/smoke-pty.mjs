@@ -151,6 +151,9 @@ try {
 	assert.equal((await run("Request-PiInput -Title Test -Prompt Name")).trim(), "Ada");
 	assert.deepEqual(lastDialog().initial.slice(0, 2), ["Test", "Name"]);
 	assert.match(lastDialog().afterInput[2] ?? "", /Ada/);
+	assert.equal((await run('Request-PiInput -Title Test -Prompt "First line`nSecond line"')).trim(), "Ada");
+	assert.deepEqual(lastDialog().initial.slice(0, 3), ["Test", "First line", "Second line"]);
+	assert.match(lastDialog().afterInput[3] ?? "", /Ada/);
 	assert.equal((await run("Request-PiInput -Title Test -Prompt Password -Secret")).trim(), "s3cr3t");
 	assert.deepEqual(lastDialog().initial.slice(0, 2), ["Test", "Password"]);
 	assert.doesNotMatch(lastDialog().afterInput.join("\n"), /s3cr3t/);

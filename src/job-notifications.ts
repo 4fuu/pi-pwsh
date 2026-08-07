@@ -6,7 +6,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Text } from "@earendil-works/pi-tui";
 
 export const JOB_NOTIFICATION_TYPE = "pi-pwsh-job-notification";
-const STATUS_KEY = "pi-pwsh-jobs";
+const WIDGET_KEY = "pi-pwsh-jobs";
 const DEFAULT_POLL_INTERVAL_MS = 400;
 const DEFAULT_BATCH_INTERVAL_MS = 250;
 const MAX_META_FILES = 200;
@@ -188,6 +188,7 @@ export class JobNotificationManager {
 	private scanning = false;
 	private flushing = false;
 	private closed = true;
+	private widgetRunningCount: number | undefined;
 
 	constructor(
 		private readonly pi: ExtensionAPI,
@@ -225,7 +226,8 @@ export class JobNotificationManager {
 		this.pending.length = 0;
 		this.pendingIds.clear();
 		this.observed.clear();
-		if (this.ctx.hasUI) this.ctx.ui.setStatus(STATUS_KEY, undefined);
+		this.widgetRunningCount = undefined;
+		if (this.ctx.hasUI) this.ctx.ui.setWidget(WIDGET_KEY, undefined);
 	}
 
 	async scanNow(): Promise<void> {
@@ -237,7 +239,7 @@ export class JobNotificationManager {
 				entries = await readdir(this.registryDir, { withFileTypes: true });
 			} catch (error) {
 				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-				this.updateStatus(0);
+				this.updateWidget(0);
 				return;
 			}
 			const files = entries
@@ -271,7 +273,7 @@ export class JobNotificationManager {
 			for (const instanceId of this.observed.keys()) {
 				if (!activeInstances.has(instanceId)) this.observed.delete(instanceId);
 			}
-			this.updateStatus(running);
+			this.updateWidget(running);
 		} finally {
 			this.scanning = false;
 		}
@@ -446,8 +448,11 @@ export class JobNotificationManager {
 		return join(this.registryDir, `${instanceId}.${kind}.notified`);
 	}
 
-	private updateStatus(running: number): void {
+	private updateWidget(running: number): void {
 		if (!this.ctx.hasUI || this.closed) return;
-		this.ctx.ui.setStatus(STATUS_KEY, running > 0 ? `${running} pwsh job${running === 1 ? "" : "s"} running` : undefined);
+		if (this.widgetRunningCount === running) return;
+		this.widgetRunningCount = running;
+		const content = running > 0 ? [`${running} pwsh job${running === 1 ? "" : "s"} running`] : undefined;
+		this.ctx.ui.setWidget(WIDGET_KEY, content, { placement: "aboveEditor" });
 	}
 }

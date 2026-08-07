@@ -3,6 +3,7 @@ import {
 	CURSOR_MARKER,
 	Input,
 	truncateToWidth,
+	wrapTextWithAnsi,
 	type Component,
 	type Focusable,
 } from "@earendil-works/pi-tui";
@@ -54,7 +55,7 @@ class InputDialogComponent implements Component, Focusable {
 			: this.input.render(width)[0];
 		this.cachedLines = [
 			truncateToWidth(this.title, width),
-			truncateToWidth(this.prompt, width),
+			...wrapTextWithAnsi(this.prompt, width),
 			inputLine,
 			truncateToWidth("Enter submit • Esc cancel", width),
 		];

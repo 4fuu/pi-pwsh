@@ -6,9 +6,9 @@ import { JobNotificationManager } from "../src/job-notifications.ts";
 
 const directory = mkdtempSync(join(tmpdir(), "pi-pwsh-notify-"));
 const messages = [];
-const statuses = [];
+const widgets = [];
 const pi = { sendMessage: (message, options) => messages.push({ message, options }) };
-const ctx = { hasUI: true, ui: { setStatus: (_key, value) => statuses.push(value) } };
+const ctx = { hasUI: true, ui: { setWidget: (key, content, options) => widgets.push({ key, content, options }) } };
 const sessionId = "session-a";
 const manager = new JobNotificationManager(pi, ctx, sessionId, {
 	registryDir: directory,
@@ -39,7 +39,7 @@ try {
 	await manager.start();
 	await manager.flushNow();
 	assert.equal(messages.length, 0);
-	assert.equal(statuses.at(-1), undefined);
+	assert.equal(widgets.at(-1)?.content, undefined);
 	console.log("PASS [session-isolation]");
 
 	rmSync(join(directory, "foreign.meta.json"));
@@ -51,8 +51,15 @@ try {
 	assert.equal(messages.length, 1);
 	assert.equal(messages[0].message.details.jobs[0].kind, "ready");
 	assert.deepEqual(messages[0].options, { deliverAs: "steer", triggerTurn: true });
-	assert.match(statuses.at(-1), /1 pwsh job running/);
-	console.log("PASS [ready-steer-and-status]");
+	assert.deepEqual(widgets.at(-1), {
+		key: "pi-pwsh-jobs",
+		content: ["1 pwsh job running"],
+		options: { placement: "aboveEditor" },
+	});
+	const widgetUpdates = widgets.length;
+	await manager.scanNow();
+	assert.equal(widgets.length, widgetUpdates);
+	console.log("PASS [ready-steer-and-widget]");
 
 	writeFileSync(join(directory, "server.exit"), "0");
 	await manager.scanNow();
@@ -103,8 +110,8 @@ try {
 	console.log("PASS [partial-exit-file-is-not-success]");
 
 	await manager.close();
-	assert.equal(statuses.at(-1), undefined);
-	console.log("PASS [shutdown-clears-status]");
+	assert.equal(widgets.at(-1)?.content, undefined);
+	console.log("PASS [shutdown-clears-widget]");
 	const resumed = new JobNotificationManager(pi, ctx, sessionId, {
 		registryDir: directory,
 		pollIntervalMs: 0,
