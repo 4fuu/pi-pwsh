@@ -1,6 +1,6 @@
 # pi-pwsh
 
-[![CI](https://github.com/4fuu/pi-pwsh/actions/workflows/ci.yml/badge.svg)](https://github.com/4fuu/pi-pwsh/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/4fuu/pi-pwsh)](https://github.com/4fuu/pi-pwsh/releases/latest)
 
 A PowerShell-native shell tool for [pi](https://github.com/earendil-works/pi) on Windows, with persistent jobs, ConPTY sessions, and user requests.
 
@@ -166,7 +166,6 @@ npm test
 ```
 
 The test suite covers configuration and runtime resolution, UTF-8 source transport, exit codes, background parsing, durable jobs, notifications, timeouts, and PTYs.
-GitHub Actions runs the same suite on Windows with Node.js 22.19 and Node.js 24, then verifies the npm package contents.
 
 ## License
 
