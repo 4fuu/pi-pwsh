@@ -1,6 +1,6 @@
 {
   "name": "@4fu/pi-pwsh",
-  "version": "0.7.5",
+  "version": "0.7.6",
   "description": "A PowerShell-native shell tool for pi on Windows, with persistent jobs, ConPTY sessions, and user requests.",
   "license": "MIT",
   "author": "4fuu",
@@ -21,7 +21,6 @@
   ],
   "files": [
     "src",
-    "docs",
     "README.md",
     "LICENSE"
   ],
