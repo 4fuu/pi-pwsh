@@ -27,7 +27,8 @@
   "pi": {
     "extensions": [
       "./src/index.ts"
-    ]
+    ],
+    "image": "https://raw.githubusercontent.com/4fuu/pi-pwsh/master/docs/logo.svg"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
