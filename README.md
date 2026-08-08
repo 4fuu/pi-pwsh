@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/logo.svg" alt="pi-pwsh" width="658">
+  <img src="https://raw.githubusercontent.com/4fuu/pi-pwsh/master/docs/logo.svg" alt="pi-pwsh" width="658">
 </p>
 
 <h1 align="center">pi-pwsh</h1>
@@ -80,7 +80,7 @@ Get-PiRequestHelp
 
 For terminal logins, `Request-PiPtyInput -Secret` sends input directly from the UI to a PTY without returning the secret to PowerShell or the model.
 
-![Example of user requests in the pi TUI](docs/request_tui.png)
+![Example of user requests in the pi TUI](https://raw.githubusercontent.com/4fuu/pi-pwsh/master/docs/request_tui.png)
 
 ## Configuration
 
