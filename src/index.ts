@@ -154,7 +154,7 @@ function detectSudo(): Promise<boolean> {
 
 export const DESCRIPTION = `Execute a PowerShell 7 (pwsh) command on Windows in the current working directory. Returns stdout and stderr. Output is truncated to the last 2000 lines or 50KB (whichever is hit first); if truncated, full output is saved to a temp file. For completeness and accuracy, prefer filtering and truncating the output yourself. Optionally provide a timeout in seconds (no default timeout).
 
-QUOTING: PowerShell quoting differs from bash. Single quotes are literal strings (escape with ''). Double quotes allow variable expansion. Backtick (\`) is the escape character, not backslash.
+USAGE & SYNTAX: PowerShell differs from bash. 'single quotes' are literal strings (embed one by doubling: 'can''t'); "double quotes" expand $variables. Backtick (\`) is the escape character, not backslash: \`" = literal quote inside "...", \`n = newline. Backslash escapes nothing (\\n and \\" stay literal; C:\\a\\b c splits into two args), so always quote paths/args containing spaces ('C:\\a b') and never write bash-style \\" or $'...'. Native executables (node, python, git, rg, ...): PowerShell 7.3+ re-quotes arguments itself per Windows CRT rules ($PSNativeCommandArgumentPassing defaults to 'Windows'), so write quotes and backslashes literally inside a PowerShell string; 'say "hi"', "^\\d+$", 'C:\\x\\' (trailing backslash included) all reach the exe exactly.
 
 ENVIRONMENT VARIABLES: Use PowerShell syntax: $env:NODE_ENV = 'production'; npm start (NOT bash-style NODE_ENV=production npm start).
 
