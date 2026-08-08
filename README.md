@@ -1,6 +1,12 @@
-# pi-pwsh
+<p align="center">
+  <img src="docs/logo.svg" alt="pi-pwsh" width="658">
+</p>
 
-[![Latest release](https://img.shields.io/github/v/release/4fuu/pi-pwsh)](https://github.com/4fuu/pi-pwsh/releases/latest)
+<h1 align="center">pi-pwsh</h1>
+
+<p align="center">
+  <a href="https://github.com/4fuu/pi-pwsh/releases/latest"><img src="https://img.shields.io/github/v/release/4fuu/pi-pwsh" alt="Latest release"></a>
+</p>
 
 A PowerShell-native shell tool for [pi](https://github.com/earendil-works/pi) on Windows, with persistent jobs, ConPTY sessions, and user requests.
 
