@@ -1,8 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { JobNotificationManager } from "./job-notifications.ts";
 import { PtySessionManager, type PtyRef, type StartPtyOptions } from "./pty-manager.ts";
 import { PwshRpcServer, type RpcRequest } from "./rpc.ts";
-import { userPowerShellArguments, type ResolvedPwshRuntime } from "./runtime.ts";
+import { type ResolvedPwshRuntime } from "./runtime.ts";
 import { UserRequestManager } from "./user-request.ts";
 
 function objectParams(value: unknown): Record<string, unknown> {
@@ -93,7 +92,6 @@ export class PwshSessionRuntime {
 	readonly ptys: PtySessionManager;
 	readonly users: UserRequestManager;
 	readonly rpc: PwshRpcServer;
-	readonly notifications: JobNotificationManager;
 	private closed = false;
 	private readonly sessionId: string;
 
@@ -102,26 +100,13 @@ export class PwshSessionRuntime {
 		this.ptys = new PtySessionManager(pwsh, ctx.cwd);
 		this.users = new UserRequestManager(ctx, this.ptys);
 		this.rpc = new PwshRpcServer((request, signal) => this.handle(request, signal));
-		this.notifications = new JobNotificationManager(pi, ctx, this.sessionId);
 	}
 
 	get env(): Readonly<Record<string, string>> { return this.rpc.env; }
 
-	get jobEnv(): Readonly<Record<string, string>> {
-		const userArguments = userPowerShellArguments(this.pwsh, { nonInteractive: true });
-		return {
-			PIPWSH_NODE: process.execPath,
-			PIPWSH_SESSION_ID: this.sessionId,
-			PIPWSH_EXECUTABLE: this.pwsh.executable,
-			PIPWSH_USER_ARGS: Buffer.from(JSON.stringify(userArguments), "utf8").toString("base64"),
-			PIPWSH_STOP_ON_ERROR: this.pwsh.stopOnError ? "1" : "0",
-		};
-	}
-
 	async close(): Promise<void> {
 		if (this.closed) return;
 		this.closed = true;
-		await this.notifications.close();
 		await this.rpc.stop();
 		await this.ptys.close();
 	}

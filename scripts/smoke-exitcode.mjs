@@ -6,6 +6,10 @@
 import { spawnSync } from "node:child_process";
 import { UTF8_PREFIX, wrapPowerShellCommand } from "../src/spawn.ts";
 
+if (spawnSync("pwsh", ["-NoProfile", "-Command", "$PSVersionTable.PSVersion.Major"]).error?.code === "ENOENT") {
+	console.log("SKIP [PowerShell exit-code e2e] pwsh is not installed"); process.exit(0);
+}
+
 const cases = [
 	// [command, expectedExit]
 	["cmd /c exit 3", 3], // real native exit code survives

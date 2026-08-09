@@ -1,6 +1,4 @@
-/**
- * Shared spawn layer for the pwsh tool and the background job tools.
- */
+/** Shared PowerShell command encoding, environment, and user-shell spawn helpers. */
 
 import { spawn, type ChildProcess } from "child_process";
 
@@ -66,7 +64,7 @@ export const SOURCE_BOOTSTRAP =
  * successful final command wins over a stale LASTEXITCODE; on failure, a
  * nonzero native code is retained when present, and failures without one map
  * to 1. wrapPowerShellCommand drains PowerShell's object formatter before it
- * exits with the captured code. Mirrors the job wrapper in jobs.ps1.
+ * exits with the captured code. The persistent task launcher uses this wrapper too.
  *
  * Starts with "\n; " — the newline detaches from a trailing line comment,
  * and the `;` neutralizes a trailing backtick (line continuation would
@@ -164,13 +162,22 @@ function waitForChildProcess(child: ChildProcess): Promise<number | null> {
 	});
 }
 
-/** Kill the whole process tree on Windows (child.kill() alone orphans children like npm). */
+/** Best-effort synchronous process-tree termination for abort and timeout callbacks. */
 export function killTree(pid: number | undefined): void {
 	if (!pid) return;
+	if (process.platform === "win32") {
+		try {
+			const killer = spawn("taskkill", ["/pid", String(pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
+			killer.once("error", () => {});
+		} catch {
+			// Best effort.
+		}
+		return;
+	}
 	try {
-		spawn("taskkill", ["/pid", String(pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
-	} catch {
-		// Best effort.
+		process.kill(-pid, "SIGKILL");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
 	}
 }
 
@@ -208,6 +215,7 @@ export async function spawnAndStream(
 		env: env ?? process.env,
 		stdio: [stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
 		windowsHide: true,
+		detached: process.platform !== "win32",
 	});
 	if (stdin !== undefined) {
 		child.stdin?.on("error", () => {

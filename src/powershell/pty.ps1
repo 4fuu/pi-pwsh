@@ -349,7 +349,7 @@ Remove-Pty (pty | -Name | -Id) [-Force]
 
 LIFECYCLE
 ---------
-PTYs live in the current pi extension session only. Unlike background jobs
+PTYs live in the current pi extension session only. Unlike persistent tasks
 they do NOT survive /reload or pi restart. PTYs are cleaned up automatically
 on session_shutdown. An aborted or timed-out pwsh call does NOT kill its
 PTYs — only Stop-Pty does.

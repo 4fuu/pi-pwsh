@@ -1,177 +1,232 @@
-/**
- * pi-pwsh — Route pi's shell tasks through PowerShell 7 (`pwsh`), including
- * background jobs that survive tool calls.
- *
- * Why: Windows has no reliable bash. A tool named "bash" also primes the model
- * to emit POSIX syntax. This extension replaces `bash` with a `pwsh` tool that
- * reuses pi's built-in bash tool definition
- * (tail truncation, temp files for full output, non-zero exit codes as tool errors, streaming preview,
- * built-in renderer) with only the spawn layer swapped to pwsh.
- *
- * Background jobs: every pwsh call is a fresh pwsh process, so native
- * PowerShell jobs die when the call ends. Commands that reference job helpers
- * lazily load jobs.ps1, which overrides the job cmdlets with implementations
- * backed by real detached OS processes (file-based registry in
- * %TEMP%\pi-pwsh-jobs). PowerShell's background `&` is rejected rather than
- * rewritten so durable background work is always explicit via Start-Job.
- *
- * Interactive processes: session-scoped node-pty/ConPTY sessions and user UI
- * requests are exposed as lazily loaded PowerShell functions over a private
- * named-pipe RPC bridge, keeping `pwsh` as the extension's only model tool.
- *
- * Requires PowerShell 7+ (`pwsh` on PATH). No fallback: if pwsh is missing the
- * extension reports an error and leaves the built-in bash tool untouched.
- */
-
-import { spawn } from "child_process";
-import { dirname, join } from "path";
-import { fileURLToPath } from "url";
+import { spawn } from "node:child_process";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { Type } from "typebox";
 import {
-	createBashToolDefinition,
 	getAgentDir,
 	type BashOperations,
 	type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
-import { createRuntimeEnv, spawnAndStream, SOURCE_BOOTSTRAP, UTF8_PREFIX, wrapPowerShellCommand } from "./spawn.ts";
-import { hasUnsupportedBackgroundOperatorWithRuntime } from "./background.ts";
-import { loadConfig, type PwshConfig } from "./config.ts";
-import { registerJobNotificationRenderer } from "./job-notifications.ts";
+import { Text } from "@earendil-works/pi-tui";
+import { loadConfig } from "./config.ts";
 import { resolvePowerShellRuntime, userPowerShellArguments } from "./runtime.ts";
 import { PwshSessionRuntime } from "./session-runtime.ts";
+import {
+	createRuntimeEnv,
+	SOURCE_BOOTSTRAP,
+	spawnAndStream,
+	UTF8_PREFIX,
+	wrapPowerShellCommand,
+} from "./spawn.ts";
+import { registerTaskNotificationRenderer, TaskNotificationManager } from "./task-notifications.ts";
+import { PwshTaskRuntime, type TaskSnapshot, type TaskStatus } from "./task-runtime.ts";
 
 const SOURCE_DIR = dirname(fileURLToPath(import.meta.url));
-const JOBS_PATH = join(SOURCE_DIR, "powershell", "jobs.ps1");
 const PTY_PATH = join(SOURCE_DIR, "powershell", "pty.ps1");
 const USER_REQUEST_PATH = join(SOURCE_DIR, "powershell", "user-request.ps1");
-
-const JOB_HELPER_PATTERN = /\b(?:Start-Job|Get-Job|Receive-Job|Wait-Job|Stop-Job|Remove-Job|Suspend-Job|Resume-Job|Debug-Job|Get-JobHelp)\b/i;
-const PTY_HELPER_PATTERN = /\b(?:Start-Pty|Get-Pty(?:Screen|Help)?|Receive-Pty|Send-PtyInput|Wait-Pty|Resize-Pty|Stop-Pty|Remove-Pty)\b/i;
+const PTY_PATTERN = /\b(?:Start-Pty|Get-Pty(?:Screen|Help)?|Receive-Pty|Send-PtyInput|Wait-Pty|Resize-Pty|Stop-Pty|Remove-Pty)\b/i;
 const USER_REQUEST_PATTERN = /\b(?:Request-Pi(?:Input|Confirmation|Selection|PtyInput)|Get-PiRequestHelp)\b/i;
 
-/** Single-quote a string for embedding in PowerShell source. */
-function psQuote(value: string): string {
-	return `'${value.replace(/'/g, "''")}'`;
+export const DESCRIPTION = `Run a PowerShell 7 command as a persistent background task, or inspect, wait for, or stop an existing task.
+
+Write PowerShell 7 syntax. Single quotes are literal; double quotes expand variables; backtick is the escape character. Set environment variables with $env:NAME = 'value'; command. Quote paths containing spaces. Prefer modern cross-platform tools such as rg and fd when available. PowerShell recursive searches do not honor .gitignore, so bound paths, depth, and output tightly.
+
+Exactly one of command or taskId is required. A command always starts a persistent task and returns immediately unless wait is supplied. With notifyOn, start and taskId waits end when that case-sensitive literal UTF-8 text appears or the task terminates; otherwise they wait for termination. A timeout or tool abort ends only waiting—the task continues. Only stop=true terminates its process tree. Queries are idempotent snapshots containing status and bounded latest output. Task IDs are usable only in the parent session that launched them.
+
+Do not create a second background layer inside the command. Use taskId in a later pwsh call to inspect or stop work.
+
+PTY SESSIONS: Start-Pty and related functions provide persistent interactive processes. USER REQUESTS: Request-PiInput, Request-PiConfirmation, Request-PiSelection, and Request-PiPtyInput ask through pi's UI.`;
+
+const ELEVATION_DESCRIPTION = `\n\nELEVATION: Windows sudo is available in inline mode. Prefix a command with sudo to request administrator execution; Windows will display a UAC prompt.`;
+
+export const PROMPT_GUIDELINE = "Use pwsh for shell work and write PowerShell 7 syntax. Start with command; use taskId to inspect/wait or stop=true to terminate; notifyOn reports literal readiness; wait and abort never stop a task. Do not nest another background layer. Keep searches and output bounded; use PTY and user-request helpers when interaction requires them.";
+
+export const PwshParams = Type.Object({
+	command: Type.Optional(Type.String({
+		minLength: 1,
+		description: "PowerShell 7 command that starts a persistent task.",
+	})),
+	notifyOn: Type.Optional(Type.String({
+		minLength: 1,
+		maxLength: 256,
+		description: "Command-only, case-sensitive literal readiness text (1–256 UTF-8 bytes).",
+	})),
+	taskId: Type.Optional(Type.String({
+		pattern: "^ps_[0-9a-f]{8}$",
+		description: "Persistent task ID returned by an earlier pwsh call in this parent session.",
+	})),
+	wait: Type.Optional(Type.Number({
+		minimum: 0,
+		maximum: 300,
+		description: "Seconds to wait for readiness when configured, otherwise terminal status. Omit to return immediately.",
+	})),
+	stop: Type.Optional(Type.Boolean({
+		description: "With taskId, terminate the complete process tree before returning its snapshot.",
+	})),
+}, { additionalProperties: false });
+
+interface PwshParamsValue {
+	command?: string;
+	notifyOn?: string;
+	taskId?: string;
+	wait?: number;
+	stop?: boolean;
 }
 
-/** npm/yarn/pnpm etc. are .cmd batch files on Windows; pwsh cannot spawn them directly. */
-function isBatchFileSpawnError(stderrText: string): boolean {
-	return (
-		stderrText.includes("is not a valid Win32 application") ||
-		stderrText.includes("no es una aplicación Win32 válida") ||
-		stderrText.includes("cannot run due to the error")
-	);
+interface PwshDetails {
+	version: 1;
+	taskId: string;
+	status: TaskStatus;
+	ready: boolean;
+	exitCode?: number | null;
+	pid?: number;
+	createdAt: string;
+	omittedBytes: number;
+	output: string;
+	error?: string;
 }
 
-function helperPrelude(command: string): { source: string; needsJobs: boolean; needsRpc: boolean } {
-	const paths: string[] = [];
-	if (JOB_HELPER_PATTERN.test(command)) paths.push(JOBS_PATH);
-	if (PTY_HELPER_PATTERN.test(command)) paths.push(PTY_PATH);
-	if (USER_REQUEST_PATTERN.test(command)) paths.push(USER_REQUEST_PATH);
+export function validate(params: PwshParamsValue): void {
+	if ((params.command === undefined) === (params.taskId === undefined)) {
+		throw new Error("pwsh: provide exactly one of command or taskId");
+	}
+	if (params.command !== undefined && params.stop !== undefined) {
+		throw new Error("pwsh: stop is accepted only with taskId");
+	}
+	if (params.taskId !== undefined && params.notifyOn !== undefined) {
+		throw new Error("pwsh: notifyOn is accepted only with command");
+	}
+	if (params.stop && params.wait !== undefined) {
+		throw new Error("pwsh: wait is not accepted when stop=true");
+	}
+	if (params.notifyOn !== undefined && (params.notifyOn.length === 0 || Buffer.byteLength(params.notifyOn, "utf8") > 256)) {
+		throw new Error("pwsh: notifyOn must contain 1 to 256 UTF-8 bytes");
+	}
+}
+
+function taskText(snapshot: TaskSnapshot): string {
+	const metadata = snapshot.metadata;
+	return [
+		`taskId: ${metadata.id}`,
+		`status: ${metadata.status}`,
+		...(snapshot.ready ? ["ready: true"] : []),
+		...(metadata.pid ? [`pid: ${metadata.pid}`] : []),
+		...(metadata.exitCode !== undefined ? [`exitCode: ${metadata.exitCode ?? "unknown"}`] : []),
+		snapshot.omittedBytes > 0 ? `output: [${snapshot.omittedBytes} earlier bytes omitted]` : "output:",
+		snapshot.output.trimEnd() || "(no output)",
+		...(metadata.error ? [`error: ${metadata.error}`] : []),
+	].join("\n");
+}
+
+function taskDetails(snapshot: TaskSnapshot): PwshDetails {
 	return {
-		source: paths.map((path) => `. ${psQuote(path)}; `).join(""),
-		needsJobs: paths.includes(JOBS_PATH),
-		needsRpc: paths.includes(PTY_PATH) || paths.includes(USER_REQUEST_PATH),
+		version: 1,
+		taskId: snapshot.metadata.id,
+		status: snapshot.metadata.status,
+		ready: snapshot.ready,
+		exitCode: snapshot.metadata.exitCode,
+		pid: snapshot.metadata.pid,
+		createdAt: snapshot.metadata.createdAt,
+		omittedBytes: snapshot.omittedBytes,
+		output: snapshot.output,
+		error: snapshot.metadata.error,
 	};
 }
 
-function createPwshOperations(runtime: PwshSessionRuntime): BashOperations {
+function quotePowerShell(value: string): string {
+	return `'${value.replaceAll("'", "''")}'`;
+}
+
+function helperPrelude(command: string): { source: string; needsRpc: boolean } {
+	const paths = [
+		...(PTY_PATTERN.test(command) ? [PTY_PATH] : []),
+		...(USER_REQUEST_PATTERN.test(command) ? [USER_REQUEST_PATH] : []),
+	];
+	return {
+		source: paths.map((path) => `. ${quotePowerShell(path)}; `).join(""),
+		needsRpc: paths.length > 0,
+	};
+}
+
+function isBatchFileSpawnError(stderr: string): boolean {
+	return stderr.includes("is not a valid Win32 application")
+		|| stderr.includes("no es una aplicación Win32 válida")
+		|| stderr.includes("cannot run due to the error");
+}
+
+function userBashOperations(session: PwshSessionRuntime): BashOperations {
 	return {
 		exec: async (command, cwd, options) => {
-			const releaseNotifications = runtime.notifications.deferDuringPwshCall();
-			try {
-				if (await hasUnsupportedBackgroundOperatorWithRuntime(command, cwd, runtime.pwsh.executable, options.signal)) {
-					options.onData(Buffer.from("[pi-pwsh] PowerShell background operator '&' is not supported because native jobs do not survive pwsh tool calls. Use Start-Job and run Get-JobHelp for details.\n"));
-					return { exitCode: 1 };
-				}
-
-				// Helper families are loaded only when their literal command names are
-				// referenced. Ordinary commands therefore avoid parsing and initializing
-				// the large job/PTY prelude on every fresh pwsh process.
-				const helper = helperPrelude(command);
-				const strict = runtime.pwsh.stopOnError ? "$ErrorActionPreference = 'Stop'; " : "";
-				// Keep helper functions in the formatter's scope so dynamic Job/PTY
-				// properties remain callable while Out-Default renders returned objects.
-				const injected =
-					`${UTF8_PREFIX}${helper.source}${strict}$global:LASTEXITCODE = $null; ${wrapPowerShellCommand(command)}`;
-				const pwshArgs = [
-					...userPowerShellArguments(runtime.pwsh, { nonInteractive: true }),
-					"-Command",
-					SOURCE_BOOTSTRAP,
-				];
-				// PIPWSH_NODE lets the job prelude launch via a fast Node helper. RPC
-				// credentials are exposed only to calls that load an interactive helper;
-				// rpc.ps1 captures and removes them before the user command runs.
-				const env = createRuntimeEnv({
-					...(helper.needsJobs ? runtime.jobEnv : {}),
-					...(helper.needsRpc ? runtime.env : {}),
-				}, options.env ?? process.env, runtime.pwsh);
-				const first = await spawnAndStream(runtime.pwsh.executable, pwshArgs, cwd, {
+			const helper = helperPrelude(command);
+			const strict = session.pwsh.stopOnError ? "$ErrorActionPreference = 'Stop'; " : "";
+			const source = `${UTF8_PREFIX}${helper.source}${strict}$global:LASTEXITCODE = $null; ${wrapPowerShellCommand(command)}`;
+			const env = createRuntimeEnv(helper.needsRpc ? session.env : {}, options.env ?? process.env, session.pwsh);
+			const first = await spawnAndStream(
+				session.pwsh.executable,
+				[...userPowerShellArguments(session.pwsh, { nonInteractive: true }), "-Command", SOURCE_BOOTSTRAP],
+				cwd,
+				{
 					...options,
 					env,
-					stdin: Buffer.from(injected, "utf8").toString("base64"),
-				});
-
-				// Fallback for "not a valid Win32 application" (npm/yarn/pnpm are .cmd
-				// batch files on Windows). Helper calls are skipped because their
-				// semantics cannot be reproduced by cmd.exe.
-				if (
-					first.exitCode !== 0 &&
-					!helper.source &&
-					isBatchFileSpawnError(first.stderrText) &&
-					!options.signal?.aborted
-				) {
-					options.onData(Buffer.from("\n[pi-pwsh] direct spawn failed; retrying via cmd /c.\n"));
-					const retry = await spawnAndStream(
-						"cmd",
-						["/d", "/s", "/c", `chcp 65001>nul & ${command}`],
-						cwd,
-						{ ...options, env },
-					);
-					return { exitCode: retry.exitCode };
-				}
-				return { exitCode: first.exitCode };
-			} finally {
-				releaseNotifications();
+					stdin: Buffer.from(source, "utf8").toString("base64"),
+				},
+			);
+			if (
+				first.exitCode !== 0
+				&& !helper.source
+				&& process.platform === "win32"
+				&& isBatchFileSpawnError(first.stderrText)
+				&& !options.signal?.aborted
+			) {
+				options.onData(Buffer.from("\n[pi-pwsh] direct spawn failed; retrying via cmd /c.\n"));
+				const retry = await spawnAndStream(
+					"cmd",
+					["/d", "/s", "/c", `chcp 65001>nul & ${command}`],
+					cwd,
+					{ ...options, env },
+				);
+				return { exitCode: retry.exitCode };
 			}
+			return { exitCode: first.exitCode };
 		},
 	};
 }
 
-/** Check that Windows Sudo is available and runs inline (stdio comes back to us). */
 function detectSudo(): Promise<boolean> {
+	if (process.platform !== "win32") return Promise.resolve(false);
 	return new Promise((resolve) => {
+		let output = "";
 		const child = spawn("sudo", ["config"], { stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
-		let out = "";
-		child.stdout?.on("data", (d: Buffer) => {
-			out += d.toString("utf-8");
+		child.stdout?.on("data", (data: Buffer) => {
+			output += data.toString("utf8");
 		});
-		child.on("error", () => resolve(false));
-		child.on("close", (code) => {
-			resolve(code === 0 && /inline|内联/i.test(out));
-		});
+		child.once("error", () => resolve(false));
+		child.once("close", (code) => resolve(code === 0 && /inline|内联/i.test(output)));
 	});
 }
 
-export const DESCRIPTION = `Execute a PowerShell 7 (pwsh) command on Windows in the current working directory. Returns stdout and stderr. Output is truncated to the last 2000 lines or 50KB (whichever is hit first); if truncated, full output is saved to a temp file. For completeness and accuracy, prefer filtering and truncating the output yourself. Optionally provide a timeout in seconds (no default timeout).
+function sanitizeOutput(text: string): string {
+	return text
+		.replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, "")
+		.replace(/\x1bP[\s\S]*?\x1b\\/g, "")
+		.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
+		.replace(/\r/g, "")
+		.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "");
+}
 
-USAGE & SYNTAX: PowerShell differs from bash. 'single quotes' are literal strings (embed one by doubling: 'can''t'); "double quotes" expand $variables. Backtick (\`) is the escape character, not backslash: \`" = literal quote inside "...", \`n = newline. Backslash escapes nothing (\\n and \\" stay literal; C:\\a\\b c splits into two args), so always quote paths/args containing spaces ('C:\\a b') and never write bash-style \\" or $'...'. Native executables (node, python, git, rg, ...): PowerShell 7.3+ re-quotes arguments itself per Windows CRT rules ($PSNativeCommandArgumentPassing defaults to 'Windows'), so write quotes and backslashes literally inside a PowerShell string; 'say "hi"', "^\\d+$", 'C:\\x\\' (trailing backslash included) all reach the exe exactly.
+function statusTone(status: TaskStatus): "success" | "error" | "warning" | "muted" {
+	if (status === "completed") return "success";
+	if (status === "failed") return "error";
+	if (status === "cancelled") return "muted";
+	return "warning";
+}
 
-ENVIRONMENT VARIABLES: Use PowerShell syntax: $env:NODE_ENV = 'production'; npm start (NOT bash-style NODE_ENV=production npm start).
-
-GET-CHILDITEM / SELECT-STRING: Recursive searches built from these cmdlets do not honor .gitignore or automatically prune heavy directories. Keep the path, depth, and output limits tight; never recursively scan any location that should not be searched.
-
-BACKGROUND JOBS: Start-Job, Get-Job, Receive-Job, Wait-Job, Stop-Job, and Remove-Job are overridden with detached implementations that persist across pwsh calls and /reload. Use Start-Job for background work. Completion is reported automatically; continue other work unless the next step requires the result. Run Get-JobHelp for lifecycle, output, notification behavior, and examples.
-
-PTY SESSIONS: Use Start-Pty and the related PowerShell functions for interactive processes that must persist across pwsh calls. Run Get-PtyHelp for commands, lifecycle, and examples.
-
-USER REQUESTS: Use Request-PiInput, Request-PiConfirmation, Request-PiSelection, or Request-PiPtyInput when a command needs user input. Run Get-PiRequestHelp for details.`;
-
-const ELEVATION_SECTION = `\n\nELEVATION: \`sudo\` is available. Prefix a command with \`sudo\` to run it as administrator (e.g. \`sudo <command>\`); a UAC prompt will appear and wait for the user to approve.`;
-
-export default function (pi: ExtensionAPI) {
-	let runtime: PwshSessionRuntime | undefined;
+export default function pwshExtension(pi: ExtensionAPI): void {
+	let sessions: PwshSessionRuntime | undefined;
+	let tasks: PwshTaskRuntime | undefined;
+	let notifications: TaskNotificationManager | undefined;
 	let operations: BashOperations | undefined;
-	let config: PwshConfig | undefined;
+	let config: ReturnType<typeof loadConfig>["config"] | undefined;
 	let setupError: string | undefined;
 	try {
 		config = loadConfig({ agentDir: getAgentDir() }).config;
@@ -179,79 +234,163 @@ export default function (pi: ExtensionAPI) {
 		setupError = error instanceof Error ? error.message : String(error);
 	}
 
-	registerJobNotificationRenderer(pi);
+	registerTaskNotificationRenderer(pi);
 	if (config?.replaceUserBash) {
 		pi.on("user_bash", () => operations ? { operations } : undefined);
 	}
 
+	const registerTool = (description: string): void => {
+		pi.registerTool({
+			name: "pwsh",
+			label: "pwsh",
+			description,
+			promptSnippet: "Start, query, wait for, receive notifications from, or stop persistent PowerShell 7 tasks",
+			promptGuidelines: [PROMPT_GUIDELINE],
+			parameters: PwshParams,
+			executionMode: "sequential",
+			async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+				validate(params);
+				if (!tasks || !sessions) throw new Error(`pwsh: ${setupError ?? "PowerShell runtime is unavailable"}`);
+				const activeTasks = tasks;
+				const release = notifications?.deferDuringToolCall() ?? (() => {});
+				try {
+					let snapshot: TaskSnapshot;
+					if (params.taskId !== undefined) {
+						snapshot = params.stop
+							? await activeTasks.stop(params.taskId)
+							: await activeTasks.snapshot(params.taskId, params.wait ?? 0, signal);
+					} else {
+						const command = params.command as string;
+						const helper = helperPrelude(command);
+						const metadata = await activeTasks.start(
+							command,
+							ctx.cwd,
+							params.notifyOn,
+							helper.source,
+							helper.needsRpc ? sessions.env : {},
+						);
+						snapshot = await activeTasks.snapshot(metadata.id, params.wait ?? 0, signal);
+					}
+					return {
+						content: [{ type: "text" as const, text: taskText(snapshot) }],
+						details: taskDetails(snapshot),
+					};
+				} finally {
+					release();
+				}
+			},
+			renderCall(args, theme) {
+				const action = args.taskId
+					? args.stop ? "stop" : args.wait !== undefined ? `wait ${args.wait}s` : "inspect"
+					: args.wait !== undefined ? `start · wait ${args.wait}s` : "start";
+				let header = `${theme.fg("toolTitle", theme.bold("pwsh"))} ${theme.fg("accent", args.taskId ?? "new task")} ${theme.fg("dim", `· ${action}`)}`;
+				if (args.notifyOn) header += theme.fg("dim", ` · notify on ${JSON.stringify(args.notifyOn)}`);
+				const command = typeof args.command === "string" ? args.command.replace(/\r/g, "").replace(/\t/g, "   ") : "";
+				if (!command) return new Text(header, 0, 0);
+				const lines = command.split("\n");
+				const shown = lines.slice(0, 10);
+				return new Text(`${header}\n${shown.join("\n")}${lines.length > shown.length ? theme.fg("dim", `\n… ${lines.length - shown.length} more lines`) : ""}`, 0, 0);
+			},
+			renderResult(result, options, theme) {
+				const details = result.details as PwshDetails | undefined;
+				if (!details) return new Text(theme.fg("muted", "pwsh"), 0, 0);
+				const elapsed = Math.max(0, Date.now() - Date.parse(details.createdAt));
+				const duration = `${(elapsed / 1_000).toFixed(1)}s`;
+				const tone = statusTone(details.status);
+				const header = `${theme.fg("toolTitle", theme.bold("pwsh"))} ${theme.fg("accent", details.taskId)} ${theme.fg(tone, details.status)} ${theme.fg("dim", `· ${duration}`)}`;
+				const output = sanitizeOutput(details.output).trimEnd();
+				const note = details.omittedBytes > 0 ? theme.fg("warning", `[${details.omittedBytes} earlier bytes omitted]`) : "";
+				if (!options.expanded) {
+					const preview = output.split("\n").slice(-5).join("\n");
+					return new Text([header, note, preview ? theme.fg("toolOutput", preview) : ""].filter(Boolean).join("\n"), 0, 0);
+				}
+				const processInfo = [
+					details.ready ? "ready" : undefined,
+					details.pid ? `PID ${details.pid}` : undefined,
+					details.exitCode !== undefined ? `exit ${details.exitCode ?? "unknown"}` : undefined,
+				].filter(Boolean).join(" · ");
+				return new Text([
+					header,
+					processInfo ? theme.fg("dim", processInfo) : "",
+					note,
+					theme.fg("toolOutput", output || "(no output)"),
+					...(details.error ? [theme.fg("error", details.error)] : []),
+				].filter(Boolean).join("\n"), 0, 0);
+			},
+		});
+	};
+
+	registerTool(DESCRIPTION);
+
 	pi.on("session_shutdown", async () => {
-		const current = runtime;
+		const currentNotifications = notifications;
+		const currentSessions = sessions;
+		notifications = undefined;
+		sessions = undefined;
+		tasks = undefined;
 		operations = undefined;
-		runtime = undefined;
-		await current?.close();
+		await currentNotifications?.close();
+		await currentSessions?.close();
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
+		await notifications?.close();
+		await sessions?.close();
+		notifications = undefined;
+		sessions = undefined;
+		tasks = undefined;
 		operations = undefined;
-		const current = runtime;
-		runtime = undefined;
-		await current?.close();
-		if (setupError || !config) {
+		if (!config) {
 			activateBuiltInBash(pi);
-			ctx.ui.notify(`pi-pwsh: ${setupError ?? "configuration could not be loaded"} The built-in bash tool was left active.`, "error");
-			return;
-		}
-		// Probe pwsh and sudo concurrently once per session; the tool description
-		// is then stable for the rest of that session.
-		let detection;
-		let sudoAvailable: boolean;
-		try {
-			[detection, sudoAvailable] = await Promise.all([resolvePowerShellRuntime(config), detectSudo()]);
-		} catch (error) {
-			activateBuiltInBash(pi);
-			ctx.ui.notify(
-				`pi-pwsh: ${error instanceof Error ? error.message : String(error)} The built-in bash tool was left active.`,
-				"error",
-			);
+			ctx.ui.notify(`pi-pwsh: ${setupError ?? "configuration could not be loaded"}. The built-in bash tool remains active.`, "error");
 			return;
 		}
 
-		const nextRuntime = new PwshSessionRuntime(pi, ctx, detection);
+		let resolved;
+		let sudoAvailable = false;
 		try {
-			await nextRuntime.notifications.start();
+			[resolved, sudoAvailable] = await Promise.all([resolvePowerShellRuntime(config), detectSudo()]);
 		} catch (error) {
-			ctx.ui.notify(`pi-pwsh: job notification startup failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+			activateBuiltInBash(pi);
+			ctx.ui.notify(`pi-pwsh: ${error instanceof Error ? error.message : String(error)}. The built-in bash tool remains active.`, "error");
+			return;
 		}
+
+		const nextSessions = new PwshSessionRuntime(pi, ctx, resolved);
 		try {
-			await nextRuntime.rpc.start();
+			await nextSessions.rpc.start();
 		} catch (error) {
 			ctx.ui.notify(`pi-pwsh: interactive service startup failed: ${error instanceof Error ? error.message : String(error)}`, "error");
 		}
-		runtime = nextRuntime;
-		operations = createPwshOperations(nextRuntime);
+		const nextTasks = new PwshTaskRuntime(resolved, { sessionId: ctx.sessionManager.getSessionId() });
+		try {
+			await nextTasks.cleanupExpired();
+		} catch (error) {
+			await nextSessions.close();
+			activateBuiltInBash(pi);
+			ctx.ui.notify(`pi-pwsh: task runtime startup failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+			return;
+		}
 
-		// Reuse the built-in bash tool definition (truncation, temp files, exit-code
-		// errors, streaming, renderer) with only the spawn layer swapped to pwsh.
-		const bashDef = createBashToolDefinition(ctx.cwd, { operations });
-		pi.registerTool({
-			...bashDef,
-			name: "pwsh",
-			label: "pwsh",
-			description: DESCRIPTION + (sudoAvailable ? ELEVATION_SECTION : ""),
-			promptSnippet: "Execute PowerShell 7 (pwsh) commands",
-			promptGuidelines: [
-				"Use pwsh for shell tasks, both foreground and background; write PowerShell syntax; prefer modern cross-platform tools (rg, fd, etc.) when available, otherwise use native PowerShell cmdlets with tightly bounded scope, and avoid Unix-only commands.",
-			],
-		});
-
+		const nextNotifications = new TaskNotificationManager(pi, ctx, nextTasks, ctx.sessionManager.getSessionId());
+		try {
+			await nextNotifications.start();
+			notifications = nextNotifications;
+		} catch (error) {
+			await nextNotifications.close();
+			ctx.ui.notify(`pi-pwsh: task notification startup failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+		}
+		sessions = nextSessions;
+		tasks = nextTasks;
+		operations = userBashOperations(nextSessions);
+		if (sudoAvailable) registerTool(`${DESCRIPTION}${ELEVATION_DESCRIPTION}`);
 		activatePwsh(pi);
 	});
 }
 
 function activatePwsh(pi: ExtensionAPI): void {
-	const active = pi.getActiveTools();
 	const replaced = new Set(["bash", "pwsh"]);
-	pi.setActiveTools([...active.filter((name) => !replaced.has(name)), "pwsh"]);
+	pi.setActiveTools([...pi.getActiveTools().filter((name) => !replaced.has(name)), "pwsh"]);
 }
 
 function activateBuiltInBash(pi: ExtensionAPI): void {

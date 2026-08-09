@@ -3,6 +3,10 @@
 import { spawnSync } from "node:child_process";
 import { createRuntimeEnv, UTF8_PREFIX, wrapPowerShellCommand } from "../src/spawn.ts";
 
+if (spawnSync("pwsh", ["-NoProfile", "-Command", "$PSVersionTable.PSVersion.Major"], { encoding: "utf8" }).error?.code === "ENOENT") {
+	console.log("SKIP [PowerShell runtime e2e] pwsh is not installed"); process.exit(0);
+}
+
 const PYTHON_DEFAULTS = {
 	PYTHONIOENCODING: "utf-8",
 	PYTHONUTF8: "1",

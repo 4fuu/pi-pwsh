@@ -2,174 +2,70 @@
 
 # pi-pwsh
 
-[![Latest release](https://img.shields.io/github/v/release/4fuu/pi-pwsh)](https://github.com/4fuu/pi-pwsh/releases/latest)
+A PowerShell-native persistent task tool for [pi](https://github.com/earendil-works/pi), focused on Windows while retaining cross-platform PowerShell support.
 
-A PowerShell-native shell tool for [pi](https://github.com/earendil-works/pi) on Windows, with persistent jobs, ConPTY sessions, and user requests.
+## Usage
 
-## Why pi-pwsh
+Talk to pi normally—the `pwsh` tool is for the model. A typical interaction looks like this:
 
-Windows shell work is more reliable when the tool name, syntax, process model, and paths all agree. `pi-pwsh` gives the model a real `pwsh` tool instead of asking it to translate bash assumptions at runtime.
+> **You:** Run the Windows build and continue reviewing the packaging changes while it runs.
+>
+> **pi:** starts `pwsh({"command":"npm run build"})`, receives `ps_…`, and continues independent work instead of polling.
+>
+> **Notification:** `ps_… completed`
+>
+> **pi:** checks the build output before reporting the result.
 
-- **PowerShell-native** — commands use PowerShell 7 syntax and Windows paths from the start.
-- **One tool, all capabilities** — jobs, interactive terminals, and user requests are exposed as PowerShell functions from `.ps1` scripts inside the same `pwsh` tool, rather than as additional model-facing tools.
-- **Progressive loading, low prompt overhead** — ordinary commands carry only compact guidance. Each helper script is loaded only when one of its functions is used, and the full reference is returned only when the model explicitly calls `Get-JobHelp`, `Get-PtyHelp`, or `Get-PiRequestHelp`.
-- **Truly detached background jobs** — familiar commands such as `Start-Job`, `Get-Job`, and `Receive-Job` are overridden with process-backed implementations. Jobs are independent of the launching PowerShell process and survive later tool calls, `/reload`, pi restarts, timeouts, and aborts.
-- **Quiet job notifications** — pi reports job completion and optional readiness matches without adding another model-facing tool or prompting the model to poll.
-- **Real interactive sessions** — Windows ConPTY sessions persist across independent tool calls.
-- **Correct Windows behavior** — UTF-8 source and output, final-command exit codes, `.cmd` fallback, process-tree cleanup, and streaming output are handled for you.
-- **Strict, optional configuration** — select a PowerShell executable and control profiles, execution policy, `!`/`!!`, stop-on-error, and Python's UTF-8 defaults without expanding the base prompt.
-- **Optional elevation** — automatically injects a [Windows Sudo](https://learn.microsoft.com/windows/advanced-settings/sudo/) hint when available.
+When the current turn depends on a command, the model can wait on that same persistent task. A service can instead use literal readiness:
 
-This keeps the base tool schema and system prompt small: pi sees one `pwsh` tool plus concise usage guidance, while implementation scripts and detailed help are introduced progressively only when a task needs them.
+```json
+{"command":"npm run build","wait":30}
+{"command":"npm run dev","notifyOn":"Local:","wait":20}
+{"taskId":"ps_12ab34cd"}
+{"taskId":"ps_12ab34cd","wait":10}
+{"taskId":"ps_12ab34cd","stop":true}
+```
 
-## Features
+- Exactly one of `command` or `taskId` is required.
+- A command without `wait` returns its `taskId` immediately.
+- `wait` (`0..300` seconds) has the same meaning on start and `taskId` calls: it waits for termination, or for the case-sensitive literal `notifyOn` readiness text when the task has one. Timeout and abort end only the wait; the task keeps running.
+- A `taskId` is restricted to the parent session that launched it. Its calls return idempotent status snapshots and bounded latest output. `stop: true` is the only operation that kills the complete process tree.
+- Completion, failure, cancellation, and optional readiness are reported automatically. State and notification markers survive `/reload` and pi restarts. Finished task data is retained for 24 hours.
 
-### Background jobs
+The TUI provides a dedicated **Pwsh Tasks** widget and compact task notifications. At most three active tasks are shown, followed by `+N more`.
 
-Long-running commands run as detached processes and remain manageable from later `pwsh` calls:
+## Migration from 0.7
+
+The custom PowerShell Job layer has been removed. `Start-Job`, `Get-Job`, `Receive-Job`, `Wait-Job`, `Stop-Job`, and `Remove-Job` are no longer overridden, `Get-JobHelp` no longer exists, and `%TEMP%\pi-pwsh-jobs` is no longer the task registry.
+
+Do not wrap commands in `Start-Job` or append PowerShell's background `&`: the `pwsh` tool command itself is already persistent. Replace:
 
 ```powershell
 Start-Job { npm run dev } -Name dev -NotifyOn 'Local:'
-
-Get-Job
 Receive-Job -Name dev -Tail 20
-Wait-Job -Name dev -Pattern 'ready|listening' -Timeout 30
-Stop-Job -Name dev | Remove-Job
-Get-JobHelp
+Stop-Job -Name dev
 ```
 
-The familiar job commands (`Start-Job`, `Get-Job`, `Receive-Job`, `Wait-Job`, `Stop-Job`, and `Remove-Job`) launch detached OS processes, support pipelines, and record state under `%TEMP%\pi-pwsh-jobs`. Work remains discoverable and controllable after the original `pwsh` invocation exits, after `/reload`, and after pi restarts.
+with model calls using `{"command":"npm run dev","notifyOn":"Local:"}`, followed by `{"taskId":"..."}` or `{"taskId":"...","stop":true}`.
 
-Completion notifications are automatic, while `-NotifyOn` optionally reports a one-time readiness match. If `Receive-Job` returns final output first, the pending completion notification is reduced to a status summary; notifications never consume output. The complete merged log remains available through `LogFile` until `Remove-Job`.
+## PTY sessions and user requests
 
-### Interactive terminals
-
-ConPTY-backed sessions support REPLs, prompts, and full-screen terminal applications:
+The non-Job PowerShell helpers remain available. Commands referencing these functions load their helper lazily:
 
 ```powershell
 Start-Pty -Command 'python' -Name py
 Get-PtyScreen -Name py
 Send-PtyInput -Name py -Text 'print(6 * 7)' -Enter
-Wait-Pty -Name py | Receive-Pty
-Stop-Pty -Name py | Remove-Pty
-
-Get-PtyHelp
+Request-PiInput -Title 'Setup' -Prompt 'Display name'
 ```
 
-PTYs live for the current pi session. Aborting an ordinary `pwsh` call does not stop an existing PTY.
-
-### Shell shortcuts
-
-Pi's `!` and `!!` shell shortcuts use the same PowerShell runtime and execution behavior as the `pwsh` tool. Set `replaceUserBash` to `false` if those shortcuts should retain pi's default shell behavior.
-
-### User requests
-
-PowerShell commands can ask through pi's UI for text, confirmation, selection, or masked input:
-
-```powershell
-$name = Request-PiInput -Title 'Setup' -Prompt 'Display name'
-$ok = Request-PiConfirmation -Title 'Deploy' -Message 'Continue?'
-$region = Request-PiSelection -Title 'Region' -Options @('cn', 'us', 'eu')
-
-Get-PiRequestHelp
-```
-
-For terminal logins, `Request-PiPtyInput -Secret` sends input directly from the UI to a PTY without returning the secret to PowerShell or the model.
-
-![Example of user requests in the pi TUI](https://raw.githubusercontent.com/4fuu/pi-pwsh/master/docs/request_tui.png)
+PTYs and the private RPC bridge remain session-scoped. Use `Get-PtyHelp` and `Get-PiRequestHelp` for details.
 
 ## Configuration
 
-Configuration is optional. Create `~/.pi/agent/pwsh.json` and run `/reload` after changing it:
+Optional `~/.pi/agent/pwsh.json` settings are unchanged: `executable`, `loadProfile`, `executionPolicy`, `replaceUserBash`, `stopOnError`, `pythonUtf8`, and `pythonUnbuffered`. PowerShell 7+ and Node.js 22.19+ are required; ConPTY requires Windows 10 1809+.
 
-```json
-{
-  "executable": "auto",
-  "loadProfile": false,
-  "executionPolicy": "Bypass",
-  "replaceUserBash": true,
-  "stopOnError": false,
-  "pythonUtf8": true,
-  "pythonUnbuffered": true
-}
-```
-
-| Setting | Default | Effect |
-| --- | --- | --- |
-| `executable` | `"auto"` | Probes PowerShell 7 and pins its absolute executable path for the session. Set an absolute path to select a specific `pwsh.exe`. |
-| `loadProfile` | `false` | Loads the user's PowerShell profile for foreground commands, detached job commands, and PTYs. |
-| `executionPolicy` | `"Bypass"` | Execution policy passed to user PowerShell processes. Use `null` to omit the argument. |
-| `replaceUserBash` | `true` | Routes pi's `!` and `!!` shortcuts through the same PowerShell operations. |
-| `stopOnError` | `false` | Sets `$ErrorActionPreference = 'Stop'` before user commands. |
-| `pythonUtf8` | `true` | Defaults `PYTHONIOENCODING=utf-8` and `PYTHONUTF8=1` unless already set. |
-| `pythonUnbuffered` | `true` | Defaults `PYTHONUNBUFFERED=1` unless already set. |
-
-Environment variables override the JSON file:
-
-| Environment variable | Setting |
-| --- | --- |
-| `PI_PWSH_CONFIG` | Alternate configuration file path |
-| `PI_PWSH_EXECUTABLE` | `executable` |
-| `PI_PWSH_LOAD_PROFILE` | `loadProfile` |
-| `PI_PWSH_EXECUTION_POLICY` | `executionPolicy` |
-| `PI_PWSH_REPLACE_USER_BASH` | `replaceUserBash` |
-| `PI_PWSH_STOP_ON_ERROR` | `stopOnError` |
-| `PI_PWSH_PYTHON_UTF8` | `pythonUtf8` |
-| `PI_PWSH_PYTHON_UNBUFFERED` | `pythonUnbuffered` |
-
-Boolean environment values accept `true`/`false`, `1`/`0`, `yes`/`no`, and `on`/`off`. Configuration is strict: unknown fields, invalid values, or an unavailable configured executable produce an error and leave pi's built-in `bash` tool active instead of creating a session without a shell.
-
-## Recommended Windows setup
-
-Pair this extension with [pi-bin-hints](https://github.com/4fuu/pi-bin-hints). It detects which commonly used modern command-line programs are installed and tells pi through one small, stable prompt line.
-
-Install the tools you commonly need to make the Windows terminal environment more complete. A useful baseline is:
-
-- [PowerShell 7](https://github.com/PowerShell/PowerShell)
-- [Git for Windows](https://gitforwindows.org/)
-- `rg` (ripgrep), `fd`, `jq`, `fzf`, `bat`, and more (optional, but greatly improves the agent's Windows terminal experience; see [pi-bin-hints](https://github.com/4fuu/pi-bin-hints) for the full list)
-
-`winget` or [Scoop](https://scoop.sh/) can install most of these tools. `pi-bin-hints` detects them at the next pi session start, so the model can prefer them without probing `PATH` on every turn.
-
-## Requirements
-
-- Node.js 22.19 or newer.
-- PowerShell 7+, discoverable through `PATH`, the standard installation location, or an absolute `executable` path in `pwsh.json`. If it is unavailable, pi reports an error and keeps its existing shell tool active.
-- Windows 10 version 1809 or newer for ConPTY sessions.
-- Permission for the trusted `node-pty` native install script when your package manager restricts dependency scripts.
-
-## Installation
-
-```powershell
-pi install npm:@4fu/pi-pwsh
-```
-
-Try it for one run without installing:
-
-```powershell
-pi -e npm:@4fu/pi-pwsh
-```
-
-### From source
-
-Run `npm install`, then add the repository path to `~/.pi/agent/settings.json`:
-
-```json
-{
-  "extensions": ["C:/path/to/pi-pwsh"]
-}
-```
-
-Run `/reload` in pi after changing the extension.
-
-## Development
-
-```powershell
-npm install
-npm test
-```
-
-The test suite covers configuration and runtime resolution, UTF-8 source transport, exit codes, background parsing, durable jobs, notifications, timeouts, and PTYs.
+Install with `pi install npm:@4fu/pi-pwsh`. For development run `npm install`, `npm test`, and `npm pack --dry-run`.
 
 ## License
 

@@ -1,6 +1,10 @@
 import { spawnSync } from "node:child_process";
 import { SOURCE_BOOTSTRAP, UTF8_PREFIX, wrapPowerShellCommand } from "../src/spawn.ts";
 
+if (spawnSync("pwsh", ["-NoProfile", "-Command", "$PSVersionTable.PSVersion.Major"], { encoding: "utf8" }).error?.code === "ENOENT") {
+	console.log("SKIP [PowerShell transport e2e] pwsh is not installed"); process.exit(0);
+}
+
 const longValue = "x".repeat(45_000);
 const cases = [
 	["unicode-multiline", `$value = '中文 ✓'\nWrite-Output $value`, (output) => output.trim() === "中文 ✓"],

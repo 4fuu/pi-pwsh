@@ -1,7 +1,7 @@
 {
   "name": "@4fu/pi-pwsh",
-  "version": "0.7.6",
-  "description": "A PowerShell-native shell tool for pi on Windows, with persistent jobs, ConPTY sessions, and user requests.",
+  "version": "0.8.0",
+  "description": "Persistent PowerShell tasks for pi on Windows, with ConPTY sessions and user requests.",
   "license": "MIT",
   "author": "4fuu",
   "repository": {
@@ -32,12 +32,10 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "npm run typecheck && npm run test:config && npm run test:runtime && npm run test:transport && npm run test:exitcode && npm run test:background && npm run test:notifications && npm run test:jobs && npm run test:timeout && npm run test:pty",
-    "test:background": "node --experimental-transform-types scripts/smoke-background.mjs",
+    "test": "npm run typecheck && npm run test:tasks && npm run test:config && npm run test:runtime && npm run test:transport && npm run test:exitcode && npm run test:timeout && npm run test:pty",
+    "test:tasks": "node --experimental-transform-types scripts/test-tasks.mjs",
     "test:config": "node --experimental-transform-types scripts/smoke-config.mjs",
     "test:exitcode": "node --experimental-transform-types scripts/smoke-exitcode.mjs",
-    "test:jobs": "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-jobs.ps1",
-    "test:notifications": "node --experimental-transform-types scripts/smoke-notifications.mjs",
     "test:pty": "node --experimental-transform-types scripts/smoke-pty.mjs",
     "test:runtime": "node --experimental-transform-types scripts/smoke-runtime.mjs",
     "test:timeout": "node --experimental-transform-types scripts/smoke-timeout.mjs",
@@ -45,12 +43,14 @@
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*"
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.84.0",
     "@earendil-works/pi-tui": "^0.84.0",
     "@types/node": "^24.0.0",
+    "typebox": "^1.1.38",
     "typescript": "^5.5.0"
   },
   "dependencies": {

@@ -2,6 +2,9 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import extension from "../src/index.ts";
 
+try { execFileSync("pwsh", ["-NoProfile", "-Command", "$PSVersionTable.PSVersion.Major"], { stdio: "ignore" }); }
+catch (error) { if (error.code === "ENOENT") { console.log("SKIP [PowerShell PTY e2e] pwsh is not installed"); process.exit(0); } throw error; }
+
 const handlers = new Map();
 let tool;
 let activeTools = ["bash", "read", "ls", "find", "grep"];
@@ -85,15 +88,13 @@ assert.ok(!activeTools.includes("bash"));
 assert.ok(activeTools.includes("ls"));
 assert.ok(activeTools.includes("find"));
 assert.ok(activeTools.includes("grep"));
-assert.match(tool.description, /BACKGROUND JOBS: Start-Job, Get-Job, Receive-Job, Wait-Job, Stop-Job, and Remove-Job are overridden/);
-assert.match(tool.description, /\n\nUSER REQUESTS:/);
-const userBash = await (handlers.get("user_bash")?.[0]?.());
-assert.equal(typeof userBash?.operations?.exec, "function");
+assert.match(tool.description, /persistent background task/);
+assert.match(tool.description, /USER REQUESTS:/);
 
 let call = 0;
 async function run(command, timeout) {
 	call++;
-	const result = await tool.execute(`pty-smoke-${call}`, { command, timeout }, undefined, undefined, ctx);
+	const result = await tool.execute(`pty-smoke-${call}`, { command, wait: timeout ?? 30 }, undefined, undefined, ctx);
 	return result.content.map((item) => item.type === "text" ? item.text : "").join("\n");
 }
 
@@ -116,18 +117,6 @@ try {
 	assert.match(selectedObject, /Name\s+State[\s\S]*x\s+y/);
 	assert.match(selectedObject, /after/);
 
-	await run("Get-Job -Name formatview | Remove-Job -Force | Out-Null");
-	await run("Start-Job { Write-Output format-output } -Name formatview | Out-Null; Wait-Job -Name formatview | Out-Null");
-	const formattedJob = await run("Get-Job -Name formatview");
-	assert.match(formattedJob, /formatview\s+Completed\s+True/);
-	await run("Remove-Job -Name formatview | Out-Null");
-
-	const jobHelp = await run("Get-JobHelp");
-	assert.match(jobHelp, /pi-pwsh background jobs/);
-	await assert.rejects(
-		() => run("Write-Output 'must-not-run' &"),
-		/background operator '&' is not supported/,
-	);
 	const help = await run("Get-PtyHelp");
 	assert.match(help, /Persistent interactive processes backed by Windows ConPTY/);
 
