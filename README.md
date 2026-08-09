@@ -11,24 +11,25 @@ A PowerShell-native shell tool for [pi](https://github.com/earendil-works/pi), w
 Windows shell work is more reliable when the tool name, syntax, process model, and paths all agree. `pi-pwsh` gives the model a real `pwsh` tool instead of asking it to translate bash assumptions at runtime.
 
 - **PowerShell-native** — commands use PowerShell 7 syntax and Windows paths from the start.
-- **One narrow task interface** — a command starts durable work; the returned `taskId` is the only handle needed to inspect, wait for, or stop it.
-- **Persistent by default** — every command is process-backed and survives later tool calls, `/reload`, pi restarts, wait timeouts, and tool aborts.
-- **Quiet automatic notifications** — completion and optional literal readiness arrive without another model-facing tool or repeated polling.
+- **Runs in the background and notifies automatically** — every command becomes a persistent task, so pi can continue other work and receive readiness or completion without polling.
+- **Durable across sessions** — tasks survive later tool calls, `/reload`, pi restarts, wait timeouts, and tool aborts.
 - **Progressive helper loading** — PTY and user-request helpers are loaded only when their PowerShell functions are referenced; detailed help remains available through `Get-PtyHelp` and `Get-PiRequestHelp`.
 - **Real interactive sessions** — persistent terminal sessions support REPLs, prompts, and full-screen applications.
 - **Correct Windows behavior** — UTF-8 source and output, final-command exit codes, `.cmd` fallback, process-tree cleanup, and streaming output are handled for you.
 - **Strict, optional configuration** — select the PowerShell executable and control profiles, execution policy, `!`/`!!`, stop-on-error, and Python UTF-8 defaults without expanding the base prompt.
 - **Optional elevation guidance** — an available [Windows Sudo](https://learn.microsoft.com/windows/advanced-settings/sudo/) installation is surfaced to the model automatically.
 
-This keeps the model-facing surface small: pi sees one `pwsh` tool plus concise current guidance, while task persistence, notifications, terminal sessions, and UI requests stay behind the extension.
+This lets pi use PowerShell without blocking on long-running work: task persistence, notifications, terminal sessions, and UI requests stay behind the extension.
 
 ## Features
 
-### Persistent PowerShell tasks
+### Background tasks and automatic notifications
 
-Every command is already persistent, so the model does not need to wrap it in another background-job layer. A new task returns immediately unless the current turn explicitly needs to wait. Waiting can end at completion or at an optional case-sensitive readiness phrase; a timeout or cancelled wait never stops the command.
+Every `pwsh` command starts a persistent background task and returns immediately by default. Pi can continue reviewing code, editing files, or planning the next step while builds, tests, scripts, servers, and watchers run. There is no separate job mode and no need to wrap the command in another background layer.
 
-The returned task ID lets the model inspect the latest snapshot, wait again, or explicitly terminate the complete process tree. Snapshots are bounded and repeatable rather than consumable. Task IDs belong to the parent session that launched them, while state and notification markers survive `/reload` and pi restarts. Terminal records are retained for 24 hours.
+Completion, failure, and cancellation are reported automatically. Long-running services can also announce readiness as soon as a chosen literal appears in their output, without ending the task. If the current turn depends on the result, pi can wait on that same task; a timeout or cancelled wait leaves it running.
+
+Each task remains available through its ID for later status and output snapshots or explicit process-tree termination. Snapshots are bounded and repeatable rather than consumable. Task state and notification markers survive `/reload` and pi restarts, and terminal records are retained for 24 hours.
 
 ### Interactive terminals
 

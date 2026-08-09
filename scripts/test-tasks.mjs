@@ -27,7 +27,7 @@ assert.throws(() => validate({ taskId: id, notifyOn: "x" }), /command/);
 assert.throws(() => validate({ taskId: id, stop: true, wait: 1 }), /wait is not accepted/);
 assert.throws(() => validate({ command: "x", notifyOn: "😀".repeat(65) }), /UTF-8 bytes/);
 assert.doesNotThrow(() => validate({ command: "Get-ChildItem", notifyOn: "ready", wait: 1 }));
-assert.match(DESCRIPTION, /PowerShell 7/); assert.match(DESCRIPTION, /\$env:NAME/); assert.match(DESCRIPTION, /bound paths/); assert.match(PROMPT_GUIDELINE, /taskId/);
+assert.match(DESCRIPTION, /PowerShell 7/); assert.match(DESCRIPTION, /\$env:NAME/); assert.match(DESCRIPTION, /bound paths/); assert.match(PROMPT_GUIDELINE, /persistent background task/);
 assert.ok(PwshParams);
 
 // Listing must filter ownership before refresh, so stale foreign metadata is

@@ -39,7 +39,7 @@ PTY SESSIONS: Start-Pty and related functions provide persistent interactive pro
 
 const ELEVATION_DESCRIPTION = `\n\nELEVATION: Windows sudo is available in inline mode. Prefix a command with sudo to request administrator execution; Windows will display a UAC prompt.`;
 
-export const PROMPT_GUIDELINE = "Use pwsh for shell work and write PowerShell 7 syntax. Start with command; use taskId to inspect/wait or stop=true to terminate; notifyOn reports literal readiness; wait and abort never stop a task. Do not nest another background layer. Keep searches and output bounded; use PTY and user-request helpers when interaction requires them.";
+export const PROMPT_GUIDELINE = "Use pwsh for shell tasks; every command starts a persistent background task. Write PowerShell syntax; prefer modern cross-platform tools (rg, fd, etc.) when available, otherwise use native PowerShell cmdlets with tightly bounded scope, and avoid Unix-only commands.";
 
 export const PwshParams = Type.Object({
 	command: Type.Optional(Type.String({
@@ -244,7 +244,7 @@ export default function pwshExtension(pi: ExtensionAPI): void {
 			name: "pwsh",
 			label: "pwsh",
 			description,
-			promptSnippet: "Start, query, wait for, receive notifications from, or stop persistent PowerShell 7 tasks",
+			promptSnippet: "Execute PowerShell 7 (pwsh) commands",
 			promptGuidelines: [PROMPT_GUIDELINE],
 			parameters: PwshParams,
 			executionMode: "sequential",
