@@ -26,16 +26,6 @@ This keeps the model-facing surface small: pi sees one `pwsh` tool plus concise 
 
 ### Persistent PowerShell tasks
 
-Talk to pi normally—the `pwsh` tool is designed for the model rather than as a command you invoke yourself:
-
-> **You:** Run the Windows build and continue reviewing the packaging changes while it runs.
->
-> **pi:** starts the build as a persistent PowerShell task, receives `ps_…`, and continues the independent review.
->
-> **Notification:** the PowerShell task completed.
->
-> **pi:** retrieves the final snapshot and incorporates the result.
-
 Every command is already persistent, so the model does not need to wrap it in another background-job layer. A new task returns immediately unless the current turn explicitly needs to wait. Waiting can end at completion or at an optional case-sensitive readiness phrase; a timeout or cancelled wait never stops the command.
 
 The returned task ID lets the model inspect the latest snapshot, wait again, or explicitly terminate the complete process tree. Snapshots are bounded and repeatable rather than consumable. Task IDs belong to the parent session that launched them, while state and notification markers survive `/reload` and pi restarts. Terminal records are retained for 24 hours.
