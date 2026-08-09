@@ -5,8 +5,9 @@ import type { ExecutionPolicy, PwshConfig } from "./config.ts";
 
 const KNOWN_PWSH_PATH = "C:\\Program Files\\PowerShell\\7\\pwsh.exe";
 const PROBE_TIMEOUT_MS = 5_000;
+// Force UTF-8 first so a non-ASCII $PSHOME path survives the parent's UTF-8 decode.
 const VERSION_PROBE =
-	"[Console]::Out.WriteLine($PSVersionTable.PSVersion.ToString()); [Console]::Out.Write((Join-Path $PSHOME 'pwsh.exe'))";
+	"[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); [Console]::Out.WriteLine($PSVersionTable.PSVersion.ToString()); [Console]::Out.Write((Join-Path $PSHOME 'pwsh.exe'))";
 
 export interface PowerShellProbe {
 	version: string;

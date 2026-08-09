@@ -152,6 +152,7 @@ function helperPrelude(command: string): { source: string; needsRpc: boolean } {
 function isBatchFileSpawnError(stderr: string): boolean {
 	return stderr.includes("is not a valid Win32 application")
 		|| stderr.includes("no es una aplicación Win32 válida")
+		|| stderr.includes("不是有效的 Win32 应用程序")
 		|| stderr.includes("cannot run due to the error");
 }
 

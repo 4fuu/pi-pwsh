@@ -7,6 +7,25 @@ const configPath = process.argv[2];
 if (!configPath) throw new Error("Missing persistent task configuration path");
 const config = JSON.parse(await readFile(configPath, "utf8"));
 
+/**
+ * Rename over an existing file, tolerating the transient lock errors Windows
+ * raises when a concurrent reader or antivirus scanner holds the destination.
+ */
+async function renameWithRetry(from, to) {
+	let lastError;
+	for (let attempt = 0; attempt < 6; attempt++) {
+		try {
+			await rename(from, to);
+			return;
+		} catch (error) {
+			if (!["EPERM", "EACCES", "EBUSY"].includes(error?.code)) throw error;
+			lastError = error;
+			await new Promise((resolve) => setTimeout(resolve, 25 * (attempt + 1)));
+		}
+	}
+	throw lastError;
+}
+
 async function writeMetadata(change) {
 	const current = JSON.parse(await readFile(config.metaPath, "utf8"));
 	if (existsSync(config.cancelMarkerPath)) throw new Error("cancelled");
@@ -17,7 +36,7 @@ async function writeMetadata(change) {
 	try {
 		await writeFile(temporary, `${JSON.stringify(next, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
 		if (existsSync(config.cancelMarkerPath)) throw new Error("cancelled");
-		await rename(temporary, config.metaPath);
+		await renameWithRetry(temporary, config.metaPath);
 	} finally {
 		await rm(temporary, { force: true });
 	}
@@ -75,12 +94,17 @@ try {
 	child = spawn(config.executable, config.args, {
 		cwd: config.cwd,
 		env: process.env,
-		stdio: ["ignore", logFd, logFd],
+		stdio: [config.stdin === undefined ? "ignore" : "pipe", logFd, logFd],
 		windowsHide: true,
 		// The detached launcher owns the Unix process group; PowerShell and all
 		// descendants inherit it so stop=true reaches the complete tree.
 		detached: false,
 	});
+	if (config.stdin !== undefined) {
+		// Startup/termination failures are reported through child events.
+		child.stdin.on("error", () => {});
+		child.stdin.end(config.stdin, "utf8");
+	}
 
 	const completion = new Promise((resolve, reject) => {
 		child.once("error", reject);

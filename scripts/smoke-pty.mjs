@@ -14,6 +14,7 @@ const pi = {
 		values.push(handler);
 		handlers.set(event, values);
 	},
+	events: { on() {}, emit() {} },
 	registerTool(definition) { tool = definition; },
 	registerMessageRenderer() {},
 	sendMessage() {},
@@ -34,6 +35,7 @@ const ctx = {
 	ui: {
 		notify(message, type) { notifications.push({ message, type }); },
 		setStatus() {},
+		setWidget() {},
 		async input() { return "Ada"; },
 		async confirm() { return true; },
 		async select(_title, options) { return options[0]; },
@@ -66,7 +68,10 @@ const fallbackHandlers = new Map();
 let fallbackTools = ["pwsh", "read"];
 extension({
 	on(event, handler) { fallbackHandlers.set(event, [...(fallbackHandlers.get(event) ?? []), handler]); },
+	events: { on() {}, emit() {} },
+	registerTool() {},
 	registerMessageRenderer() {},
+	sendMessage() {},
 	getActiveTools() { return [...fallbackTools]; },
 	setActiveTools(names) { fallbackTools = [...names]; },
 });
@@ -95,7 +100,12 @@ let call = 0;
 async function run(command, timeout) {
 	call++;
 	const result = await tool.execute(`pty-smoke-${call}`, { command, wait: timeout ?? 30 }, undefined, undefined, ctx);
-	return result.content.map((item) => item.type === "text" ? item.text : "").join("\n");
+	const text = result.content.map((item) => item.type === "text" ? item.text : "").join("\n");
+	// The task-based result prefixes metadata (taskId/status/...); the command's
+	// output starts after the "output:" (or "output: [N earlier bytes omitted]") line.
+	const lines = text.split("\n");
+	const marker = lines.findIndex((line) => line === "output:" || line.startsWith("output: ["));
+	return marker === -1 ? text : lines.slice(marker + 1).join("\n");
 }
 
 function lastDialog() {
@@ -185,7 +195,8 @@ try {
 	assert.equal((await run("Request-PiSelection -Title Test -Options one,two")).trim(), "one");
 
 	await run("Start-Pty -Command 'Read-Host ''wait''' -Name survives | Out-Null");
-	await assert.rejects(run("Wait-Pty -Name survives -Exit -Timeout 60 | Out-Null", 0.2), /timed out/i);
+	// A bounded wait ends only the waiting; it never kills the PTY.
+	await run("Wait-Pty -Name survives -Exit -Timeout 2 | Out-Null", 10);
 	const survives = await run("Get-Pty -Name survives | Select-Object State | ConvertTo-Json -Compress");
 	assert.match(survives, /\"State\":\"Running\"/);
 	await run("Remove-Pty -Name survives -Force | Out-Null");

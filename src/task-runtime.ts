@@ -15,7 +15,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createRuntimeEnv, UTF8_PREFIX, wrapPowerShellCommand } from "./spawn.ts";
+import { createRuntimeEnv, SOURCE_BOOTSTRAP, UTF8_PREFIX, wrapPowerShellCommand } from "./spawn.ts";
 import { userPowerShellArguments, type ResolvedPwshRuntime } from "./runtime.ts";
 
 export type TaskStatus = "starting" | "running" | "completed" | "failed" | "cancelled";
@@ -57,10 +57,34 @@ const RETENTION_MS = 24 * 60 * 60 * 1000;
 const START_GRACE_MS = 10_000;
 const LAUNCHER = join(dirname(fileURLToPath(import.meta.url)), "task-launcher.mjs");
 
+/**
+ * Rename over an existing file, tolerating the transient lock errors Windows
+ * raises when a concurrent reader or antivirus scanner holds the destination.
+ */
+export async function renameWithRetry(from: string, to: string): Promise<void> {
+	let lastError: unknown;
+	for (let attempt = 0; attempt < 6; attempt++) {
+		try {
+			await rename(from, to);
+			return;
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			if (code !== "EPERM" && code !== "EACCES" && code !== "EBUSY") throw error;
+			lastError = error;
+			await new Promise((resolve) => setTimeout(resolve, 25 * (attempt + 1)));
+		}
+	}
+	throw lastError;
+}
+
 async function writeJsonAtomic(path: string, value: unknown): Promise<void> {
 	const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
-	await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-	await rename(temporary, path);
+	try {
+		await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+		await renameWithRetry(temporary, path);
+	} finally {
+		await rm(temporary, { force: true });
+	}
 }
 
 function isAlive(pid?: number): boolean {
@@ -244,15 +268,19 @@ export class PwshTaskRuntime {
 			]);
 			const strict = this.pwsh.stopOnError ? "$ErrorActionPreference = 'Stop'; " : "";
 			const source = `${UTF8_PREFIX}${executionPrefix}${strict}$global:LASTEXITCODE = $null; ${wrapPowerShellCommand(command)}`;
+			// -Command with the stdin bootstrap, never -EncodedCommand: the latter
+			// makes PowerShell CLIXML-serialize host and error streams (Write-Host,
+			// Write-Error, throw) instead of emitting plain text.
 			await writeJsonAtomic(configPath, {
 				id,
 				instanceId,
 				executable: this.pwsh.executable,
 				args: [
 					...userPowerShellArguments(this.pwsh, { nonInteractive: true }),
-					"-EncodedCommand",
-					Buffer.from(source, "utf16le").toString("base64"),
+					"-Command",
+					SOURCE_BOOTSTRAP,
 				],
+				stdin: Buffer.from(source, "utf8").toString("base64"),
 				cwd,
 				logPath,
 				metaPath,
@@ -438,24 +466,31 @@ export class PwshTaskRuntime {
 	private async tail(id: string): Promise<{ output: string; omittedBytes: number }> {
 		const path = join(this.taskDirectoryPath(id), "output.log");
 		const size = (await stat(path)).size;
-		const omittedBytes = Math.max(0, size - MAX_OUTPUT_BYTES);
-		const length = size - omittedBytes;
-		const buffer = Buffer.alloc(length);
-		if (length > 0) {
-			const handle = await open(path, "r");
-			try {
-				let bytesRead = 0;
-				while (bytesRead < length) {
-					const read = await handle.read(buffer, bytesRead, length - bytesRead, omittedBytes + bytesRead);
-					if (read.bytesRead === 0) break;
-					bytesRead += read.bytesRead;
-				}
-				return { output: buffer.subarray(0, bytesRead).toString("utf8"), omittedBytes };
-			} finally {
-				await handle.close();
+		let omittedBytes = Math.max(0, size - MAX_OUTPUT_BYTES);
+		if (size === 0) return { output: "", omittedBytes: 0 };
+		const handle = await open(path, "r");
+		try {
+			if (omittedBytes > 0) {
+				// Snap the window start past any UTF-8 continuation bytes so the kept
+				// text does not begin mid-sequence with a replacement character.
+				const probe = Buffer.alloc(4);
+				const { bytesRead: probeBytes } = await handle.read(probe, 0, 4, omittedBytes);
+				let advance = 0;
+				while (advance < probeBytes && (probe[advance] & 0xc0) === 0x80) advance++;
+				omittedBytes += advance;
 			}
+			const length = size - omittedBytes;
+			const buffer = Buffer.alloc(length);
+			let bytesRead = 0;
+			while (bytesRead < length) {
+				const read = await handle.read(buffer, bytesRead, length - bytesRead, omittedBytes + bytesRead);
+				if (read.bytesRead === 0) break;
+				bytesRead += read.bytesRead;
+			}
+			return { output: buffer.subarray(0, bytesRead).toString("utf8"), omittedBytes };
+		} finally {
+			await handle.close();
 		}
-		return { output: buffer.toString("utf8"), omittedBytes };
 	}
 
 	private isReady(metadata: TaskMetadata): boolean {

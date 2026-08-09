@@ -1,10 +1,10 @@
 import { existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { open, readFile, rename, rm, stat, utimes } from "node:fs/promises";
+import { open, readFile, rm, stat, utimes } from "node:fs/promises";
 import { join } from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { ActiveTaskUpdate, TaskCoordinator, TaskNotificationKind, TaskWithdrawalReason } from "@4fu/pi-task-coordinator";
-import { PwshTaskRuntime, type TaskMetadata } from "./task-runtime.ts";
+import { PwshTaskRuntime, renameWithRetry, type TaskMetadata } from "./task-runtime.ts";
 
 const DEFAULT_POLL_MS = 400;
 const MAX_NOTIFICATION_LINES = 20;
@@ -134,7 +134,7 @@ export class TaskNotificationManager {
 			}
 		}
 		try {
-			await rename(this.claimPath(metadata, kind), submitted);
+			await renameWithRetry(this.claimPath(metadata, kind), submitted);
 			const now = new Date();
 			await utimes(submitted, now, now);
 		}
@@ -157,7 +157,7 @@ export class TaskNotificationManager {
 			const submitted = this.submittedPath(metadata, kind);
 			if (existsSync(submitted)) {
 				try {
-					await rename(submitted, claim);
+					await renameWithRetry(submitted, claim);
 				} catch (error) {
 					if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
 					await rm(submitted, { force: true });
@@ -208,7 +208,7 @@ export class TaskNotificationManager {
 			try {
 				if (Date.now() - (await stat(submitted)).mtimeMs <= CLAIM_LEASE_MS) return "busy";
 				const stale = `${submitted}.${randomUUID()}.stale`;
-				await rename(submitted, stale);
+				await renameWithRetry(submitted, stale);
 				await rm(stale, { force: true });
 				return this.claim(metadata, kind);
 			} catch {
@@ -220,7 +220,7 @@ export class TaskNotificationManager {
 		catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") return "retry"; }
 		try {
 			if (Date.now() - (await stat(claim)).mtimeMs <= CLAIM_LEASE_MS) return "busy";
-			const stale = `${claim}.${randomUUID()}.stale`; await rename(claim, stale); await rm(stale, { force: true });
+			const stale = `${claim}.${randomUUID()}.stale`; await renameWithRetry(claim, stale); await rm(stale, { force: true });
 			return this.claim(metadata, kind);
 		} catch { return existsSync(this.notifiedPath(metadata, kind)) || existsSync(this.submittedPath(metadata, kind)) ? "settled" : "busy"; }
 	}
