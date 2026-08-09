@@ -23,7 +23,7 @@ This lets pi use PowerShell without blocking on long-running work: task persiste
 
 ## Features
 
-### Background tasks and automatic notifications
+### Background tasks and coordinated notifications
 
 Every `pwsh` command starts a persistent background task and returns immediately by default. Pi can continue reviewing code, editing files, or planning the next step while builds, tests, scripts, servers, and watchers run. There is no separate job mode and no need to wrap the command in another background layer.
 
@@ -69,9 +69,9 @@ For terminal logins, `Request-PiPtyInput -Secret` sends input directly from the 
 
 ### Task notifications and TUI
 
-Readiness, completion, failure, and cancellation are reported automatically. If the model has already retrieved complete terminal output, a later notification is reduced to compact status instead of repeating the payload.
+Readiness, completion, failure, and cancellation are reported automatically. Notifications cooperate and aggregate with installed `@4fu` background-task plugins. Successfully retrieving a ready or terminal result explicitly cancels its pending notification, avoiding repeated status and output.
 
-The dedicated **Pwsh Tasks** widget shows up to three active tasks with status, duration, and command preview, followed by `+N more`. Tool calls remain compact by default and expose task details and bounded output when expanded.
+The shared background-task widget combines active work from participating plugins. Pwsh tool calls keep their compact TUI and expose task details and bounded output when expanded.
 
 ## Configuration
 

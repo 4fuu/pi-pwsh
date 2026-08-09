@@ -327,6 +327,10 @@ export class PwshTaskRuntime {
 		return { metadata, ...output, ready };
 	}
 
+	async markReadyPresented(metadata: TaskMetadata): Promise<void> {
+		await this.markPresented(metadata, "ready");
+	}
+
 	async stop(id: string): Promise<TaskSnapshot> {
 		let metadata = await this.refreshOwned(id);
 		if (!TERMINAL.has(metadata.status)) {
@@ -459,8 +463,8 @@ export class PwshTaskRuntime {
 			&& existsSync(join(this.taskDirectoryPath(metadata.id), `${metadata.instanceId}.ready.detected`));
 	}
 
-	private async markPresented(metadata: TaskMetadata): Promise<void> {
-		const path = join(this.taskDirectoryPath(metadata.id), `${metadata.instanceId}.exit.presented`);
+	private async markPresented(metadata: TaskMetadata, kind: "ready" | "exit" = "exit"): Promise<void> {
+		const path = join(this.taskDirectoryPath(metadata.id), `${metadata.instanceId}.${kind}.presented`);
 		try {
 			const handle = await open(path, "wx", 0o600);
 			await handle.close();

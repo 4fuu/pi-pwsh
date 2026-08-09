@@ -8,6 +8,7 @@ import {
 	type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
+import { registerTaskCoordinator } from "@4fu/pi-task-coordinator";
 import { loadConfig } from "./config.ts";
 import { resolvePowerShellRuntime, userPowerShellArguments } from "./runtime.ts";
 import { PwshSessionRuntime } from "./session-runtime.ts";
@@ -18,7 +19,7 @@ import {
 	UTF8_PREFIX,
 	wrapPowerShellCommand,
 } from "./spawn.ts";
-import { registerTaskNotificationRenderer, TaskNotificationManager } from "./task-notifications.ts";
+import { TaskNotificationManager } from "./task-notifications.ts";
 import { PwshTaskRuntime, type TaskSnapshot, type TaskStatus } from "./task-runtime.ts";
 
 const SOURCE_DIR = dirname(fileURLToPath(import.meta.url));
@@ -222,6 +223,7 @@ function statusTone(status: TaskStatus): "success" | "error" | "warning" | "mute
 }
 
 export default function pwshExtension(pi: ExtensionAPI): void {
+	const coordinator = registerTaskCoordinator(pi, "pwsh");
 	let sessions: PwshSessionRuntime | undefined;
 	let tasks: PwshTaskRuntime | undefined;
 	let notifications: TaskNotificationManager | undefined;
@@ -234,7 +236,6 @@ export default function pwshExtension(pi: ExtensionAPI): void {
 		setupError = error instanceof Error ? error.message : String(error);
 	}
 
-	registerTaskNotificationRenderer(pi);
 	if (config?.replaceUserBash) {
 		pi.on("user_bash", () => operations ? { operations } : undefined);
 	}
@@ -252,7 +253,9 @@ export default function pwshExtension(pi: ExtensionAPI): void {
 				validate(params);
 				if (!tasks || !sessions) throw new Error(`pwsh: ${setupError ?? "PowerShell runtime is unavailable"}`);
 				const activeTasks = tasks;
-				const release = notifications?.deferDuringToolCall() ?? (() => {});
+				let release = params.taskId !== undefined
+					? coordinator.holdTask(`pwsh:${params.taskId}`)
+					: coordinator.holdSource();
 				try {
 					let snapshot: TaskSnapshot;
 					if (params.taskId !== undefined) {
@@ -269,7 +272,16 @@ export default function pwshExtension(pi: ExtensionAPI): void {
 							helper.source,
 							helper.needsRpc ? sessions.env : {},
 						);
+						const releaseSource = release;
+						release = coordinator.holdTask(`pwsh:${metadata.id}`);
+						releaseSource();
 						snapshot = await activeTasks.snapshot(metadata.id, params.wait ?? 0, signal);
+					}
+					if (snapshot.metadata.status !== "starting" && snapshot.metadata.status !== "running") {
+						coordinator.withdrawTask(`pwsh:${snapshot.metadata.id}`, ["ready", "terminal"], "presented");
+					} else if (snapshot.ready) {
+						await activeTasks.markReadyPresented(snapshot.metadata);
+						coordinator.withdrawTask(`pwsh:${snapshot.metadata.id}`, ["ready"], "presented");
 					}
 					return {
 						content: [{ type: "text" as const, text: taskText(snapshot) }],
@@ -330,6 +342,7 @@ export default function pwshExtension(pi: ExtensionAPI): void {
 		tasks = undefined;
 		operations = undefined;
 		await currentNotifications?.close();
+		coordinator.closeSession();
 		await currentSessions?.close();
 	});
 
@@ -340,6 +353,7 @@ export default function pwshExtension(pi: ExtensionAPI): void {
 		sessions = undefined;
 		tasks = undefined;
 		operations = undefined;
+		coordinator.closeSession();
 		if (!config) {
 			activateBuiltInBash(pi);
 			ctx.ui.notify(`pi-pwsh: ${setupError ?? "configuration could not be loaded"}. The built-in bash tool remains active.`, "error");
@@ -372,7 +386,8 @@ export default function pwshExtension(pi: ExtensionAPI): void {
 			return;
 		}
 
-		const nextNotifications = new TaskNotificationManager(pi, ctx, nextTasks, ctx.sessionManager.getSessionId());
+		coordinator.startSession(ctx, ctx.sessionManager.getSessionId());
+		const nextNotifications = new TaskNotificationManager(coordinator, ctx, nextTasks, ctx.sessionManager.getSessionId());
 		try {
 			await nextNotifications.start();
 			notifications = nextNotifications;

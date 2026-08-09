@@ -54,6 +54,7 @@
     "typescript": "^5.5.0"
   },
   "dependencies": {
+    "@4fu/pi-task-coordinator": "0.1.2",
     "@xterm/headless": "^6.0.0",
     "node-pty": "1.1.0"
   }
