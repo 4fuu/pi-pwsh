@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+cd "$repo_root"
+export PATH="$HOME/.local/bin:$PATH"
+
+started=$SECONDS
+fail() { printf '[resume] %s Rerun .agents/setup.\n' "$1" >&2; exit 1; }
+command -v node >/dev/null 2>&1 || fail 'Node.js is unavailable.'
+node -e 'const [a,b,c]=process.versions.node.split(".").map(Number); process.exit(a>22||(a===22&&(b>19||(b===19&&c>=0)))?0:1)' || fail 'Node.js 22.19.0 or newer is required.'
+command -v npm >/dev/null 2>&1 || fail 'npm is unavailable.'
+command -v python3 >/dev/null 2>&1 || fail 'Python 3 is unavailable.'
+[[ -d node_modules ]] || fail 'node_modules is missing.'
+printf '[resume] Ready with Node %s, npm %s, and Python 3 in %ss; Windows integration tests remain host-dependent.\n' \
+  "$(node --version)" "$(npm --version)" "$((SECONDS - started))"

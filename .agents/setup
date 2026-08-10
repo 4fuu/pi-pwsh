@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+cd "$repo_root"
+export PATH="$HOME/.local/bin:$PATH"
+started=$SECONDS
+phase_start=$SECONDS
+phase() { printf '[setup] %s completed in %ss\n' "$1" "$((SECONDS-phase_start))"; phase_start=$SECONDS; }
+
+apt_install_missing() {
+  local missing=() package
+  for package in "$@"; do
+    dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q 'ok installed' || missing+=("$package")
+  done
+  ((${#missing[@]} == 0)) && return
+  local apt
+  if ((EUID == 0)); then
+    apt=(env DEBIAN_FRONTEND=noninteractive apt-get)
+  elif command -v sudo >/dev/null 2>&1; then
+    apt=(sudo env DEBIAN_FRONTEND=noninteractive apt-get)
+  else
+    printf 'Cannot install prerequisites (%s): run as root or install sudo.\n' "${missing[*]}" >&2
+    exit 1
+  fi
+  "${apt[@]}" update
+  "${apt[@]}" install -y "${missing[@]}"
+}
+
+apt_install_missing ca-certificates curl xz-utils build-essential python3
+phase 'System prerequisites'
+
+node_ok() { command -v node >/dev/null 2>&1 && node -e 'const [a,b,c]=process.versions.node.split(".").map(Number); process.exit(a>22||(a===22&&(b>19||(b===19&&c>=0)))?0:1)'; }
+case "$(uname -m)" in
+  x86_64) portable_arch=x64 ;;
+  aarch64|arm64) portable_arch=arm64 ;;
+  *) printf 'Unsupported architecture: %s\n' "$(uname -m)" >&2; exit 1 ;;
+esac
+if ! node_ok || ! command -v npm >/dev/null 2>&1; then
+  node_version=22.19.0
+  install_root="$HOME/.local/share/node-v${node_version}-linux-${portable_arch}"
+  mkdir -p "$HOME/.local/share" "$HOME/.local/bin"
+  if [[ ! -x "$install_root/bin/node" ]]; then
+    archive="$(mktemp)"; trap 'rm -f "${archive:-}"' EXIT
+    curl --fail --location --retry 3 --output "$archive" "https://nodejs.org/dist/v${node_version}/node-v${node_version}-linux-${portable_arch}.tar.xz"
+    rm -rf "$install_root"; tar -xJf "$archive" -C "$HOME/.local/share"; rm -f "$archive"; trap - EXIT
+  fi
+  for executable in node npm npx corepack; do ln -sfn "$install_root/bin/$executable" "$HOME/.local/bin/$executable"; done
+  hash -r
+fi
+phase 'Node.js and npm'
+printf '[setup] Windows PowerShell/ConPTY integration tests remain host-dependent.\n'
+
+profile="$HOME/.bash_profile"; marker="amp-repo-path:${repo_root}"
+if ! grep -Fq "$marker" "$profile" 2>/dev/null; then
+  cat >>"$profile" <<EOF
+
+# ${marker}
+case "\${PWD:-}/" in
+  "${repo_root}/"*) export PATH="\$HOME/.local/bin:\$PATH" ;;
+esac
+# end ${marker}
+EOF
+fi
+phase 'Shell profile'
+
+npm ci --no-audit --no-fund
+phase 'npm dependencies'
+printf '[setup] Complete in %ss\n' "$((SECONDS - started))"
