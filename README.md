@@ -71,7 +71,7 @@ For terminal logins, `Request-PiPtyInput -Secret` sends input directly from the 
 
 Readiness, completion, failure, and cancellation are reported automatically. Notifications cooperate and aggregate with installed `@4fu` background-task plugins. Successfully retrieving a ready or terminal result explicitly cancels its pending notification, avoiding repeated status and output.
 
-The shared background-task widget combines active work from participating plugins. Pwsh tool calls keep their compact TUI and expose task details and bounded output when expanded.
+The shared Tasks widget combines active work and retained terminal records from participating plugins. Run `/tasks` for the complete bounded catalog. Pwsh tool calls keep their compact TUI and expose task details and bounded output when expanded. Upgrade all participating `@4fu` task plugins together so they use the same shared task-presentation generation.
 
 ## Configuration
 

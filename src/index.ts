@@ -9,6 +9,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { registerTaskCoordinator } from "@4fu/pi-task-coordinator";
+import { registerTaskReporter } from "@4fu/pi-tasks";
 import { loadConfig } from "./config.ts";
 import { resolvePowerShellRuntime, userPowerShellArguments } from "./runtime.ts";
 import { PwshSessionRuntime } from "./session-runtime.ts";
@@ -235,6 +236,7 @@ function statusTone(status: TaskStatus): "success" | "error" | "warning" | "mute
 }
 
 export default function pwshExtension(pi: ExtensionAPI): void {
+	const reporter = registerTaskReporter(pi, "pwsh");
 	const coordinator = registerTaskCoordinator(pi, "pwsh");
 	let sessions: PwshSessionRuntime | undefined;
 	let tasks: PwshTaskRuntime | undefined;
@@ -403,7 +405,7 @@ export default function pwshExtension(pi: ExtensionAPI): void {
 		}
 
 		coordinator.startSession(ctx, ctx.sessionManager.getSessionId());
-		const nextNotifications = new TaskNotificationManager(coordinator, ctx, nextTasks, ctx.sessionManager.getSessionId());
+		const nextNotifications = new TaskNotificationManager(coordinator, reporter, ctx, nextTasks, ctx.sessionManager.getSessionId());
 		try {
 			await nextNotifications.start();
 			notifications = nextNotifications;

@@ -137,19 +137,31 @@ assert.equal((await runtime.readMetadata(launchId)).status, "completed");
 
 // Offers use the shared aggregation schema. Submission and delivery have
 // distinct durable markers, and either one prevents a repeated offer.
-const offers = [], activeUpdates = [];
+const offers = [], catalogs = [];
 const coordinator = {
 	offer(update, callbacks) { offers.push({ update, callbacks }); },
-	updateActiveTasks(update) { activeUpdates.push(update); },
 	withdrawTask() {},
+};
+const reporter = {
+	publishCatalog(sessionId, catalog) { catalogs.push({ sessionId, catalog }); },
+	close() {},
 };
 const ctx = {
 	hasUI: true,
 	mode: "print",
 	ui: { notify() {} },
 };
-const manager = new TaskNotificationManager(coordinator, ctx, runtime, "one", 0);
+const manager = new TaskNotificationManager(coordinator, reporter, ctx, runtime, "one", 0);
 await manager.start();
+const initialCatalog = catalogs.at(-1);
+assert.equal(initialCatalog.sessionId, "one");
+const terminalPresented = initialCatalog.catalog.find(task => task.taskId === launchId);
+assert.deepEqual(terminalPresented, {
+	taskKey: `pwsh:${launchId}`, source: "pwsh", taskId: launchId,
+	phase: "completed", statusLabel: "completed",
+	createdAt: Date.parse(launchMeta.createdAt), updatedAt: Date.parse((await runtime.readMetadata(launchId)).updatedAt),
+	startedAt: Date.parse(launchMeta.createdAt), endedAt: Date.parse((await runtime.readMetadata(launchId)).updatedAt), summary: "x",
+});
 assert.ok(!offers.some(({ update }) => update.taskId === ownId), "presented terminal events must be skipped entirely");
 const terminalOffer = offers.find(({ update }) => update.taskId === launchId);
 assert.deepEqual({
@@ -174,7 +186,6 @@ await manager.scanNow();
 assert.equal(offers.filter(({ update }) => update.taskId === launchId).length, 1);
 await terminalOffer.callbacks.onDelivered("delivery-1");
 assert.equal(await readFile(join(launchTask, `${launchInstance}.exit.notified`), "utf8"), "");
-assert.ok(activeUpdates.length > 0);
 
 // A stale pre-submission lease is recoverable. Readiness is then superseded by
 // terminal state, whose coordinator withdrawal callback settles the ready event.
@@ -191,6 +202,12 @@ await utimes(retryLease, stale, stale);
 await manager.scanNow();
 const readyOffer = offers.find(({ update }) => update.taskId === retryId && update.event === "ready");
 assert.ok(readyOffer);
+assert.deepEqual(catalogs.at(-1).catalog.find(task => task.taskId === retryId), {
+	taskKey: `pwsh:${retryId}`, source: "pwsh", taskId: retryId,
+	phase: "active", statusLabel: "ready",
+	createdAt: Date.parse(retryMeta.createdAt), updatedAt: Date.parse(retryMeta.updatedAt),
+	startedAt: Date.parse(retryMeta.createdAt), summary: "x",
+});
 await writeFile(join(retryTask, "meta.json"), JSON.stringify({ ...retryMeta, status: "completed", exitCode: 0, updatedAt: new Date().toISOString() }));
 await manager.scanNow();
 assert.ok(offers.some(({ update }) => update.taskId === retryId && update.event === "terminal"));
@@ -203,9 +220,8 @@ let releaseList;
 const delayedOffers = [];
 const delayed = new TaskNotificationManager({
 	offer(update) { delayedOffers.push(update); },
-	updateActiveTasks() {},
 	withdrawTask() {},
-}, ctx, {
+}, reporter, ctx, {
 	list: () => new Promise(resolve => { releaseList = resolve; }),
 }, "old-session", 0);
 const startingDelayed = delayed.start();
@@ -215,6 +231,7 @@ await Promise.all([startingDelayed, closingDelayed]);
 assert.equal(delayedOffers.length, 0);
 
 await manager.close();
+assert.deepEqual(catalogs.at(-1), { sessionId: "one", catalog: [] });
 
 // A fresh observer respects a submitted lease, then recovers it after expiry
 // if no matching message acknowledgement ever arrived.
@@ -229,9 +246,8 @@ await writeFile(submittedMarker, "");
 const resumedOffers = [];
 const resumed = new TaskNotificationManager({
 	offer(update, callbacks) { resumedOffers.push({ update, callbacks }); },
-	updateActiveTasks() {},
 	withdrawTask() {},
-}, ctx, runtime, "one", 0);
+}, reporter, ctx, runtime, "one", 0);
 await resumed.start();
 assert.equal(resumedOffers.some(({ update }) => update.taskId === submittedId), false);
 await utimes(submittedMarker, stale, stale);

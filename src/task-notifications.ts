@@ -3,8 +3,9 @@ import { randomUUID } from "node:crypto";
 import { open, readFile, rm, stat, utimes } from "node:fs/promises";
 import { join } from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { ActiveTaskUpdate, TaskCoordinator, TaskNotificationKind, TaskWithdrawalReason } from "@4fu/pi-task-coordinator";
-import { PwshTaskRuntime, renameWithRetry, type TaskMetadata } from "./task-runtime.ts";
+import type { TaskCoordinator, TaskNotificationKind, TaskWithdrawalReason } from "@4fu/pi-task-coordinator";
+import type { PresentedTask, TaskReporter } from "@4fu/pi-tasks";
+import { PwshTaskRuntime, renameWithRetry, type TaskMetadata, type TaskSnapshot } from "./task-runtime.ts";
 
 const DEFAULT_POLL_MS = 400;
 const MAX_NOTIFICATION_LINES = 20;
@@ -15,6 +16,11 @@ type ClaimState = "claimed" | "busy" | "settled" | "retry";
 
 function isTerminal(metadata: TaskMetadata): boolean {
 	return metadata.status !== "starting" && metadata.status !== "running";
+}
+
+function taskPhase(metadata: TaskMetadata): PresentedTask["phase"] {
+	if (metadata.status === "starting" || metadata.status === "running") return "active";
+	return metadata.status;
 }
 
 function boundedOutput(text: string): string {
@@ -35,6 +41,7 @@ export class TaskNotificationManager {
 
 	constructor(
 		private readonly coordinator: TaskCoordinator,
+		private readonly reporter: TaskReporter,
 		private readonly ctx: ExtensionContext,
 		private readonly runtime: PwshTaskRuntime,
 		private readonly sessionId: string,
@@ -57,7 +64,7 @@ export class TaskNotificationManager {
 		this.timer = undefined;
 		await this.scanPromise?.catch(() => {});
 		this.lastScanError = undefined;
-		this.coordinator.updateActiveTasks([]);
+		this.reporter.publishCatalog(this.sessionId, []);
 	}
 
 	async scanNow(): Promise<void> {
@@ -75,10 +82,32 @@ export class TaskNotificationManager {
 	private async performScan(): Promise<void> {
 		const tasks = (await this.runtime.list(this.sessionId)).sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
 		if (this.closed) return;
-		const active: ActiveTaskUpdate[] = [];
+		const snapshots: TaskSnapshot[] = [];
 		for (const metadata of tasks) {
 			if (this.closed) return;
 			const snapshot = await this.runtime.snapshot(metadata.id, 0, undefined, { claimTerminal: false });
+			if (this.closed) return;
+			snapshots.push(snapshot);
+		}
+		const catalog: PresentedTask[] = snapshots.map(({ metadata, ready }) => {
+			const active = !isTerminal(metadata);
+			const createdAt = Date.parse(metadata.createdAt);
+			const updatedAt = Date.parse(metadata.updatedAt);
+			return {
+				taskKey: `pwsh:${metadata.id}`,
+				source: "pwsh",
+				taskId: metadata.id,
+				phase: taskPhase(metadata),
+				statusLabel: active && ready ? "ready" : metadata.status,
+				createdAt,
+				updatedAt,
+				startedAt: createdAt,
+				...(active ? {} : { endedAt: updatedAt }),
+				summary: metadata.commandSummary,
+			};
+		});
+		this.reporter.publishCatalog(this.sessionId, catalog);
+		for (const snapshot of snapshots) {
 			if (this.closed) return;
 			if (isTerminal(snapshot.metadata)) {
 				if (snapshot.ready) {
@@ -86,16 +115,8 @@ export class TaskNotificationManager {
 					await this.settleNotified(snapshot.metadata, "ready");
 				}
 				await this.offer(snapshot.metadata, "terminal", snapshot.output);
-			} else {
-				active.push({
-					taskKey: `pwsh:${snapshot.metadata.id}`, source: "pwsh", taskId: snapshot.metadata.id,
-					status: snapshot.ready ? "ready" : snapshot.metadata.status,
-					startedAt: Date.parse(snapshot.metadata.createdAt), summary: snapshot.metadata.commandSummary,
-				});
-				if (snapshot.ready) await this.offer(snapshot.metadata, "ready", snapshot.output);
-			}
+			} else if (snapshot.ready) await this.offer(snapshot.metadata, "ready", snapshot.output);
 		}
-		if (!this.closed) this.coordinator.updateActiveTasks(active);
 	}
 
 	private async offer(metadata: TaskMetadata, kind: TaskNotificationKind, output: string): Promise<void> {
