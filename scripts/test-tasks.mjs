@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { mkdtemp, mkdir, writeFile, readFile, rm, stat, utimes } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdtemp, mkdir, writeFile, readFile, readdir, rm, stat, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PwshTaskRuntime } from "../src/task-runtime.ts";
-import { validate, DESCRIPTION, PROMPT_GUIDELINE, PwshParams } from "../src/index.ts";
+import { validate, DESCRIPTION, PROMPT_GUIDELINE, PwshParams, taskDetails, taskText } from "../src/index.ts";
 import { TaskNotificationManager } from "../src/task-notifications.ts";
 
 const dir = await mkdtemp(join(tmpdir(), "pi-pwsh-test-"));
@@ -30,6 +31,47 @@ assert.throws(() => validate({ command: "x", notifyOn: "😀".repeat(65) }), /UT
 assert.doesNotThrow(() => validate({ command: "Get-ChildItem", notifyOn: "ready", wait: 1 }));
 assert.match(DESCRIPTION, /PowerShell 7/); assert.match(DESCRIPTION, /\$env:NAME/); assert.match(DESCRIPTION, /bound paths/); assert.match(PROMPT_GUIDELINE, /persistent background task/);
 assert.ok(PwshParams);
+
+// Model text stays lean while structured details retain everything needed by
+// the collapsed and expanded TUI renderers.
+const modelMeta = { ...meta, sessionId: "one", pid: 4321 };
+const successful = { metadata: modelMeta, ready: true, output: "", omittedBytes: 0 };
+assert.equal(taskText(successful), `taskId: ${id}\nstatus: completed`);
+assert.deepEqual(taskDetails(successful), {
+	version: 1, taskId: id, status: "completed", ready: true, exitCode: 0, pid: 4321,
+	createdAt: now, omittedBytes: 0, output: "", error: undefined, diagnosticsPath: undefined,
+});
+const running = { metadata: { ...modelMeta, status: "running", exitCode: undefined }, ready: true, output: "hello\n", omittedBytes: 12 };
+assert.equal(taskText(running), `taskId: ${id}\nstatus: running\nready: true\noutput: [12 earlier bytes omitted]\nhello`);
+const commandFailure = { metadata: { ...modelMeta, status: "failed", exitCode: 7 }, ready: false, output: "", omittedBytes: 0 };
+assert.equal(taskText(commandFailure), `taskId: ${id}\nstatus: failed\nexitCode: 7`);
+const cancelled = { metadata: { ...modelMeta, status: "cancelled", exitCode: null }, ready: false, output: "", omittedBytes: 0 };
+assert.doesNotMatch(taskText(cancelled), /exitCode|unknown|output:|pid/);
+const infraPath = task;
+const infrastructureFailure = { metadata: { ...modelMeta, status: "failed", exitCode: null, error: "launcher broke", failureKind: "infrastructure" }, ready: true, output: "", omittedBytes: 0 };
+assert.match(taskText(infrastructureFailure, infraPath), new RegExp(`error: launcher broke\\ndiagnosticsPath: ${infraPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`));
+assert.equal(taskDetails(infrastructureFailure, infraPath).diagnosticsPath, infraPath);
+assert.doesNotMatch(taskText(commandFailure, infraPath), /diagnosticsPath/);
+const signalFailure = { metadata: { ...modelMeta, status: "failed", exitCode: null, error: "PowerShell exited after signal SIGTERM" }, ready: false, output: "", omittedBytes: 0 };
+assert.match(taskText(signalFailure, infraPath), /error: PowerShell exited after signal SIGTERM/);
+assert.doesNotMatch(taskText(signalFailure, infraPath), /diagnosticsPath/);
+
+// A launcher failure after task-directory allocation leaves real, useful
+// diagnostics behind and names that existing location in the thrown error.
+const startupDir = await mkdtemp(join(tmpdir(), "pi-pwsh-startup-test-"));
+const brokenRuntime = new PwshTaskRuntime({ executable: join(startupDir, "missing-pwsh"), args: [], loadProfile: false, executionPolicy: null, stopOnError: false, pythonUtf8: false, pythonUnbuffered: false }, { taskDir: startupDir, sessionId: "one" });
+let startupError;
+try { await brokenRuntime.start("x", startupDir); } catch (error) { startupError = error; }
+assert.match(String(startupError), /diagnosticsPath:/);
+const startupPath = String(startupError).match(/diagnosticsPath: (.+)$/m)?.[1];
+assert.ok(startupPath && existsSync(startupPath));
+assert.deepEqual((await readdir(startupPath)).filter(name => ["config.json", "meta.json", "output.log"].includes(name)).sort(), ["config.json", "meta.json", "output.log"]);
+const startupMetadata = JSON.parse(await readFile(join(startupPath, "meta.json"), "utf8"));
+assert.equal(startupMetadata.status, "failed");
+assert.equal(startupMetadata.failureKind, "infrastructure");
+assert.match(await readFile(join(startupPath, "output.log"), "utf8"), /startup failure/);
+assert.equal(existsSync(join(startupPath, `${startupMetadata.instanceId}.exit.presented`)), true);
+await rm(startupDir, { recursive: true, force: true });
 
 // Listing must filter ownership before refresh, so stale foreign metadata is
 // neither returned nor rewritten by this session.

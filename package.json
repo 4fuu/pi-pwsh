@@ -1,6 +1,6 @@
 {
   "name": "@4fu/pi-pwsh",
-  "version": "0.8.5",
+  "version": "0.8.6",
   "description": "Persistent PowerShell tasks for pi on Windows, with ConPTY sessions and user requests.",
   "license": "MIT",
   "author": "4fuu",

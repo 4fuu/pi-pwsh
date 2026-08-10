@@ -154,7 +154,12 @@ try {
 			&& ["starting", "running"].includes(metadata.status)
 			&& !existsSync(config.cancelMarkerPath)
 		) {
-			await writeMetadata({ status: "failed", exitCode: null, error: error instanceof Error ? error.message : String(error) });
+			await writeMetadata({
+				status: "failed",
+				exitCode: null,
+				error: error instanceof Error ? error.message : String(error),
+				failureKind: "infrastructure",
+			});
 		}
 	} catch {
 		// Cancellation and replaced metadata are already authoritative.

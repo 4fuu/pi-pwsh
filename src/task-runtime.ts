@@ -35,6 +35,7 @@ export interface TaskMetadata {
 	status: TaskStatus;
 	exitCode?: number | null;
 	error?: string;
+	failureKind?: "infrastructure";
 }
 
 export interface TaskSnapshot {
@@ -189,6 +190,7 @@ function parseMetadata(value: unknown, id: string): TaskMetadata {
 	if (typeof input.status !== "string" || !STATUSES.has(input.status as TaskStatus)) throw new Error("invalid status");
 	if (input.exitCode !== undefined && input.exitCode !== null && !Number.isInteger(input.exitCode)) throw new Error("invalid exit code");
 	if (input.error !== undefined && typeof input.error !== "string") throw new Error("invalid error");
+	if (input.failureKind !== undefined && input.failureKind !== "infrastructure") throw new Error("invalid failure kind");
 	return input as unknown as TaskMetadata;
 }
 
@@ -259,6 +261,7 @@ export class PwshTaskRuntime {
 		const logPath = join(directory, "output.log");
 		const metaPath = join(directory, "meta.json");
 		const configPath = join(directory, "config.json");
+		const cancelMarkerPath = join(directory, `${instanceId}.cancelled`);
 		let launcherPid = 0;
 
 		try {
@@ -286,7 +289,7 @@ export class PwshTaskRuntime {
 				metaPath,
 				notifyOn,
 				readyMarkerPath: join(directory, `${instanceId}.ready.detected`),
-				cancelMarkerPath: join(directory, `${instanceId}.cancelled`),
+				cancelMarkerPath,
 			});
 
 			const launcher = spawn(process.execPath, [LAUNCHER, configPath], {
@@ -329,8 +332,39 @@ export class PwshTaskRuntime {
 			launcher.unref();
 			return await this.refreshOwned(id);
 		} catch (error) {
-			await killProcessTree(launcherPid);
-			await rm(directory, { recursive: true, force: true });
+			const startupMessage = error instanceof Error ? error.message : String(error);
+			const cleanupErrors: string[] = [];
+			try {
+				await writeFile(cancelMarkerPath, "", { flag: "a", mode: 0o600 });
+			} catch (cleanupError) {
+				cleanupErrors.push(`cancel marker: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`);
+			}
+			try {
+				await killProcessTree(launcherPid);
+			} catch (cleanupError) {
+				cleanupErrors.push(`process cleanup: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`);
+			}
+			const message = cleanupErrors.length > 0
+				? `${startupMessage}; cleanup failed (${cleanupErrors.join("; ")})`
+				: startupMessage;
+			// Allocation succeeded, so retain the task artifacts and make startup
+			// failures inspectable just like asynchronous infrastructure failures.
+			const failed = {
+				...metadata,
+				status: "failed" as const,
+				exitCode: null,
+				error: message,
+				failureKind: "infrastructure" as const,
+				updatedAt: new Date().toISOString(),
+			};
+			await Promise.allSettled([
+				writeFile(logPath, `[pi-pwsh startup failure] ${message}\n`, { encoding: "utf8", mode: 0o600, flag: "a" }),
+				writeJsonAtomic(metaPath, failed),
+				writeFile(join(directory, `${instanceId}.exit.presented`), "", { flag: "a", mode: 0o600 }),
+			]);
+			if (directory && existsSync(directory)) {
+				throw new Error(`${message}\ndiagnosticsPath: ${directory}`);
+			}
 			throw error;
 		}
 	}
@@ -374,6 +408,7 @@ export class PwshTaskRuntime {
 				status: "cancelled",
 				exitCode: null,
 				error: undefined,
+				failureKind: undefined,
 				updatedAt: new Date().toISOString(),
 			};
 			await writeJsonAtomic(this.metaPath(id), metadata);
@@ -389,11 +424,12 @@ export class PwshTaskRuntime {
 	}
 
 	async readMetadata(id: string): Promise<TaskMetadata> {
-		if (!existsSync(this.taskDirectoryPath(id))) throw new Error(`pwsh: task ${JSON.stringify(id)} was not found`);
+		const directory = this.taskDirectoryPath(id);
+		if (!existsSync(directory)) throw new Error(`pwsh: task ${JSON.stringify(id)} was not found`);
 		try {
 			return parseMetadata(JSON.parse(await readFile(this.metaPath(id), "utf8")), id);
 		} catch (error) {
-			throw new Error(`pwsh: could not read task ${JSON.stringify(id)}: ${error instanceof Error ? error.message : String(error)}`);
+			throw new Error(`pwsh: could not read task ${JSON.stringify(id)}: ${error instanceof Error ? error.message : String(error)}\ndiagnosticsPath: ${directory}`);
 		}
 	}
 
@@ -442,6 +478,7 @@ export class PwshTaskRuntime {
 			status: "failed",
 			exitCode: null,
 			error: staleStart ? "Task launcher did not become ready" : "Task supervisor exited without final status",
+			failureKind: "infrastructure",
 			updatedAt: new Date().toISOString(),
 		};
 		await writeJsonAtomic(this.metaPath(id), metadata);

@@ -85,6 +85,7 @@ interface PwshDetails {
 	omittedBytes: number;
 	output: string;
 	error?: string;
+	diagnosticsPath?: string;
 }
 
 export function validate(params: PwshParamsValue): void {
@@ -105,21 +106,30 @@ export function validate(params: PwshParamsValue): void {
 	}
 }
 
-function taskText(snapshot: TaskSnapshot): string {
+export function taskText(snapshot: TaskSnapshot, diagnosticsPath?: string): string {
 	const metadata = snapshot.metadata;
+	const output = snapshot.output.trimEnd();
+	const hasOutput = output.length > 0 || snapshot.omittedBytes > 0;
+	const exitCode = typeof metadata.exitCode === "number" && metadata.exitCode !== 0
+		? `exitCode: ${metadata.exitCode}`
+		: metadata.status === "failed" && (metadata.exitCode === undefined || metadata.exitCode === null)
+			? "exitCode: unknown"
+			: undefined;
 	return [
 		`taskId: ${metadata.id}`,
 		`status: ${metadata.status}`,
-		...(snapshot.ready ? ["ready: true"] : []),
-		...(metadata.pid ? [`pid: ${metadata.pid}`] : []),
-		...(metadata.exitCode !== undefined ? [`exitCode: ${metadata.exitCode ?? "unknown"}`] : []),
-		snapshot.omittedBytes > 0 ? `output: [${snapshot.omittedBytes} earlier bytes omitted]` : "output:",
-		snapshot.output.trimEnd() || "(no output)",
+		...(snapshot.ready && (metadata.status === "starting" || metadata.status === "running") ? ["ready: true"] : []),
+		...(exitCode ? [exitCode] : []),
+		...(hasOutput ? [
+			snapshot.omittedBytes > 0 ? `output: [${snapshot.omittedBytes} earlier bytes omitted]` : "output:",
+			...(output ? [output] : []),
+		] : []),
 		...(metadata.error ? [`error: ${metadata.error}`] : []),
+		...(metadata.failureKind === "infrastructure" && diagnosticsPath ? [`diagnosticsPath: ${diagnosticsPath}`] : []),
 	].join("\n");
 }
 
-function taskDetails(snapshot: TaskSnapshot): PwshDetails {
+export function taskDetails(snapshot: TaskSnapshot, diagnosticsPath?: string): PwshDetails {
 	return {
 		version: 1,
 		taskId: snapshot.metadata.id,
@@ -131,6 +141,7 @@ function taskDetails(snapshot: TaskSnapshot): PwshDetails {
 		omittedBytes: snapshot.omittedBytes,
 		output: snapshot.output,
 		error: snapshot.metadata.error,
+		diagnosticsPath: snapshot.metadata.failureKind === "infrastructure" ? diagnosticsPath : undefined,
 	};
 }
 
@@ -284,9 +295,12 @@ export default function pwshExtension(pi: ExtensionAPI): void {
 						await activeTasks.markReadyPresented(snapshot.metadata);
 						coordinator.withdrawTask(`pwsh:${snapshot.metadata.id}`, ["ready"], "presented");
 					}
+					const diagnosticsPath = snapshot.metadata.failureKind === "infrastructure"
+						? activeTasks.taskDirectoryPath(snapshot.metadata.id)
+						: undefined;
 					return {
-						content: [{ type: "text" as const, text: taskText(snapshot) }],
-						details: taskDetails(snapshot),
+						content: [{ type: "text" as const, text: taskText(snapshot, diagnosticsPath) }],
+						details: taskDetails(snapshot, diagnosticsPath),
 					};
 				} finally {
 					release();
@@ -328,6 +342,7 @@ export default function pwshExtension(pi: ExtensionAPI): void {
 					note,
 					theme.fg("toolOutput", output || "(no output)"),
 					...(details.error ? [theme.fg("error", details.error)] : []),
+					...(details.diagnosticsPath ? [theme.fg("dim", `diagnostics: ${details.diagnosticsPath}`)] : []),
 				].filter(Boolean).join("\n"), 0, 0);
 			},
 		});
