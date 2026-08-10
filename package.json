@@ -1,6 +1,6 @@
 {
   "name": "@4fu/pi-pwsh",
-  "version": "0.8.7",
+  "version": "0.8.8",
   "description": "Persistent PowerShell tasks for pi on Windows, with ConPTY sessions and user requests.",
   "license": "MIT",
   "author": "4fuu",
@@ -56,7 +56,7 @@
   },
   "dependencies": {
     "@4fu/pi-task-coordinator": "0.2.0",
-    "@4fu/pi-tasks": "0.1.0",
+    "@4fu/pi-tasks": "0.1.1",
     "@xterm/headless": "^6.0.0",
     "node-pty": "1.1.0"
   }
