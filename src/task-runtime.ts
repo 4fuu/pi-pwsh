@@ -292,10 +292,14 @@ export class PwshTaskRuntime {
 				cancelMarkerPath,
 			});
 
+			const launcherEnv = createRuntimeEnv(extraEnv, process.env, this.pwsh);
+			// A Bun-compiled standalone otherwise re-enters its bundled application
+			// instead of executing the external launcher module.
+			if (process.versions.bun) launcherEnv.BUN_BE_BUN = "1";
 			const launcher = spawn(process.execPath, [LAUNCHER, configPath], {
 				cwd,
 				detached: true,
-				env: createRuntimeEnv(extraEnv, process.env, this.pwsh),
+				env: launcherEnv,
 				stdio: ["ignore", "ignore", "ignore", "ipc"],
 				windowsHide: true,
 			});

@@ -91,6 +91,9 @@ let child;
 let logFd;
 try {
 	logFd = openSync(config.logPath, "a");
+	// This flag makes a Bun standalone execute this launcher, but it must not
+	// alter Bun standalone executables started by the user's PowerShell command.
+	if (process.versions.bun) delete process.env.BUN_BE_BUN;
 	child = spawn(config.executable, config.args, {
 		cwd: config.cwd,
 		env: process.env,

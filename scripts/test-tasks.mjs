@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { existsSync } from "node:fs";
 import { mkdtemp, mkdir, writeFile, readFile, readdir, rm, stat, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -134,6 +134,39 @@ assert.equal(ready.ready, true);
 assert.ok(ready.omittedBytes > 50000);
 if (launcher.exitCode === null) await new Promise(resolve => launcher.once("exit", resolve));
 assert.equal((await runtime.readMetadata(launchId)).status, "completed");
+
+// Bun standalone launchers require BUN_BE_BUN, but user commands must not
+// inherit it. Simulate Bun in a Node bootstrap so this is covered in CI.
+const bunId = "ps_b16be000", bunTask = runtime.taskDirectoryPath(bunId), bunInstance = "6".repeat(32);
+await mkdir(bunTask);
+const bunMeta = { ...meta, id: bunId, instanceId: bunInstance, sessionId: "one", status: "starting", exitCode: undefined };
+const bunLog = join(bunTask, "output.log"), bunMetaPath = join(bunTask, "meta.json");
+const bunConfig = join(bunTask, "config.json");
+await writeFile(bunMetaPath, JSON.stringify(bunMeta));
+await writeFile(bunLog, "");
+await writeFile(bunConfig, JSON.stringify({
+	id: bunId,
+	instanceId: bunInstance,
+	executable: process.execPath,
+	args: ["-e", "process.stdout.write(process.env.BUN_BE_BUN ?? '<unset>')"],
+	cwd: dir,
+	logPath: bunLog,
+	metaPath: bunMetaPath,
+	cancelMarkerPath: join(bunTask, `${bunInstance}.cancelled`),
+}));
+const bunBootstrap = `Object.defineProperty(process.versions, "bun", { value: "test" }); await import(${JSON.stringify(pathToFileURL(launcherPath).href)})`;
+const bunLauncher = spawn(process.execPath, ["--input-type=module", "-e", bunBootstrap, "launcher", bunConfig], {
+	env: { ...process.env, BUN_BE_BUN: "1" },
+	stdio: ["ignore", "ignore", "ignore", "ipc"],
+});
+await new Promise((resolve, reject) => {
+	bunLauncher.once("error", reject);
+	bunLauncher.on("message", message => message?.type === "ready" && resolve());
+});
+if (bunLauncher.exitCode === null) await new Promise(resolve => bunLauncher.once("exit", resolve));
+const bunDone = await runtime.snapshot(bunId, 1, undefined, { claimTerminal: false });
+assert.equal(bunDone.metadata.status, "completed");
+assert.equal(bunDone.output, "<unset>");
 
 // Offers use the shared aggregation schema. Submission and delivery have
 // distinct durable markers, and either one prevents a repeated offer.
