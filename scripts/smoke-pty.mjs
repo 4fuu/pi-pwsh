@@ -5,6 +5,24 @@ import extension from "../src/index.ts";
 try { execFileSync("pwsh", ["-NoProfile", "-Command", "$PSVersionTable.PSVersion.Major"], { stdio: "ignore" }); }
 catch (error) { if (error.code === "ENOENT") { console.log("SKIP [PowerShell PTY e2e] pwsh is not installed"); process.exit(0); } throw error; }
 
+function createEventBus() {
+	const subscriptions = new Map();
+	return {
+		on(channel, handler) {
+			const handlers = subscriptions.get(channel) ?? new Set();
+			handlers.add(handler);
+			subscriptions.set(channel, handlers);
+			return () => {
+				handlers.delete(handler);
+				if (handlers.size === 0) subscriptions.delete(channel);
+			};
+		},
+		emit(channel, data) {
+			for (const handler of [...(subscriptions.get(channel) ?? [])]) handler(data);
+		},
+	};
+}
+
 const handlers = new Map();
 let tool;
 let activeTools = ["bash", "read", "ls", "find", "grep"];
@@ -14,7 +32,8 @@ const pi = {
 		values.push(handler);
 		handlers.set(event, values);
 	},
-	events: { on() {}, emit() {} },
+	events: createEventBus(),
+	registerCommand() {},
 	registerTool(definition) { tool = definition; },
 	registerMessageRenderer() {},
 	sendMessage() {},
@@ -68,7 +87,8 @@ const fallbackHandlers = new Map();
 let fallbackTools = ["pwsh", "read"];
 extension({
 	on(event, handler) { fallbackHandlers.set(event, [...(fallbackHandlers.get(event) ?? []), handler]); },
-	events: { on() {}, emit() {} },
+	events: createEventBus(),
+	registerCommand() {},
 	registerTool() {},
 	registerMessageRenderer() {},
 	sendMessage() {},
