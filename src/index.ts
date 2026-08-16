@@ -33,7 +33,7 @@ export const DESCRIPTION = `Run a PowerShell 7 command as a persistent backgroun
 
 Write PowerShell 7 syntax. Single quotes are literal; double quotes expand variables; backtick is the escape character. Set environment variables with $env:NAME = 'value'; command. Quote paths containing spaces. Prefer modern cross-platform tools such as rg and fd when available. PowerShell recursive searches do not honor .gitignore, so bound paths, depth, and output tightly.
 
-Exactly one of command or taskId is required. A command always starts a persistent task and returns immediately unless wait is supplied. With notifyOn, start and taskId waits end when that case-sensitive literal UTF-8 text appears or the task terminates; otherwise they wait for termination. A timeout or tool abort ends only waiting—the task continues. Only stop=true terminates its process tree. Queries are idempotent snapshots containing status and bounded latest output. Task IDs are usable only in the parent session that launched them.
+Exactly one of command or taskId is required. To start a new task, pass only command and omit taskId. To inspect, wait for, or stop an existing task, pass only taskId and omit command. A command always starts a persistent task and returns immediately unless wait is supplied. With notifyOn, start and taskId waits end when that case-sensitive literal UTF-8 text appears or the task terminates; otherwise they wait for termination. A timeout or tool abort ends only waiting—the task continues. Only stop=true terminates its process tree. Queries are idempotent snapshots containing status and bounded latest output. Task IDs are usable only in the parent session that launched them.
 
 Do not create a second background layer inside the command. Use taskId in a later pwsh call to inspect or stop work.
 
@@ -90,8 +90,15 @@ interface PwshDetails {
 }
 
 export function validate(params: PwshParamsValue): void {
+	// Strict-mode providers force optional fields into `required` and emit null for
+	// absent ones; treat null as not provided (same as undefined).
+	for (const key of ["command", "notifyOn", "taskId", "wait", "stop"] as const) {
+		if ((params as Record<string, unknown>)[key] == null) {
+			delete (params as Record<string, unknown>)[key];
+		}
+	}
 	if ((params.command === undefined) === (params.taskId === undefined)) {
-		throw new Error("pwsh: provide exactly one of command or taskId");
+		throw new Error("pwsh: provide exactly one of command or taskId — pass only command to start a new task, or only taskId to inspect/wait/stop an existing one");
 	}
 	if (params.command !== undefined && params.stop !== undefined) {
 		throw new Error("pwsh: stop is accepted only with taskId");
