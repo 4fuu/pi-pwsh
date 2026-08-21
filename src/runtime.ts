@@ -89,13 +89,12 @@ export async function resolvePowerShellRuntime(
 	const failures: string[] = [];
 
 	for (const candidate of candidates) {
-		if (explicit && !dependencies.exists(candidate)) {
-			failures.push(`${candidate}: file not found`);
-			continue;
-		}
+		// Windows app-execution aliases can be spawnable even when existsSync returns false.
 		const probe = await dependencies.probe(candidate);
 		if (!probe) {
-			failures.push(`${candidate}: failed to start or returned an invalid version`);
+			failures.push(explicit && !dependencies.exists(candidate)
+				? `${candidate}: file not found`
+				: `${candidate}: failed to start or returned an invalid version`);
 			continue;
 		}
 		const major = majorVersion(probe.version);

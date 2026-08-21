@@ -75,6 +75,19 @@ try {
 		]);
 	});
 
+	await test("runtime-accepts-spawnable-app-execution-alias", async () => {
+		const alias = "C:\\Users\\me\\AppData\\Local\\Microsoft\\WindowsApps\\pwsh.exe";
+		const resolved = "C:\\Program Files\\WindowsApps\\Microsoft.PowerShell_7.6.5.0_x64__8wekyb3d8bbwe\\pwsh.exe";
+		const runtime = await resolvePowerShellRuntime({ ...DEFAULT_CONFIG, executable: alias }, {
+			exists: (path) => path === resolved,
+			probe: async (candidate) => {
+				assert.equal(candidate, alias);
+				return { version: "7.6.5", executable: resolved };
+			},
+		});
+		assert.equal(runtime.executable, resolved);
+	});
+
 	await test("rejects-powershell-before-seven", async () => {
 		await assert.rejects(
 			resolvePowerShellRuntime({ ...DEFAULT_CONFIG }, {
