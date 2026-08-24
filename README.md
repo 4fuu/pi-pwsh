@@ -21,6 +21,29 @@ Windows shell work is more reliable when the tool name, syntax, process model, a
 
 This lets pi use PowerShell without blocking on long-running work: task persistence, notifications, terminal sessions, and UI requests stay behind the extension.
 
+## Compared with pi's built-in PowerShell tool
+
+Pi 0.84.3 added an optional built-in [`powershell` tool](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/windows.md#powershell-tool) for Windows. It is a lightweight foreground command executor built on pi's existing shell-tool infrastructure. `pi-pwsh` adds a persistent task and interaction layer for work that must continue independently of one tool call.
+
+| Area | Pi built-in `powershell` | `pi-pwsh` | Better fit |
+| --- | --- | --- | --- |
+| Basic command execution | Built into pi with no extension dependencies | Separate extension with task, PTY, and coordination dependencies | **Built-in** for simple commands |
+| Shared baseline | Runs in the current directory, captures stdout/stderr, bounds returned output, and can terminate a process tree | Same | **Equivalent** |
+| Foreground experience | Waits for completion and streams live output into the current tool card | Starts a task and returns immediately by default; waiting returns a task snapshot rather than live tool updates | **Built-in** for short foreground work |
+| Background work | No managed background-task API or task ID | Every command is a persistent task with inspect, wait, and stop operations | **pi-pwsh** |
+| Abort and timeout | Aborting the tool call or reaching its timeout terminates the process tree | Aborting or timing out a wait leaves the task running; only `stop=true` terminates it | Depends on whether work should stop or continue |
+| Readiness and completion | No readiness detection or deferred notification | Reports readiness from `notifyOn`, then completion, failure, or cancellation without polling | **pi-pwsh** |
+| Durability and output | Returns the last 2,000 lines or 50 KiB and writes truncated full output to a temporary file | Persists task metadata and full logs across later calls, `/reload`, and pi restarts; snapshots return the latest 50 KiB and terminal records are retained for 24 hours | **pi-pwsh** |
+| Interactive programs | Non-interactive process with no stdin or terminal session | Persistent ConPTY sessions with input, screen snapshots, transcript reads, waiting, resizing, and process control | **pi-pwsh** |
+| User interaction | No command-to-UI request API | Commands can request text, confirmation, selection, masked input, or secret input sent directly to a PTY | **pi-pwsh** |
+| PowerShell runtime | Prefers `pwsh.exe` but falls back to Windows PowerShell; fixed `-NoProfile -NonInteractive -ExecutionPolicy Bypass` | Requires and verifies PowerShell 7+; executable, profile loading, execution policy, and stop-on-error behavior are configurable | Built-in for broad availability; **pi-pwsh** for consistent behavior |
+| Encoding and source transport | Sets console output to UTF-8 and passes the command as a process argument | Sends UTF-8 source through stdin, configures PowerShell and native-command encodings, strips styling for task output, and can default Python to unbuffered UTF-8 | **pi-pwsh** |
+| Exit status | Reports the outer PowerShell process exit code | Preserves the final native command's exact exit code and maps final PowerShell command failures consistently | **pi-pwsh** |
+| `!` and `!!` shortcuts | Continue to use Bash | Use the configured PowerShell runtime by default; this replacement is optional | **pi-pwsh** for a consistent shell |
+| Pi integration | Core tool, available through `defaultTools` and the SDK, with current `PI_*` session/model environment variables | Custom task UI, coordinated notifications, and the shared `/tasks` catalog | Depends on the integration needed |
+
+Choose the built-in tool when commands are short-lived and native pi integration matters most. Choose `pi-pwsh` for builds, tests, servers, watchers, interactive applications, durable output, or commands that need to ask the user for input. The tools have different names and can coexist, but enabling both gives the model two PowerShell tools with different lifecycle semantics; most setups should select one.
+
 ## Features
 
 ### Background tasks and coordinated notifications
