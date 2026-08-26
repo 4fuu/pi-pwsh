@@ -2,10 +2,10 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { existsSync } from "node:fs";
-import { mkdtemp, mkdir, writeFile, readFile, readdir, rm, stat, utimes } from "node:fs/promises";
+import { mkdtemp, mkdir, open, writeFile, readFile, readdir, rm, stat, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { PwshTaskRuntime } from "../src/task-runtime.ts";
+import { PwshTaskRuntime, renameWithRetry } from "../src/task-runtime.ts";
 import { validate, DESCRIPTION, PROMPT_GUIDELINE, PwshParams, taskDetails, taskText } from "../src/index.ts";
 import { TaskNotificationManager } from "../src/task-notifications.ts";
 
@@ -134,6 +134,90 @@ assert.equal(ready.ready, true);
 assert.ok(ready.omittedBytes > 50000);
 if (launcher.exitCode === null) await new Promise(resolve => launcher.once("exit", resolve));
 assert.equal((await runtime.readMetadata(launchId)).status, "completed");
+
+// Windows refuses rename-over while any reader holds the destination open.
+// The retry budget must outlive a contention window longer than the old
+// linear schedule, and the launcher must acknowledge startup before waiting
+// on that metadata write. Holding the handle through the complete retry ladder
+// also exercises the last-resort in-place overwrite.
+if (process.platform === "win32") {
+	const retryDestination = join(dir, "retry-destination.json");
+	const retrySource = join(dir, "retry-source.json");
+	await writeFile(retryDestination, "old");
+	await writeFile(retrySource, "new");
+	const retryHandle = await open(retryDestination, "r");
+	const releaseRetryHandle = setTimeout(() => void retryHandle.close().catch(() => {}), 750);
+	try {
+		await renameWithRetry(retrySource, retryDestination);
+	} finally {
+		clearTimeout(releaseRetryHandle);
+		await retryHandle.close().catch(() => {});
+	}
+	assert.equal(await readFile(retryDestination, "utf8"), "new");
+
+	const lockedId = "ps_e1e2e3e4";
+	const lockedTask = runtime.taskDirectoryPath(lockedId);
+	const lockedInstance = "7".repeat(32);
+	const lockedMetaPath = join(lockedTask, "meta.json");
+	const lockedLogPath = join(lockedTask, "output.log");
+	const lockedConfigPath = join(lockedTask, "config.json");
+	await mkdir(lockedTask);
+	await writeFile(lockedMetaPath, JSON.stringify({
+		...meta,
+		id: lockedId,
+		instanceId: lockedInstance,
+		sessionId: "one",
+		status: "starting",
+		exitCode: undefined,
+	}));
+	await writeFile(lockedLogPath, "");
+	await writeFile(lockedConfigPath, JSON.stringify({
+		id: lockedId,
+		instanceId: lockedInstance,
+		executable: process.execPath,
+		args: ["-e", "setTimeout(()=>{},250)"],
+		cwd: dir,
+		logPath: lockedLogPath,
+		metaPath: lockedMetaPath,
+		cancelMarkerPath: join(lockedTask, `${lockedInstance}.cancelled`),
+	}));
+
+	const lockedHandle = await open(lockedMetaPath, "r");
+	const lockedLauncher = spawn(process.execPath, [launcherPath, lockedConfigPath], { stdio: ["ignore", "ignore", "ignore", "ipc"] });
+	let statusAtReady;
+	let statusWhileLocked;
+	try {
+		await new Promise((resolve, reject) => {
+			const timeout = setTimeout(() => reject(new Error("locked launcher did not send ready within 5 seconds")), 5_000);
+			const onError = (error) => { clearTimeout(timeout); reject(error); };
+			const onExit = (code) => { clearTimeout(timeout); reject(new Error(`locked launcher exited before ready (${code})`)); };
+			const onMessage = (message) => {
+				if (message?.type !== "ready") return;
+				clearTimeout(timeout);
+				lockedLauncher.off("error", onError);
+				lockedLauncher.off("exit", onExit);
+				lockedLauncher.off("message", onMessage);
+				resolve();
+			};
+			lockedLauncher.once("error", onError);
+			lockedLauncher.once("exit", onExit);
+			lockedLauncher.on("message", onMessage);
+		});
+		statusAtReady = JSON.parse(await readFile(lockedMetaPath, "utf8")).status;
+		const fallbackDeadline = Date.now() + 6_000;
+		while (Date.now() < fallbackDeadline && statusWhileLocked !== "running") {
+			try { statusWhileLocked = JSON.parse(await readFile(lockedMetaPath, "utf8")).status; }
+			catch { /* An in-place overwrite may expose one transient torn read. */ }
+			if (statusWhileLocked !== "running") await new Promise(resolve => setTimeout(resolve, 25));
+		}
+	} finally {
+		await lockedHandle.close().catch(() => {});
+		if (lockedLauncher.exitCode === null) await new Promise(resolve => lockedLauncher.once("exit", resolve));
+	}
+	assert.equal(statusAtReady, "starting");
+	assert.equal(statusWhileLocked, "running");
+	assert.equal((await runtime.readMetadata(lockedId)).status, "completed");
+}
 
 // Bun standalone launchers require BUN_BE_BUN, but user commands must not
 // inherit it. Simulate Bun in a Node bootstrap so this is covered in CI.
