@@ -8,19 +8,30 @@ if (!configPath) throw new Error("Missing persistent task configuration path");
 const config = JSON.parse(await readFile(configPath, "utf8"));
 
 /**
- * Rename over an existing file, tolerating the transient lock errors Windows
- * raises when a concurrent reader or antivirus scanner holds the destination.
+ * Rename over an existing file, tolerating the lock errors Windows raises
+ * while a concurrent reader holds the destination open.
+ *
+ * On Windows this is not always transient: MoveFileExW(REPLACE_EXISTING)
+ * fails with EPERM whenever ANY handle holds the destination open, and every
+ * pi instance rescans all task directories every 400ms, so multi-instance
+ * machines routinely keep meta.json contended far longer than a short linear
+ * retry can ride out. Use exponential backoff with enough total budget for
+ * the observed windows, and stop scheduling sleep after the final failed
+ * attempt — that pause only delays the caller's fallback for no benefit.
  */
 async function renameWithRetry(from, to) {
 	let lastError;
-	for (let attempt = 0; attempt < 6; attempt++) {
+	const attempts = 8;
+	for (let attempt = 0; attempt < attempts; attempt++) {
 		try {
 			await rename(from, to);
 			return;
 		} catch (error) {
 			if (!["EPERM", "EACCES", "EBUSY"].includes(error?.code)) throw error;
 			lastError = error;
-			await new Promise((resolve) => setTimeout(resolve, 25 * (attempt + 1)));
+			if (attempt + 1 < attempts) {
+				await new Promise((resolve) => setTimeout(resolve, Math.min(25 * 2 ** attempt, 1600)));
+			}
 		}
 	}
 	throw lastError;
@@ -36,7 +47,16 @@ async function writeMetadata(change) {
 	try {
 		await writeFile(temporary, `${JSON.stringify(next, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
 		if (existsSync(config.cancelMarkerPath)) throw new Error("cancelled");
-		await renameWithRetry(temporary, config.metaPath);
+		try {
+			await renameWithRetry(temporary, config.metaPath);
+		} catch (error) {
+			// Last resort once the backoff ladder is exhausted: overwrite in
+			// place. Atomicity degrades to best-effort, but readers already
+			// tolerate transient parse failures, so a torn read costs one poll
+			// cycle while a failed write costs the whole task.
+			if (!["EPERM", "EACCES", "EBUSY"].includes(error?.code)) throw error;
+			await writeFile(config.metaPath, `${JSON.stringify(next, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+		}
 	} finally {
 		await rm(temporary, { force: true });
 	}
@@ -119,9 +139,16 @@ try {
 		child.once("spawn", resolve);
 		child.once("error", reject);
 	});
-	await writeMetadata({ supervisorPid: process.pid, pid: child.pid, status: "running" });
+	// Send the ready handshake before the first metadata write: under
+	// contention the rename backoff ladder can hold writeMetadata for
+	// seconds, and the parent's 5-second launcher-ready bridge must not
+	// depend on that timing - a healthy task that is already producing
+	// output would otherwise be reported as "did not start within 5
+	// seconds" and killed. The parent already tolerates reading
+	// status "starting" in the immediate post-ready snapshot.
 	notify({ type: "ready" });
 	if (process.connected) process.disconnect();
+	await writeMetadata({ supervisorPid: process.pid, pid: child.pid, status: "running" });
 
 	const { exitCode, signal } = await completion;
 	if (readinessTimer) clearInterval(readinessTimer);
