@@ -130,9 +130,16 @@ try {
 		child.once("spawn", resolve);
 		child.once("error", reject);
 	});
-	await writeMetadata({ supervisorPid: process.pid, pid: child.pid, status: "running" });
+	// Send the ready handshake before the first metadata write: under
+	// contention the rename backoff ladder can hold writeMetadata for
+	// seconds, and the parent's 5-second launcher-ready bridge must not
+	// depend on that timing - a healthy task that is already producing
+	// output would otherwise be reported as "did not start within 5
+	// seconds" and killed. The parent already tolerates reading
+	// status "starting" in the immediate post-ready snapshot.
 	notify({ type: "ready" });
 	if (process.connected) process.disconnect();
+	await writeMetadata({ supervisorPid: process.pid, pid: child.pid, status: "running" });
 
 	const { exitCode, signal } = await completion;
 	if (readinessTimer) clearInterval(readinessTimer);
