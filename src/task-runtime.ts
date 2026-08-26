@@ -93,7 +93,17 @@ async function writeJsonAtomic(path: string, value: unknown): Promise<void> {
 	const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
 	try {
 		await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-		await renameWithRetry(temporary, path);
+		try {
+			await renameWithRetry(temporary, path);
+		} catch (error) {
+			// Last resort once the backoff ladder is exhausted: overwrite in
+			// place. Atomicity degrades to best-effort, but readers already
+			// tolerate transient parse failures, so a torn read costs one poll
+			// cycle while a failed write costs the whole task.
+			const code = (error as NodeJS.ErrnoException).code;
+			if (code !== "EPERM" && code !== "EACCES" && code !== "EBUSY") throw error;
+			await writeFile(path, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+		}
 	} finally {
 		await rm(temporary, { force: true });
 	}

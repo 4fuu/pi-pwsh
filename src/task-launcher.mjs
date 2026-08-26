@@ -47,7 +47,16 @@ async function writeMetadata(change) {
 	try {
 		await writeFile(temporary, `${JSON.stringify(next, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
 		if (existsSync(config.cancelMarkerPath)) throw new Error("cancelled");
-		await renameWithRetry(temporary, config.metaPath);
+		try {
+			await renameWithRetry(temporary, config.metaPath);
+		} catch (error) {
+			// Last resort once the backoff ladder is exhausted: overwrite in
+			// place. Atomicity degrades to best-effort, but readers already
+			// tolerate transient parse failures, so a torn read costs one poll
+			// cycle while a failed write costs the whole task.
+			if (!["EPERM", "EACCES", "EBUSY"].includes(error?.code)) throw error;
+			await writeFile(config.metaPath, `${JSON.stringify(next, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+		}
 	} finally {
 		await rm(temporary, { force: true });
 	}
