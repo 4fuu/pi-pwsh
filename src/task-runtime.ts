@@ -59,12 +59,21 @@ const START_GRACE_MS = 10_000;
 const LAUNCHER = join(dirname(fileURLToPath(import.meta.url)), "task-launcher.mjs");
 
 /**
- * Rename over an existing file, tolerating the transient lock errors Windows
- * raises when a concurrent reader or antivirus scanner holds the destination.
+ * Rename over an existing file, tolerating the lock errors Windows raises
+ * while a concurrent reader holds the destination open.
+ *
+ * On Windows this is not always transient: MoveFileExW(REPLACE_EXISTING)
+ * fails with EPERM whenever ANY handle holds the destination open, and every
+ * pi instance rescans all task directories every 400ms, so multi-instance
+ * machines routinely keep meta.json contended far longer than a short linear
+ * retry can ride out. Use exponential backoff with enough total budget for
+ * the observed windows, and stop scheduling sleep after the final failed
+ * attempt — that pause only delays the caller's fallback for no benefit.
  */
 export async function renameWithRetry(from: string, to: string): Promise<void> {
 	let lastError: unknown;
-	for (let attempt = 0; attempt < 6; attempt++) {
+	const attempts = 8;
+	for (let attempt = 0; attempt < attempts; attempt++) {
 		try {
 			await rename(from, to);
 			return;
@@ -72,7 +81,9 @@ export async function renameWithRetry(from: string, to: string): Promise<void> {
 			const code = (error as NodeJS.ErrnoException).code;
 			if (code !== "EPERM" && code !== "EACCES" && code !== "EBUSY") throw error;
 			lastError = error;
-			await new Promise((resolve) => setTimeout(resolve, 25 * (attempt + 1)));
+			if (attempt + 1 < attempts) {
+				await new Promise((resolve) => setTimeout(resolve, Math.min(25 * 2 ** attempt, 1_600)));
+			}
 		}
 	}
 	throw lastError;

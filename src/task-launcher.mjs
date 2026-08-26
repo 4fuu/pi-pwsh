@@ -8,19 +8,30 @@ if (!configPath) throw new Error("Missing persistent task configuration path");
 const config = JSON.parse(await readFile(configPath, "utf8"));
 
 /**
- * Rename over an existing file, tolerating the transient lock errors Windows
- * raises when a concurrent reader or antivirus scanner holds the destination.
+ * Rename over an existing file, tolerating the lock errors Windows raises
+ * while a concurrent reader holds the destination open.
+ *
+ * On Windows this is not always transient: MoveFileExW(REPLACE_EXISTING)
+ * fails with EPERM whenever ANY handle holds the destination open, and every
+ * pi instance rescans all task directories every 400ms, so multi-instance
+ * machines routinely keep meta.json contended far longer than a short linear
+ * retry can ride out. Use exponential backoff with enough total budget for
+ * the observed windows, and stop scheduling sleep after the final failed
+ * attempt — that pause only delays the caller's fallback for no benefit.
  */
 async function renameWithRetry(from, to) {
 	let lastError;
-	for (let attempt = 0; attempt < 6; attempt++) {
+	const attempts = 8;
+	for (let attempt = 0; attempt < attempts; attempt++) {
 		try {
 			await rename(from, to);
 			return;
 		} catch (error) {
 			if (!["EPERM", "EACCES", "EBUSY"].includes(error?.code)) throw error;
 			lastError = error;
-			await new Promise((resolve) => setTimeout(resolve, 25 * (attempt + 1)));
+			if (attempt + 1 < attempts) {
+				await new Promise((resolve) => setTimeout(resolve, Math.min(25 * 2 ** attempt, 1600)));
+			}
 		}
 	}
 	throw lastError;
