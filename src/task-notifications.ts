@@ -52,7 +52,7 @@ export class TaskNotificationManager {
 		if (!this.closed) return;
 		this.closed = false;
 		if (this.pollIntervalMs > 0) {
-			this.timer = setInterval(() => void this.scanSafely(), this.pollIntervalMs);
+			this.timer = setInterval(() => void this.scanSafely().catch(() => {}), this.pollIntervalMs);
 			this.timer.unref?.();
 		}
 		await this.scanSafely();
@@ -208,7 +208,27 @@ export class TaskNotificationManager {
 			const message = error instanceof Error ? error.message : String(error);
 			if (message === this.lastScanError) return;
 			this.lastScanError = message;
-			if (!this.closed && this.ctx.hasUI) this.ctx.ui.notify(`pi-pwsh: task observer error: ${message}`, "error");
+			this.notifyScanError(message);
+		}
+	}
+
+	/**
+	 * Reports a scan error through the UI. Never throws: this is the observer's last
+	 * error handler, and it runs from a timer callback whose rejection would surface as
+	 * an uncaught exception.
+	 *
+	 * Every property of a captured extension context asserts that the context is still
+	 * active, so `ctx.hasUI` throws once pi replaces or reloads the session. The context
+	 * is invalidated before `session_start` fires, so the timer can still be armed while
+	 * the context is already stale. Stop the observer in that case; index.ts constructs a
+	 * new manager with the fresh context on `session_start`.
+	 */
+	private notifyScanError(message: string): void {
+		if (this.closed) return;
+		try {
+			if (this.ctx.hasUI) this.ctx.ui.notify(`pi-pwsh: task observer error: ${message}`, "error");
+		} catch {
+			void this.close().catch(() => {});
 		}
 	}
 

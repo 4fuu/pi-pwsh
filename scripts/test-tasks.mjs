@@ -347,6 +347,43 @@ releaseList([]);
 await Promise.all([startingDelayed, closingDelayed]);
 assert.equal(delayedOffers.length, 0);
 
+// A scan error still reaches the UI on a live context.
+const notified = [];
+const liveObserver = new TaskNotificationManager({
+	offer() {},
+	withdrawTask() {},
+}, reporter, {
+	hasUI: true,
+	mode: "print",
+	ui: { notify(message, level) { notified.push({ message, level }); } },
+}, {
+	list: () => Promise.reject(new Error("scan failed")),
+}, "live-session", 0);
+await assert.doesNotReject(() => liveObserver.start());
+assert.deepEqual(notified, [{ message: "pi-pwsh: task observer error: scan failed", level: "error" }]);
+await liveObserver.close();
+
+// A stale context cannot take the process down. Every property of a captured
+// context asserts liveness, so `hasUI` throws once pi replaces or reloads the
+// session, and the scan error handler runs from a timer callback whose rejection
+// would surface as an uncaught exception. The observer stops instead.
+const staleCtx = {
+	get hasUI() { throw new Error("This extension ctx is stale after session replacement or reload."); },
+	mode: "print",
+	ui: { notify() { assert.fail("a stale context must not reach ui.notify"); } },
+};
+const staleObserver = new TaskNotificationManager({
+	offer() {},
+	withdrawTask() {},
+}, reporter, staleCtx, {
+	list: () => Promise.reject(new Error("scan failed during session replacement")),
+}, "stale-session", 0);
+await assert.doesNotReject(() => staleObserver.start());
+await new Promise(resolve => setImmediate(resolve));
+assert.deepEqual(catalogs.at(-1), { sessionId: "stale-session", catalog: [] });
+await assert.doesNotReject(() => staleObserver.scanNow());
+await staleObserver.close();
+
 await manager.close();
 assert.deepEqual(catalogs.at(-1), { sessionId: "one", catalog: [] });
 
