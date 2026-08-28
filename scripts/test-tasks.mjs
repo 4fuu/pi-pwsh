@@ -363,12 +363,20 @@ await assert.doesNotReject(() => liveObserver.start());
 assert.deepEqual(notified, [{ message: "pi-pwsh: task observer error: scan failed", level: "error" }]);
 await liveObserver.close();
 
-// A stale context cannot take the process down. Every property of a captured
-// context asserts liveness, so `hasUI` throws once pi replaces or reloads the
-// session, and the scan error handler runs from a timer callback whose rejection
-// would surface as an uncaught exception. The observer stops instead.
+// A stale context cannot take the process down. Start with a successful scan,
+// then invalidate the context before the next timer tick fails. Every property
+// of a captured context asserts liveness, so `hasUI` throws once pi replaces or
+// reloads the session. The observer stops after that failed tick instead of
+// surfacing an unhandled rejection or continuing to poll.
+let contextInvalidated = false;
+let staleScans = 0;
+let resolveFailedTick;
+const failedTick = new Promise(resolve => { resolveFailedTick = resolve; });
 const staleCtx = {
-	get hasUI() { throw new Error("This extension ctx is stale after session replacement or reload."); },
+	get hasUI() {
+		if (contextInvalidated) throw new Error("This extension ctx is stale after session replacement or reload.");
+		return true;
+	},
 	mode: "print",
 	ui: { notify() { assert.fail("a stale context must not reach ui.notify"); } },
 };
@@ -376,12 +384,24 @@ const staleObserver = new TaskNotificationManager({
 	offer() {},
 	withdrawTask() {},
 }, reporter, staleCtx, {
-	list: () => Promise.reject(new Error("scan failed during session replacement")),
-}, "stale-session", 0);
+	list: () => {
+		staleScans++;
+		if (staleScans === 1) return Promise.resolve([]);
+		resolveFailedTick();
+		return Promise.reject(new Error("scan failed during session replacement"));
+	},
+}, "stale-session", 10);
 await assert.doesNotReject(() => staleObserver.start());
-await new Promise(resolve => setImmediate(resolve));
+assert.equal(staleScans, 1);
+contextInvalidated = true;
+const failedTickTimeout = setTimeout(() => resolveFailedTick(), 1_000);
+await failedTick;
+clearTimeout(failedTickTimeout);
+await new Promise(resolve => setTimeout(resolve, 30));
+assert.equal(staleScans, 2);
 assert.deepEqual(catalogs.at(-1), { sessionId: "stale-session", catalog: [] });
 await assert.doesNotReject(() => staleObserver.scanNow());
+assert.equal(staleScans, 2);
 await staleObserver.close();
 
 await manager.close();

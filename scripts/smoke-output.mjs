@@ -4,7 +4,7 @@
 //   the task launcher must use the stdin SOURCE_BOOTSTRAP instead.
 // - Chinese output from PowerShell and console-codepage-aware native commands
 //   round-trips as UTF-8.
-// Run: node --experimental-transform-types scripts/smoke-output.mjs
+// Run: npx tsx scripts/smoke-output.mjs
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";

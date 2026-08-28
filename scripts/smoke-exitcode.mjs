@@ -2,7 +2,7 @@
 // `pwsh -Command` flattens native exit codes to 0/1 unless the script ends
 // with an explicit `exit`; the wrapper must restore the real codes after
 // draining PowerShell's object formatter.
-// Run: node scripts/smoke-exitcode.mjs   (Node >= 22.6, type stripping)
+// Run: npx tsx scripts/smoke-exitcode.mjs
 import { spawnSync } from "node:child_process";
 import { UTF8_PREFIX, wrapPowerShellCommand } from "../src/spawn.ts";
 

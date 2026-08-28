@@ -33,14 +33,14 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "npm run typecheck && npm run test:tasks && npm run test:config && npm run test:runtime && npm run test:transport && npm run test:exitcode && npm run test:output && npm run test:timeout && npm run test:pty",
-    "test:tasks": "node --experimental-transform-types scripts/test-tasks.mjs",
-    "test:config": "node --experimental-transform-types scripts/smoke-config.mjs",
-    "test:exitcode": "node --experimental-transform-types scripts/smoke-exitcode.mjs",
-    "test:output": "node --experimental-transform-types scripts/smoke-output.mjs",
-    "test:pty": "node --experimental-transform-types scripts/smoke-pty.mjs",
-    "test:runtime": "node --experimental-transform-types scripts/smoke-runtime.mjs",
-    "test:timeout": "node --experimental-transform-types scripts/smoke-timeout.mjs",
-    "test:transport": "node --experimental-transform-types scripts/smoke-transport.mjs"
+    "test:tasks": "tsx scripts/test-tasks.mjs",
+    "test:config": "tsx scripts/smoke-config.mjs",
+    "test:exitcode": "tsx scripts/smoke-exitcode.mjs",
+    "test:output": "tsx scripts/smoke-output.mjs",
+    "test:pty": "tsx scripts/smoke-pty.mjs",
+    "test:runtime": "tsx scripts/smoke-runtime.mjs",
+    "test:timeout": "tsx scripts/smoke-timeout.mjs",
+    "test:transport": "tsx scripts/smoke-transport.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
@@ -51,12 +51,13 @@
     "@earendil-works/pi-coding-agent": "^0.84.0",
     "@earendil-works/pi-tui": "^0.84.0",
     "@types/node": "^24.0.0",
+    "tsx": "^4.20.0",
     "typebox": "^1.1.38",
     "typescript": "^5.5.0"
   },
   "dependencies": {
     "@4fu/pi-task-coordinator": "0.2.0",
-    "@4fu/pi-tasks": "0.1.1",
+    "@4fu/pi-tasks": "0.1.2",
     "@xterm/headless": "^6.0.0",
     "node-pty": "1.1.0"
   }

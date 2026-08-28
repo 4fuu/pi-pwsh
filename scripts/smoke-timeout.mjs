@@ -1,5 +1,5 @@
 // Smoke tests for timeout/abort settlement and inherited stdio handling in src/spawn.ts.
-// Run: node scripts/smoke-timeout.mjs   (Node >= 22.6, type stripping)
+// Run: npx tsx scripts/smoke-timeout.mjs
 import { spawnSync } from "node:child_process";
 import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";

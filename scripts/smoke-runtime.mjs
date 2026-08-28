@@ -1,5 +1,5 @@
 // Smoke test for the runtime baseline in src/spawn.ts.
-// Run: node scripts/smoke-runtime.mjs   (Node >= 22.6, type stripping)
+// Run: npx tsx scripts/smoke-runtime.mjs
 import { spawnSync } from "node:child_process";
 import { createRuntimeEnv, UTF8_PREFIX, wrapPowerShellCommand } from "../src/spawn.ts";
 
