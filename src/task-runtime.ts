@@ -7,7 +7,6 @@ import {
 	open,
 	readFile,
 	readdir,
-	rename,
 	rm,
 	stat,
 	writeFile,
@@ -17,6 +16,9 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRuntimeEnv, SOURCE_BOOTSTRAP, UTF8_PREFIX, wrapPowerShellCommand } from "./spawn.ts";
 import { userPowerShellArguments, type ResolvedPwshRuntime } from "./runtime.ts";
+import { mutateMetadataSnapshots, readLatestMetadataSnapshot, renameWithRetry } from "./task-metadata-store.mjs";
+
+export { renameWithRetry };
 
 export type TaskStatus = "starting" | "running" | "completed" | "failed" | "cancelled";
 
@@ -57,37 +59,6 @@ const MAX_NOTIFY_BYTES = 256;
 const RETENTION_MS = 24 * 60 * 60 * 1000;
 const START_GRACE_MS = 10_000;
 const LAUNCHER = join(dirname(fileURLToPath(import.meta.url)), "task-launcher.mjs");
-
-/**
- * Rename over an existing file, tolerating the lock errors Windows raises
- * while a concurrent reader holds the destination open.
- *
- * On Windows this is not always transient: MoveFileExW(REPLACE_EXISTING)
- * fails with EPERM whenever ANY handle holds the destination open, and every
- * pi instance rescans all task directories every 400ms, so multi-instance
- * machines routinely keep meta.json contended far longer than a short linear
- * retry can ride out. Use exponential backoff with enough total budget for
- * the observed windows, and stop scheduling sleep after the final failed
- * attempt — that pause only delays the caller's fallback for no benefit.
- */
-export async function renameWithRetry(from: string, to: string): Promise<void> {
-	let lastError: unknown;
-	const attempts = 8;
-	for (let attempt = 0; attempt < attempts; attempt++) {
-		try {
-			await rename(from, to);
-			return;
-		} catch (error) {
-			const code = (error as NodeJS.ErrnoException).code;
-			if (code !== "EPERM" && code !== "EACCES" && code !== "EBUSY") throw error;
-			lastError = error;
-			if (attempt + 1 < attempts) {
-				await new Promise((resolve) => setTimeout(resolve, Math.min(25 * 2 ** attempt, 1_600)));
-			}
-		}
-	}
-	throw lastError;
-}
 
 async function writeJsonAtomic(path: string, value: unknown): Promise<void> {
 	const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
@@ -280,7 +251,7 @@ export class PwshTaskRuntime {
 			status: "starting",
 		};
 		const logPath = join(directory, "output.log");
-		const metaPath = join(directory, "meta.json");
+		const metadataDir = join(directory, "metadata");
 		const configPath = join(directory, "config.json");
 		const cancelMarkerPath = join(directory, `${instanceId}.cancelled`);
 		let launcherPid = 0;
@@ -288,7 +259,10 @@ export class PwshTaskRuntime {
 		try {
 			await Promise.all([
 				writeFile(logPath, "", { encoding: "utf8", mode: 0o600 }),
-				writeJsonAtomic(metaPath, metadata),
+				this.updateMetadata(id, (current) => {
+					if (current) throw new Error("pwsh: task metadata already exists");
+					return metadata;
+				}, true),
 			]);
 			const strict = this.pwsh.stopOnError ? "$ErrorActionPreference = 'Stop'; " : "";
 			const source = `${UTF8_PREFIX}${executionPrefix}${strict}$global:LASTEXITCODE = $null; ${wrapPowerShellCommand(command)}`;
@@ -307,7 +281,7 @@ export class PwshTaskRuntime {
 				stdin: Buffer.from(source, "utf8").toString("base64"),
 				cwd,
 				logPath,
-				metaPath,
+				metadataDir,
 				notifyOn,
 				readyMarkerPath: join(directory, `${instanceId}.ready.detected`),
 				cancelMarkerPath,
@@ -384,7 +358,7 @@ export class PwshTaskRuntime {
 			};
 			await Promise.allSettled([
 				writeFile(logPath, `[pi-pwsh startup failure] ${message}\n`, { encoding: "utf8", mode: 0o600, flag: "a" }),
-				writeJsonAtomic(metaPath, failed),
+				this.updateMetadata(id, () => failed, true),
 				writeFile(join(directory, `${instanceId}.exit.presented`), "", { flag: "a", mode: 0o600 }),
 			]);
 			if (directory && existsSync(directory)) {
@@ -424,19 +398,19 @@ export class PwshTaskRuntime {
 			const instanceId = metadata.instanceId;
 			await writeFile(join(this.taskDirectoryPath(id), `${instanceId}.cancelled`), "", { flag: "a", mode: 0o600 });
 			await killProcessTree(metadata.supervisorPid || metadata.pid);
-			const current = await this.readMetadata(id);
-			if (current.sessionId !== this.sessionId || current.instanceId !== instanceId) {
-				throw new Error(`pwsh: task ${JSON.stringify(id)} changed while stopping`);
-			}
-			metadata = {
-				...current,
-				status: "cancelled",
-				exitCode: null,
-				error: undefined,
-				failureKind: undefined,
-				updatedAt: new Date().toISOString(),
-			};
-			await writeJsonAtomic(this.metaPath(id), metadata);
+			metadata = await this.updateMetadata(id, (current) => {
+				if (!current || current.sessionId !== this.sessionId || current.instanceId !== instanceId) {
+					throw new Error(`pwsh: task ${JSON.stringify(id)} changed while stopping`);
+				}
+				return {
+					...current,
+					status: "cancelled",
+					exitCode: null,
+					error: undefined,
+					failureKind: undefined,
+					updatedAt: new Date().toISOString(),
+				};
+			});
 		}
 		return this.snapshot(id);
 	}
@@ -452,7 +426,13 @@ export class PwshTaskRuntime {
 		const directory = this.taskDirectoryPath(id);
 		if (!existsSync(directory)) throw new Error(`pwsh: task ${JSON.stringify(id)} was not found`);
 		try {
-			return parseMetadata(JSON.parse(await readFile(this.metaPath(id), "utf8")), id);
+			if (existsSync(this.metadataDirectoryPath(id))) {
+				return (await readLatestMetadataSnapshot<TaskMetadata>(
+					this.metadataDirectoryPath(id),
+					(value) => parseMetadata(value, id),
+				)).metadata;
+			}
+			return await this.readLegacyMetadata(id);
 		} catch (error) {
 			throw new Error(`pwsh: could not read task ${JSON.stringify(id)}: ${error instanceof Error ? error.message : String(error)}\ndiagnosticsPath: ${directory}`);
 		}
@@ -470,6 +450,44 @@ export class PwshTaskRuntime {
 
 	private metaPath(id: string): string {
 		return join(this.taskDirectoryPath(id), "meta.json");
+	}
+
+	private metadataDirectoryPath(id: string): string {
+		return join(this.taskDirectoryPath(id), "metadata");
+	}
+
+	private async readLegacyMetadata(id: string): Promise<TaskMetadata> {
+		let lastError: unknown;
+		for (let attempt = 0; attempt < 3; attempt++) {
+			const raw = await readFile(this.metaPath(id), "utf8");
+			try {
+				return parseMetadata(JSON.parse(raw), id);
+			} catch (error) {
+				lastError = error;
+				if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 50));
+			}
+		}
+		throw lastError;
+	}
+
+	private async updateMetadata(
+		id: string,
+		update: (current: TaskMetadata | undefined) => TaskMetadata | undefined,
+		allowCreate = false,
+	): Promise<TaskMetadata> {
+		const snapshots = this.metadataDirectoryPath(id);
+		if (allowCreate || existsSync(snapshots)) {
+			return (await mutateMetadataSnapshots<TaskMetadata>(snapshots, update, {
+				allowCreate,
+				validate: (value) => parseMetadata(value, id),
+			})).metadata;
+		}
+		const current = await this.readMetadata(id);
+		const next = update(current);
+		if (!next) return current;
+		const validated = parseMetadata(next, id);
+		await writeJsonAtomic(this.metaPath(id), validated);
+		return validated;
 	}
 
 	private async refreshOwned(id: string): Promise<TaskMetadata> {
@@ -495,19 +513,20 @@ export class PwshTaskRuntime {
 		if (!staleStart && !dead) return metadata;
 		if (dead) await new Promise((resolve) => setTimeout(resolve, 50));
 
-		const current = await this.readMetadata(id);
-		const stillDead = current.supervisorPid > 0 && !isAlive(current.supervisorPid);
-		if (current.instanceId !== metadata.instanceId || TERMINAL.has(current.status) || (!staleStart && !stillDead)) return current;
-		metadata = {
-			...current,
-			status: "failed",
-			exitCode: null,
-			error: staleStart ? "Task launcher did not become ready" : "Task supervisor exited without final status",
-			failureKind: "infrastructure",
-			updatedAt: new Date().toISOString(),
-		};
-		await writeJsonAtomic(this.metaPath(id), metadata);
-		return metadata;
+		return this.updateMetadata(id, (current) => {
+			if (!current) throw new Error(`pwsh: task ${JSON.stringify(id)} has no metadata`);
+			const stillDead = current.supervisorPid > 0 && !isAlive(current.supervisorPid);
+			if (current.instanceId !== metadata.instanceId || TERMINAL.has(current.status) || (!staleStart && !stillDead)) return undefined;
+			metadata = {
+				...current,
+				status: "failed",
+				exitCode: null,
+				error: staleStart ? "Task launcher did not become ready" : "Task supervisor exited without final status",
+				failureKind: "infrastructure",
+				updatedAt: new Date().toISOString(),
+			};
+			return metadata;
+		});
 	}
 
 	private async readAll(): Promise<TaskMetadata[]> {

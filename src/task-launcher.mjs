@@ -1,48 +1,27 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { closeSync, existsSync, openSync } from "node:fs";
-import { open, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { open, readFile, rm, writeFile } from "node:fs/promises";
+import { mutateMetadataSnapshots, readLatestMetadataSnapshot, renameWithRetry } from "./task-metadata-store.mjs";
 
 const configPath = process.argv[2];
 if (!configPath) throw new Error("Missing persistent task configuration path");
 const config = JSON.parse(await readFile(configPath, "utf8"));
 
-/**
- * Rename over an existing file, tolerating the lock errors Windows raises
- * while a concurrent reader holds the destination open.
- *
- * On Windows this is not always transient: MoveFileExW(REPLACE_EXISTING)
- * fails with EPERM whenever ANY handle holds the destination open, and every
- * pi instance rescans all task directories every 400ms, so multi-instance
- * machines routinely keep meta.json contended far longer than a short linear
- * retry can ride out. Use exponential backoff with enough total budget for
- * the observed windows, and stop scheduling sleep after the final failed
- * attempt — that pause only delays the caller's fallback for no benefit.
- */
-async function renameWithRetry(from, to) {
-	let lastError;
-	const attempts = 8;
-	for (let attempt = 0; attempt < attempts; attempt++) {
-		try {
-			await rename(from, to);
-			return;
-		} catch (error) {
-			if (!["EPERM", "EACCES", "EBUSY"].includes(error?.code)) throw error;
-			lastError = error;
-			if (attempt + 1 < attempts) {
-				await new Promise((resolve) => setTimeout(resolve, Math.min(25 * 2 ** attempt, 1600)));
-			}
-		}
-	}
-	throw lastError;
+function validateMetadata(value) {
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid task metadata");
+	if (value.id !== config.id || value.instanceId !== config.instanceId) throw new Error("stale task instance");
+	return value;
 }
 
-async function writeMetadata(change) {
-	const current = JSON.parse(await readFile(config.metaPath, "utf8"));
-	if (existsSync(config.cancelMarkerPath)) throw new Error("cancelled");
-	if (current.id !== config.id || current.instanceId !== config.instanceId) throw new Error("stale task instance");
-	if (!current || !["starting", "running"].includes(current.status)) throw new Error("task is already terminal");
-	const next = { ...current, ...change, updatedAt: new Date().toISOString() };
+async function readCurrentMetadata() {
+	if (config.metadataDir) {
+		return (await readLatestMetadataSnapshot(config.metadataDir, validateMetadata)).metadata;
+	}
+	return validateMetadata(JSON.parse(await readFile(config.metaPath, "utf8")));
+}
+
+async function writeLegacyMetadata(next) {
 	const temporary = `${config.metaPath}.${process.pid}.${randomUUID()}.tmp`;
 	try {
 		await writeFile(temporary, `${JSON.stringify(next, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
@@ -50,16 +29,36 @@ async function writeMetadata(change) {
 		try {
 			await renameWithRetry(temporary, config.metaPath);
 		} catch (error) {
-			// Last resort once the backoff ladder is exhausted: overwrite in
-			// place. Atomicity degrades to best-effort, but readers already
-			// tolerate transient parse failures, so a torn read costs one poll
-			// cycle while a failed write costs the whole task.
+			// Compatibility for launchers created before snapshot metadata: once
+			// rename-over retries are exhausted, preserve the old in-place fallback.
 			if (!["EPERM", "EACCES", "EBUSY"].includes(error?.code)) throw error;
 			await writeFile(config.metaPath, `${JSON.stringify(next, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
 		}
 	} finally {
 		await rm(temporary, { force: true });
 	}
+}
+
+async function writeMetadata(change) {
+	if (config.metadataDir) {
+		await mutateMetadataSnapshots(config.metadataDir, (current) => {
+			validateMetadata(current);
+			if (existsSync(config.cancelMarkerPath)) throw new Error("cancelled");
+			if (!["starting", "running"].includes(current.status)) throw new Error("task is already terminal");
+			return { ...current, ...change, updatedAt: new Date().toISOString() };
+		}, {
+			validate: validateMetadata,
+			beforePublish: () => {
+				if (existsSync(config.cancelMarkerPath)) throw new Error("cancelled");
+			},
+		});
+		return;
+	}
+	const current = await readCurrentMetadata();
+	if (existsSync(config.cancelMarkerPath)) throw new Error("cancelled");
+	if (!["starting", "running"].includes(current.status)) throw new Error("task is already terminal");
+	const next = { ...current, ...change, updatedAt: new Date().toISOString() };
+	await writeLegacyMetadata(next);
 }
 
 function notify(message) {
@@ -139,13 +138,9 @@ try {
 		child.once("spawn", resolve);
 		child.once("error", reject);
 	});
-	// Send the ready handshake before the first metadata write: under
-	// contention the rename backoff ladder can hold writeMetadata for
-	// seconds, and the parent's 5-second launcher-ready bridge must not
-	// depend on that timing - a healthy task that is already producing
-	// output would otherwise be reported as "did not start within 5
-	// seconds" and killed. The parent already tolerates reading
-	// status "starting" in the immediate post-ready snapshot.
+	// Keep the parent's 5-second launcher-ready bridge independent of metadata
+	// storage latency. The parent tolerates status "starting" immediately after
+	// this handshake, including for legacy meta.json tasks under contention.
 	notify({ type: "ready" });
 	if (process.connected) process.disconnect();
 	await writeMetadata({ supervisorPid: process.pid, pid: child.pid, status: "running" });
@@ -177,7 +172,7 @@ try {
 		}
 	}
 	try {
-		const metadata = JSON.parse(await readFile(config.metaPath, "utf8"));
+		const metadata = await readCurrentMetadata();
 		if (
 			metadata.id === config.id
 			&& metadata.instanceId === config.instanceId

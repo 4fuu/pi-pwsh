@@ -6,6 +6,7 @@ import { mkdtemp, mkdir, open, writeFile, readFile, readdir, rm, stat, utimes } 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PwshTaskRuntime, renameWithRetry } from "../src/task-runtime.ts";
+import { mutateMetadataSnapshots, readLatestMetadataSnapshot } from "../src/task-metadata-store.mjs";
 import { validate, DESCRIPTION, PROMPT_GUIDELINE, PwshParams, taskDetails, taskText } from "../src/index.ts";
 import { TaskNotificationManager } from "../src/task-notifications.ts";
 
@@ -22,6 +23,71 @@ const controller = new AbortController(); controller.abort(new Error("cancel wai
 await assert.rejects(() => runtime.snapshot(id, 1, controller.signal), /cancel wait/);
 assert.equal((await runtime.readMetadata(id)).status, "completed");
 assert.equal((await import("node:fs")).existsSync(join(task, `${meta.instanceId}.exit.presented`)), false);
+
+// The Windows in-place write fallback can briefly expose torn JSON. Metadata
+// reads recover from that parse failure without retrying filesystem failures.
+const tornId = "ps_fadedcab", tornTask = runtime.taskDirectoryPath(tornId);
+await mkdir(tornTask);
+await writeFile(join(tornTask, "meta.json"), '{"version":1');
+const repairTornMetadata = new Promise((resolve, reject) => setTimeout(() => {
+	void writeFile(join(tornTask, "meta.json"), JSON.stringify({ ...meta, id: tornId })).then(resolve, reject);
+}, 10));
+try {
+	assert.equal((await runtime.readMetadata(tornId)).status, "completed");
+} finally {
+	await repairTornMetadata;
+}
+const missingMetaId = "ps_dec0ded0";
+const missingMetaTask = runtime.taskDirectoryPath(missingMetaId);
+await mkdir(missingMetaTask);
+const createMissingMetadata = new Promise((resolve, reject) => setTimeout(() => {
+	void writeFile(join(missingMetaTask, "meta.json"), JSON.stringify({ ...meta, id: missingMetaId })).then(resolve, reject);
+}, 10));
+try {
+	await assert.rejects(() => runtime.readMetadata(missingMetaId), /ENOENT/);
+} finally {
+	await createMissingMetadata;
+}
+
+// Snapshot writers serialize without involving readers, retain a bounded
+// history, and readers fall back if the newest immutable snapshot is corrupt.
+const snapshotId = "ps_5a7e0001", snapshotTask = runtime.taskDirectoryPath(snapshotId);
+const snapshotMetadataDir = join(snapshotTask, "metadata");
+await mkdir(snapshotTask);
+await mutateMetadataSnapshots(snapshotMetadataDir, () => ({ ...meta, id: snapshotId, counter: 0 }), { allowCreate: true });
+const abandonedWriterLock = join(snapshotMetadataDir, ".writer-lock");
+await mkdir(abandonedWriterLock);
+await writeFile(join(abandonedWriterLock, "owner.json"), JSON.stringify({ pid: 99_999_999, token: "abandoned" }));
+await mutateMetadataSnapshots(snapshotMetadataDir, current => ({ ...current, counter: current.counter + 1 }));
+await Promise.all(Array.from({ length: 8 }, () => mutateMetadataSnapshots(snapshotMetadataDir, async (current) => {
+	await new Promise(resolve => setTimeout(resolve, Math.floor(Math.random() * 5)));
+	return { ...current, counter: current.counter + 1, updatedAt: new Date().toISOString() };
+})));
+const latestSnapshot = await readLatestMetadataSnapshot(snapshotMetadataDir);
+assert.equal(latestSnapshot.revision, 9);
+assert.equal(latestSnapshot.metadata.counter, 9);
+assert.equal((await readdir(snapshotMetadataDir)).filter(name => name.endsWith(".json")).length, 3);
+await assert.rejects(() => mutateMetadataSnapshots(snapshotMetadataDir, current => ({ ...current, counter: 10 }), {
+	beforePublish: () => { throw new Error("cancel snapshot publication"); },
+}), /cancel snapshot publication/);
+assert.equal((await readLatestMetadataSnapshot(snapshotMetadataDir)).revision, 9);
+assert.equal((await readdir(snapshotMetadataDir)).some(name => name === ".writer-lock" || name.endsWith(".tmp")), false);
+await writeFile(latestSnapshot.path, '{"storageVersion":2');
+const recoveredSnapshot = await readLatestMetadataSnapshot(snapshotMetadataDir);
+assert.equal(recoveredSnapshot.revision, 8);
+assert.equal((await runtime.readMetadata(snapshotId)).counter, 8);
+const resumedSnapshot = await mutateMetadataSnapshots(snapshotMetadataDir, current => ({ ...current, counter: current.counter + 1 }));
+assert.equal(resumedSnapshot.revision, 10);
+assert.equal(resumedSnapshot.metadata.counter, 9);
+
+const expiredSnapshotId = "ps_e7e1ed00", expiredSnapshotTask = runtime.taskDirectoryPath(expiredSnapshotId);
+await mkdir(expiredSnapshotTask);
+const expiredAt = new Date(Date.now() - 25 * 60 * 60 * 1_000).toISOString();
+await mutateMetadataSnapshots(join(expiredSnapshotTask, "metadata"), () => ({
+	...meta, id: expiredSnapshotId, createdAt: expiredAt, updatedAt: expiredAt,
+}), { allowCreate: true });
+await runtime.cleanupExpired();
+assert.equal(existsSync(expiredSnapshotTask), false);
 
 assert.throws(() => validate({}), /exactly one/);
 assert.throws(() => validate({ command: "x", taskId: id }), /exactly one/);
@@ -65,10 +131,13 @@ try { await brokenRuntime.start("x", startupDir); } catch (error) { startupError
 assert.match(String(startupError), /diagnosticsPath:/);
 const startupPath = String(startupError).match(/diagnosticsPath: (.+)$/m)?.[1];
 assert.ok(startupPath && existsSync(startupPath));
-assert.deepEqual((await readdir(startupPath)).filter(name => ["config.json", "meta.json", "output.log"].includes(name)).sort(), ["config.json", "meta.json", "output.log"]);
-const startupMetadata = JSON.parse(await readFile(join(startupPath, "meta.json"), "utf8"));
+assert.deepEqual((await readdir(startupPath)).filter(name => ["config.json", "metadata", "output.log"].includes(name)).sort(), ["config.json", "metadata", "output.log"]);
+assert.equal(existsSync(join(startupPath, "meta.json")), false);
+const startupConfig = JSON.parse(await readFile(join(startupPath, "config.json"), "utf8"));
+const startupMetadata = await brokenRuntime.readMetadata(startupConfig.id);
 assert.equal(startupMetadata.status, "failed");
 assert.equal(startupMetadata.failureKind, "infrastructure");
+assert.equal((await readdir(join(startupPath, "metadata"))).filter(name => name.endsWith(".json")).length, 3);
 assert.match(await readFile(join(startupPath, "output.log"), "utf8"), /startup failure/);
 assert.equal(existsSync(join(startupPath, `${startupMetadata.instanceId}.exit.presented`)), true);
 await rm(startupDir, { recursive: true, force: true });
@@ -99,15 +168,25 @@ assert.equal((await runtime.snapshot(ownId, 0, undefined, { claimTerminal: false
 assert.equal((await runtime.stop(ownId)).metadata.status, "cancelled");
 assert.equal(await readFile(join(ownTask, `${ownInstance}.cancelled`), "utf8"), "");
 
+const snapshotStopId = "ps_570c0001", snapshotStopTask = runtime.taskDirectoryPath(snapshotStopId);
+const snapshotStopInstance = "5".repeat(32), snapshotStopMetadataDir = join(snapshotStopTask, "metadata");
+await mkdir(snapshotStopTask);
+await mutateMetadataSnapshots(snapshotStopMetadataDir, () => ({
+	...meta, id: snapshotStopId, instanceId: snapshotStopInstance, sessionId: "one", status: "running", exitCode: undefined,
+}), { allowCreate: true });
+await writeFile(join(snapshotStopTask, "output.log"), "");
+assert.equal((await runtime.stop(snapshotStopId)).metadata.status, "cancelled");
+assert.equal((await readdir(snapshotStopMetadataDir)).filter(name => name.endsWith(".json")).length, 2);
+
 // The detached launcher owns readiness scanning so long-lived task queries stay
 // O(new output), including a multi-byte literal split at a 64 KiB boundary.
 const launchId = "ps_feedface", launchTask = runtime.taskDirectoryPath(launchId), launchInstance = "c".repeat(32);
 await mkdir(launchTask);
 const launchMeta = { ...meta, id: launchId, instanceId: launchInstance, sessionId: "one", status: "starting", notifyOn: "😀ready", exitCode: undefined };
-const launchLog = join(launchTask, "output.log"), launchMetaPath = join(launchTask, "meta.json");
+const launchLog = join(launchTask, "output.log"), launchMetadataDir = join(launchTask, "metadata");
 const readyMarker = join(launchTask, `${launchInstance}.ready.detected`);
 const cancelMarker = join(launchTask, `${launchInstance}.cancelled`);
-await writeFile(launchMetaPath, JSON.stringify(launchMeta));
+await mutateMetadataSnapshots(launchMetadataDir, () => launchMeta, { allowCreate: true });
 await writeFile(launchLog, "");
 const launcherPath = fileURLToPath(new URL("../src/task-launcher.mjs", import.meta.url));
 const source = "const b=Buffer.concat([Buffer.alloc(65534,120),Buffer.from('😀ready'),Buffer.alloc(60000,122)]);process.stdout.write(b);setTimeout(()=>{},250)";
@@ -119,21 +198,37 @@ await writeFile(launchConfig, JSON.stringify({
 	args: ["-e", source],
 	cwd: dir,
 	logPath: launchLog,
-	metaPath: launchMetaPath,
+	metadataDir: launchMetadataDir,
 	notifyOn: "😀ready",
 	readyMarkerPath: readyMarker,
 	cancelMarkerPath: cancelMarker,
 }));
+const initialLaunchSnapshot = await readLatestMetadataSnapshot(launchMetadataDir);
+const initialLaunchHandle = await open(initialLaunchSnapshot.path, "r");
 const launcher = spawn(process.execPath, [launcherPath, launchConfig], { stdio: ["ignore", "ignore", "ignore", "ipc"] });
-await new Promise((resolve, reject) => {
-	launcher.once("error", reject);
-	launcher.on("message", message => message?.type === "ready" && resolve());
-});
-const ready = await runtime.snapshot(launchId, 2, undefined, { claimTerminal: false });
+let ready;
+try {
+	await new Promise((resolve, reject) => {
+		launcher.once("error", reject);
+		launcher.on("message", message => message?.type === "ready" && resolve());
+	});
+	const publicationDeadline = Date.now() + 1_500;
+	let metadataWhileOpen = await runtime.readMetadata(launchId);
+	while (metadataWhileOpen.status === "starting" && Date.now() < publicationDeadline) {
+		await new Promise(resolve => setTimeout(resolve, 25));
+		metadataWhileOpen = await runtime.readMetadata(launchId);
+	}
+	assert.notEqual(metadataWhileOpen.status, "starting", "an open old snapshot must not block publication");
+	ready = await runtime.snapshot(launchId, 2, undefined, { claimTerminal: false });
+	if (launcher.exitCode === null) await new Promise(resolve => launcher.once("exit", resolve));
+} finally {
+	await initialLaunchHandle.close();
+}
 assert.equal(ready.ready, true);
 assert.ok(ready.omittedBytes > 50000);
-if (launcher.exitCode === null) await new Promise(resolve => launcher.once("exit", resolve));
 assert.equal((await runtime.readMetadata(launchId)).status, "completed");
+assert.equal(existsSync(join(launchTask, "meta.json")), false);
+assert.equal((await readdir(launchMetadataDir)).filter(name => name.endsWith(".json")).length, 3);
 
 // Windows refuses rename-over while any reader holds the destination open.
 // The retry budget must outlive a contention window longer than the old
@@ -224,9 +319,9 @@ if (process.platform === "win32") {
 const bunId = "ps_b16be000", bunTask = runtime.taskDirectoryPath(bunId), bunInstance = "6".repeat(32);
 await mkdir(bunTask);
 const bunMeta = { ...meta, id: bunId, instanceId: bunInstance, sessionId: "one", status: "starting", exitCode: undefined };
-const bunLog = join(bunTask, "output.log"), bunMetaPath = join(bunTask, "meta.json");
+const bunLog = join(bunTask, "output.log"), bunMetadataDir = join(bunTask, "metadata");
 const bunConfig = join(bunTask, "config.json");
-await writeFile(bunMetaPath, JSON.stringify(bunMeta));
+await mutateMetadataSnapshots(bunMetadataDir, () => bunMeta, { allowCreate: true });
 await writeFile(bunLog, "");
 await writeFile(bunConfig, JSON.stringify({
 	id: bunId,
@@ -235,7 +330,7 @@ await writeFile(bunConfig, JSON.stringify({
 	args: ["-e", "process.stdout.write(process.env.BUN_BE_BUN ?? '<unset>')"],
 	cwd: dir,
 	logPath: bunLog,
-	metaPath: bunMetaPath,
+	metadataDir: bunMetadataDir,
 	cancelMarkerPath: join(bunTask, `${bunInstance}.cancelled`),
 }));
 const bunBootstrap = `Object.defineProperty(process.versions, "bun", { value: "test" }); await import(${JSON.stringify(pathToFileURL(launcherPath).href)})`;

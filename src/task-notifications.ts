@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { open, readFile, rm, stat, utimes } from "node:fs/promises";
+import { open, rm, stat, utimes } from "node:fs/promises";
 import { join } from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { TaskCoordinator, TaskNotificationKind, TaskWithdrawalReason } from "@4fu/pi-task-coordinator";
@@ -197,7 +197,7 @@ export class TaskNotificationManager {
 
 	private async isCurrent(metadata: TaskMetadata): Promise<boolean> {
 		try {
-			const current = JSON.parse(await readFile(join(this.runtime.taskDirectoryPath(metadata.id), "meta.json"), "utf8")) as Record<string, unknown>;
+			const current = await this.runtime.readMetadata(metadata.id);
 			return current.instanceId === metadata.instanceId && current.sessionId === this.sessionId;
 		} catch { return false; }
 	}
