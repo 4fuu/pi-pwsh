@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { existsSync } from "node:fs";
+import fs, { existsSync } from "node:fs";
 import { mkdtemp, mkdir, open, writeFile, readFile, readdir, rm, stat, utimes } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PwshTaskRuntime, renameWithRetry } from "../src/task-runtime.ts";
@@ -55,30 +56,127 @@ const snapshotId = "ps_5a7e0001", snapshotTask = runtime.taskDirectoryPath(snaps
 const snapshotMetadataDir = join(snapshotTask, "metadata");
 await mkdir(snapshotTask);
 await mutateMetadataSnapshots(snapshotMetadataDir, () => ({ ...meta, id: snapshotId, counter: 0 }), { allowCreate: true });
+
+// Independent processes cross a barrier and simultaneously recover the same
+// abandoned claims. A reclaimer may delete only that immutable owner claim,
+// never a replacement writer's ticket.
+const abandonedPid = 99_999_999;
 const abandonedWriterLock = join(snapshotMetadataDir, ".writer-lock");
 await mkdir(abandonedWriterLock);
-await writeFile(join(abandonedWriterLock, "owner.json"), JSON.stringify({ pid: 99_999_999, token: "abandoned" }));
-await mutateMetadataSnapshots(snapshotMetadataDir, current => ({ ...current, counter: current.counter + 1 }));
-await Promise.all(Array.from({ length: 8 }, () => mutateMetadataSnapshots(snapshotMetadataDir, async (current) => {
-	await new Promise(resolve => setTimeout(resolve, Math.floor(Math.random() * 5)));
-	return { ...current, counter: current.counter + 1, updatedAt: new Date().toISOString() };
-})));
+await writeFile(join(abandonedWriterLock, "owner.json"), JSON.stringify({ pid: abandonedPid, token: "abandoned" }));
+await writeFile(join(snapshotMetadataDir, `.writer-choosing.${abandonedPid}.${"a".repeat(32)}`), "");
+await writeFile(join(snapshotMetadataDir, `.writer-ticket.000000000000.${abandonedPid}.${"b".repeat(32)}`), "");
+const metadataStoreUrl = new URL("../src/task-metadata-store.mjs", import.meta.url).href;
+const writerSource = `
+	import { mutateMetadataSnapshots } from ${JSON.stringify(metadataStoreUrl)};
+	const directory = process.argv.at(-1);
+	process.send({ type: "ready" });
+	await new Promise(resolve => process.once("message", message => message?.type === "go" && resolve()));
+	await mutateMetadataSnapshots(directory, async current => {
+		await new Promise(resolve => setTimeout(resolve, Math.floor(Math.random() * 10)));
+		return { ...current, counter: current.counter + 1, updatedAt: new Date().toISOString() };
+	});
+`;
+function spawnBarrierWriter() {
+	const child = spawn(process.execPath, ["--input-type=module", "-e", writerSource, snapshotMetadataDir], {
+		stdio: ["ignore", "ignore", "pipe", "ipc"],
+	});
+	let stderr = "", ready = false;
+	child.stderr.setEncoding("utf8");
+	child.stderr.on("data", chunk => { stderr += chunk; });
+	let resolveReady, rejectReady;
+	const becameReady = new Promise((resolve, reject) => { resolveReady = resolve; rejectReady = reject; });
+	const completed = new Promise((resolve, reject) => {
+		const timeout = setTimeout(() => {
+			child.kill();
+			reject(new Error("metadata barrier writer timed out"));
+		}, 10_000);
+		child.on("message", message => {
+			if (message?.type !== "ready" || ready) return;
+			ready = true;
+			resolveReady();
+		});
+		child.once("error", error => {
+			clearTimeout(timeout);
+			rejectReady(error);
+			reject(error);
+		});
+		child.once("exit", code => {
+			clearTimeout(timeout);
+			if (!ready) rejectReady(new Error(`metadata barrier writer exited before ready (${code}): ${stderr}`));
+			if (code === 0) resolve();
+			else reject(new Error(`metadata barrier writer exited with ${code}: ${stderr}`));
+		});
+	});
+	completed.catch(() => {});
+	return { child, becameReady, completed };
+}
+const barrierWriters = Array.from({ length: 8 }, spawnBarrierWriter);
+await Promise.all(barrierWriters.map(worker => worker.becameReady));
+for (const worker of barrierWriters) worker.child.send({ type: "go" });
+await Promise.all(barrierWriters.map(worker => worker.completed));
 const latestSnapshot = await readLatestMetadataSnapshot(snapshotMetadataDir);
-assert.equal(latestSnapshot.revision, 9);
-assert.equal(latestSnapshot.metadata.counter, 9);
+assert.equal(latestSnapshot.revision, 8);
+assert.equal(latestSnapshot.metadata.counter, 8);
 assert.equal((await readdir(snapshotMetadataDir)).filter(name => name.endsWith(".json")).length, 3);
 await assert.rejects(() => mutateMetadataSnapshots(snapshotMetadataDir, current => ({ ...current, counter: 10 }), {
 	beforePublish: () => { throw new Error("cancel snapshot publication"); },
 }), /cancel snapshot publication/);
-assert.equal((await readLatestMetadataSnapshot(snapshotMetadataDir)).revision, 9);
-assert.equal((await readdir(snapshotMetadataDir)).some(name => name === ".writer-lock" || name.endsWith(".tmp")), false);
+assert.equal((await readLatestMetadataSnapshot(snapshotMetadataDir)).revision, 8);
+assert.equal((await readdir(snapshotMetadataDir)).some(name => name.startsWith(".writer-choosing.")
+	|| name.startsWith(".writer-ticket.") || name.endsWith(".tmp")), false);
 await writeFile(latestSnapshot.path, '{"storageVersion":2');
 const recoveredSnapshot = await readLatestMetadataSnapshot(snapshotMetadataDir);
-assert.equal(recoveredSnapshot.revision, 8);
-assert.equal((await runtime.readMetadata(snapshotId)).counter, 8);
+assert.equal(recoveredSnapshot.revision, 7);
+assert.equal((await runtime.readMetadata(snapshotId)).counter, 7);
 const resumedSnapshot = await mutateMetadataSnapshots(snapshotMetadataDir, current => ({ ...current, counter: current.counter + 1 }));
-assert.equal(resumedSnapshot.revision, 10);
-assert.equal(resumedSnapshot.metadata.counter, 9);
+assert.equal(resumedSnapshot.revision, 9);
+assert.equal(resumedSnapshot.metadata.counter, 8);
+
+// Force a reader to enumerate revision 0, then delay its open until three
+// serial publications have pruned that path. The bounded relist must find the
+// newer snapshots instead of reporting that every snapshot disappeared.
+const relistMetadataDir = join(runtime.taskDirectoryPath("ps_2e115700"), "metadata");
+await mutateMetadataSnapshots(relistMetadataDir, () => ({ counter: 0 }), { allowCreate: true });
+const originalReadFile = fs.promises.readFile;
+let releaseEnumeratedRead, resolveEnumeratedRead;
+const enumeratedRead = new Promise(resolve => { resolveEnumeratedRead = resolve; });
+const enumeratedReadRelease = new Promise(resolve => { releaseEnumeratedRead = resolve; });
+let intercepted = false;
+let racedRead;
+try {
+	fs.promises.readFile = async (path, ...args) => {
+		if (!intercepted && typeof path === "string" && path.startsWith(relistMetadataDir) && path.endsWith(".json")) {
+			intercepted = true;
+			resolveEnumeratedRead();
+			await enumeratedReadRelease;
+		}
+		return originalReadFile(path, ...args);
+	};
+	syncBuiltinESMExports();
+	racedRead = readLatestMetadataSnapshot(relistMetadataDir);
+	await enumeratedRead;
+	fs.promises.readFile = originalReadFile;
+	syncBuiltinESMExports();
+	for (let counter = 1; counter <= 3; counter++) {
+		await mutateMetadataSnapshots(relistMetadataDir, () => ({ counter }));
+	}
+	releaseEnumeratedRead();
+	const relisted = await racedRead;
+	assert.equal(relisted.revision, 3);
+	assert.equal(relisted.metadata.counter, 3);
+} finally {
+	fs.promises.readFile = originalReadFile;
+	syncBuiltinESMExports();
+	releaseEnumeratedRead();
+	await racedRead?.catch(() => {});
+}
+let permanentValidationAttempts = 0;
+await assert.rejects(() => readLatestMetadataSnapshot(relistMetadataDir, () => {
+	permanentValidationAttempts++;
+	throw new Error("permanent metadata validation failure");
+}), /permanent metadata validation failure/);
+assert.equal(permanentValidationAttempts, 3, "validation failures must not trigger a relist");
 
 const expiredSnapshotId = "ps_e7e1ed00", expiredSnapshotTask = runtime.taskDirectoryPath(expiredSnapshotId);
 await mkdir(expiredSnapshotTask);

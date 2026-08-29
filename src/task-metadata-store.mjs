@@ -1,13 +1,14 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 const SNAPSHOT_PATTERN = /^(\d{12})\.([0-9a-f]{32})\.json$/;
-const WRITER_LOCK = ".writer-lock";
-const LOCK_OWNER = "owner.json";
+const WRITER_CHOOSING_PATTERN = /^\.writer-choosing\.(\d+)\.([0-9a-f]{32})$/;
+const WRITER_TICKET_PATTERN = /^\.writer-ticket\.(\d{12})\.(\d+)\.([0-9a-f]{32})$/;
 const LOCK_WAIT_MS = 5_000;
-const OWNERLESS_LOCK_STALE_MS = 30_000;
 const RETAINED_SNAPSHOTS = 3;
+const SNAPSHOT_RELIST_ATTEMPTS = 3;
+const SNAPSHOT_RELIST_DELAY_MS = 5;
 
 function errorWithCode(message, code) {
 	const error = new Error(message);
@@ -47,31 +48,39 @@ async function listSnapshots(directory) {
 }
 
 export async function readLatestMetadataSnapshot(directory, validate = (value) => value) {
-	const snapshots = await listSnapshots(directory);
-	if (snapshots.length === 0) throw errorWithCode("metadata snapshot store is empty", "ENOENT");
-	let lastError;
-	for (const snapshot of snapshots) {
-		let raw;
-		try {
-			raw = await readFile(join(directory, snapshot.name), "utf8");
-		} catch (error) {
-			if (error?.code === "ENOENT") continue;
-			throw error;
+	for (let attempt = 0; attempt < SNAPSHOT_RELIST_ATTEMPTS; attempt++) {
+		const snapshots = await listSnapshots(directory);
+		if (snapshots.length === 0) throw errorWithCode("metadata snapshot store is empty", "ENOENT");
+		let lastError;
+		for (const snapshot of snapshots) {
+			let raw;
+			try {
+				raw = await readFile(join(directory, snapshot.name), "utf8");
+			} catch (error) {
+				if (error?.code === "ENOENT") continue;
+				throw error;
+			}
+			try {
+				const envelope = JSON.parse(raw);
+				if (!envelope || typeof envelope !== "object" || Array.isArray(envelope)) throw new Error("invalid metadata snapshot");
+				if (envelope.storageVersion !== 2 || envelope.revision !== snapshot.revision) throw new Error("invalid metadata snapshot revision");
+				return {
+					revision: snapshot.revision,
+					metadata: validate(envelope.metadata),
+					path: join(directory, snapshot.name),
+				};
+			} catch (error) {
+				lastError = error;
+			}
 		}
-		try {
-			const envelope = JSON.parse(raw);
-			if (!envelope || typeof envelope !== "object" || Array.isArray(envelope)) throw new Error("invalid metadata snapshot");
-			if (envelope.storageVersion !== 2 || envelope.revision !== snapshot.revision) throw new Error("invalid metadata snapshot revision");
-			return {
-				revision: snapshot.revision,
-				metadata: validate(envelope.metadata),
-				path: join(directory, snapshot.name),
-			};
-		} catch (error) {
-			lastError = error;
+		// Relist only when every enumerated path vanished before it could be
+		// opened. Persistent JSON/schema corruption must not become a retry loop.
+		if (lastError) throw lastError;
+		if (attempt + 1 < SNAPSHOT_RELIST_ATTEMPTS) {
+			await new Promise((resolve) => setTimeout(resolve, SNAPSHOT_RELIST_DELAY_MS));
 		}
 	}
-	throw lastError ?? errorWithCode("metadata snapshots disappeared while reading", "ENOENT");
+	throw errorWithCode("metadata snapshots disappeared while reading", "ENOENT");
 }
 
 /** Rename with bounded retries for transient Windows sharing violations. */
@@ -93,59 +102,83 @@ export async function renameWithRetry(from, to) {
 	throw lastError;
 }
 
-async function lockIsStale(lockPath) {
-	let lockStat;
-	try {
-		lockStat = await stat(lockPath);
-	} catch (error) {
-		if (error?.code === "ENOENT") return false;
-		throw error;
+function writerClaim(entry) {
+	if (!entry.isFile()) return undefined;
+	let match = WRITER_CHOOSING_PATTERN.exec(entry.name);
+	if (match) return { name: entry.name, choosing: true, pid: Number(match[1]), token: match[2] };
+	match = WRITER_TICKET_PATTERN.exec(entry.name);
+	if (!match) return undefined;
+	return { name: entry.name, choosing: false, ticket: Number(match[1]), pid: Number(match[2]), token: match[3] };
+}
+
+async function listWriterClaims(directory) {
+	const claims = (await readdir(directory, { withFileTypes: true }))
+		.map(writerClaim)
+		.filter((claim) => claim !== undefined);
+	const active = [];
+	for (const claim of claims) {
+		if (isAlive(claim.pid)) {
+			active.push(claim);
+			continue;
+		}
+		// Claim names contain a random owner token and are never reused. Removing
+		// this exact dead process's claim cannot delete a replacement owner.
+		await rm(join(directory, claim.name), { force: true }).catch(() => {});
 	}
+	return active;
+}
+
+async function retireWriterClaim(path) {
 	try {
-		const owner = JSON.parse(await readFile(join(lockPath, LOCK_OWNER), "utf8"));
-		return !isAlive(owner?.pid);
-	} catch (error) {
-		if (error?.code !== "ENOENT" && !(error instanceof SyntaxError)) throw error;
-		return Date.now() - lockStat.mtimeMs > OWNERLESS_LOCK_STALE_MS;
+		await rm(path, { force: true });
+	} catch {
+		// A renamed claim no longer matches the active-claim grammar. This keeps
+		// publication committed if antivirus briefly prevents deletion on Windows.
+		try {
+			await rename(path, `${path}.released.${randomUUID()}`);
+		} catch { /* A later cleanup can remove an abandoned, uniquely owned claim. */ }
 	}
 }
 
+// Filesystem form of Lamport's bakery lock. A choosing claim closes the race
+// while a process selects a ticket; ticket/token order then admits one writer.
+// Every reclaim targets an immutable owner path rather than a shared lock name.
 async function acquireWriterLock(directory) {
 	await mkdir(directory, { recursive: true, mode: 0o700 });
-	const lockPath = join(directory, WRITER_LOCK);
-	const token = randomUUID();
-	const deadline = Date.now() + LOCK_WAIT_MS;
-	while (true) {
+	const token = randomUUID().replaceAll("-", "");
+	const choosingPath = join(directory, `.writer-choosing.${process.pid}.${token}`);
+	let ticketName, ticketPath;
+	try {
+		await writeFile(choosingPath, "", { mode: 0o600, flag: "wx" });
 		try {
-			await mkdir(lockPath, { mode: 0o700 });
-			try {
-				await writeFile(join(lockPath, LOCK_OWNER), JSON.stringify({ pid: process.pid, token }), { encoding: "utf8", mode: 0o600 });
-			} catch (error) {
-				await rm(lockPath, { recursive: true, force: true });
-				throw error;
+			const claims = await listWriterClaims(directory);
+			const ticket = Math.max(-1, ...claims.filter((claim) => !claim.choosing).map((claim) => claim.ticket)) + 1;
+			if (!Number.isSafeInteger(ticket) || ticket > 999_999_999_999) throw new Error("metadata writer ticket is exhausted");
+			ticketName = `.writer-ticket.${String(ticket).padStart(12, "0")}.${process.pid}.${token}`;
+			ticketPath = join(directory, ticketName);
+			await writeFile(ticketPath, "", { mode: 0o600, flag: "wx" });
+		} finally {
+			await retireWriterClaim(choosingPath);
+		}
+
+		const deadline = Date.now() + LOCK_WAIT_MS;
+		while (true) {
+			const claims = await listWriterClaims(directory);
+			if (!claims.some((claim) => claim.name === ticketName)) {
+				throw errorWithCode("metadata snapshot writer lost its ticket", "EBUSY");
 			}
-			return async () => {
-				try {
-					const owner = JSON.parse(await readFile(join(lockPath, LOCK_OWNER), "utf8"));
-					if (owner?.token !== token) return;
-					try {
-						await rm(lockPath, { recursive: true, force: true });
-					} catch {
-						// If deletion is blocked, make the surviving lock immediately
-						// reclaimable without exposing a pid:0 ABA window on the normal path.
-						await writeFile(join(lockPath, LOCK_OWNER), JSON.stringify({ pid: 0, token }), { encoding: "utf8", mode: 0o600 });
-					}
-				} catch { /* A later writer can reclaim an ownerless or pid:0 lock. */ }
-			};
-		} catch (error) {
-			if (error?.code !== "EEXIST") throw error;
-			if (await lockIsStale(lockPath)) {
-				await rm(lockPath, { recursive: true, force: true });
-				continue;
+			const choosing = claims.some((claim) => claim.choosing);
+			const tickets = claims.filter((claim) => !claim.choosing)
+				.sort((a, b) => a.ticket - b.ticket || a.token.localeCompare(b.token));
+			if (!choosing && tickets[0]?.name === ticketName) {
+				return () => retireWriterClaim(ticketPath);
 			}
 			if (Date.now() >= deadline) throw errorWithCode("metadata snapshot writer lock is busy", "EBUSY");
 			await new Promise((resolve) => setTimeout(resolve, 10 + Math.floor(Math.random() * 40)));
 		}
+	} catch (error) {
+		if (ticketPath) await retireWriterClaim(ticketPath);
+		throw error;
 	}
 }
 
@@ -155,6 +188,8 @@ async function pruneSnapshots(directory) {
 	const obsolete = [
 		...snapshots.slice(RETAINED_SNAPSHOTS).map((snapshot) => snapshot.name),
 		...entries.filter((entry) => entry.isFile() && entry.name.startsWith(".") && entry.name.endsWith(".tmp")).map((entry) => entry.name),
+		...entries.filter((entry) => entry.isFile() && entry.name.includes(".released.")
+			&& (entry.name.startsWith(".writer-choosing.") || entry.name.startsWith(".writer-ticket."))).map((entry) => entry.name),
 	];
 	await Promise.allSettled(obsolete.map((name) => rm(join(directory, name), { force: true })));
 }
