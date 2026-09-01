@@ -139,9 +139,26 @@ function scanReadiness(chunk) {
 	readinessCarry = data.subarray(Math.max(0, data.length - (readinessNeedle.length - 1)));
 }
 
+// Set once the completion promise exists, so a failure on the output path can
+// reach the handler that kills the child and records the task as failed.
+let failCompletion;
+let outputFailure;
+
+// A stream callback is outside the surrounding try/catch: an uncaught throw here
+// would kill the launcher without that cleanup, leaving the task looking alive.
+// Disk-full is exactly the condition this bound exists for, so the write path
+// has to fail into the normal termination handling rather than past it.
 function onOutput(chunk) {
-	appendToLog(chunk);
-	scanReadiness(chunk);
+	try {
+		appendToLog(chunk);
+		scanReadiness(chunk);
+	} catch (error) {
+		if (outputFailure) return;
+		outputFailure = error;
+		child?.stdout?.off("data", onOutput);
+		child?.stderr?.off("data", onOutput);
+		failCompletion?.(error);
+	}
 }
 
 let child;
@@ -168,15 +185,9 @@ try {
 		child.stdin.on("error", () => {});
 		child.stdin.end(config.stdin, "utf8");
 	}
-	// Both streams land in the one log, as they did when both inherited its
-	// descriptor. Draining them is also what keeps a noisy child from blocking on
-	// a full pipe once its output stops being retained.
-	child.stdout.on("data", onOutput);
-	child.stderr.on("data", onOutput);
-	child.stdout.on("error", () => {});
-	child.stderr.on("error", () => {});
 
 	const completion = new Promise((resolve, reject) => {
+		failCompletion = reject;
 		child.once("error", reject);
 		// "close", not "exit": the piped streams can still hold buffered output when
 		// the process itself exits, and the parent reads the log as soon as it sees a
@@ -185,6 +196,15 @@ try {
 	});
 	// Avoid an unhandled rejection if startup itself fails before completion is awaited.
 	void completion.catch(() => {});
+	// Attached after the completion promise exists, so a write failure on the very
+	// first chunk still has somewhere to be reported. Both streams land in the one
+	// log, as they did when both inherited its descriptor; draining them is also
+	// what keeps a noisy child from blocking on a full pipe once its output stops
+	// being retained.
+	child.stdout.on("data", onOutput);
+	child.stderr.on("data", onOutput);
+	child.stdout.on("error", () => {});
+	child.stderr.on("error", () => {});
 	await new Promise((resolve, reject) => {
 		child.once("spawn", resolve);
 		child.once("error", reject);
