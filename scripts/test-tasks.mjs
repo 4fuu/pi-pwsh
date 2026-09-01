@@ -622,5 +622,57 @@ await resumed.scanNow();
 assert.equal(resumedOffers.some(({ update }) => update.taskId === submittedId), true);
 await resumed.close();
 
+// The task directory is shared by every session on the host, so `list()` used to
+// read the metadata of every task on every poll just to discard the ones it did
+// not own. A task's sessionId never changes, so a foreign task is read once and
+// skipped thereafter; retention still has to see all of them.
+const sharedDir = await mkdtemp(join(tmpdir(), "pi-pwsh-shared-"));
+const shared = new PwshTaskRuntime(
+	{ executable: process.execPath, args: [], loadProfile: false, executionPolicy: null, stopOnError: false, pythonUtf8: false, pythonUnbuffered: false },
+	{ taskDir: sharedDir, sessionId: "mine" },
+);
+const sharedStamp = new Date().toISOString();
+const addTask = async (taskId, sessionId) => {
+	const taskPath = shared.taskDirectoryPath(taskId);
+	await mkdir(taskPath);
+	await writeFile(join(taskPath, "meta.json"), JSON.stringify({
+		version: 1, id: taskId, instanceId: "b".repeat(32), sessionId, supervisorPid: 0,
+		cwd: sharedDir, command: "x", commandSummary: "x",
+		createdAt: sharedStamp, updatedAt: sharedStamp, status: "completed", exitCode: 0,
+	}));
+	await writeFile(join(taskPath, "output.log"), "ok");
+};
+await addTask("ps_aaaa0001", "mine");
+await addTask("ps_bbbb0002", "other");
+await addTask("ps_cccc0003", "other");
+
+const metadataReads = [];
+const readThrough = shared.readMetadata.bind(shared);
+shared.readMetadata = async (taskId) => { metadataReads.push(taskId); return readThrough(taskId); };
+
+await shared.list();
+assert.ok(metadataReads.includes("ps_bbbb0002"), "the first list must read a foreign task once to classify it");
+
+metadataReads.length = 0;
+const ownedOnly = await shared.list();
+assert.deepEqual(ownedOnly.map(({ id }) => id), ["ps_aaaa0001"], "list still returns only the owned task");
+assert.deepEqual(
+	metadataReads.filter((taskId) => taskId !== "ps_aaaa0001"),
+	[],
+	"a later list must not re-read metadata for tasks owned by another session",
+);
+
+metadataReads.length = 0;
+await shared.cleanupExpired();
+assert.ok(metadataReads.includes("ps_bbbb0002"), "retention must still see tasks owned by other sessions");
+
+// Rebinding the session invalidates the cache: what was foreign can now be ours.
+shared.setSessionId("other");
+assert.deepEqual(
+	(await shared.list()).map(({ id }) => id).sort(),
+	["ps_bbbb0002", "ps_cccc0003"],
+	"after setSessionId the previously foreign tasks become visible",
+);
+await rm(sharedDir, { recursive: true, force: true });
 await rm(dir, { recursive: true, force: true });
 console.log("task runtime/schema tests passed (PowerShell process e2e skipped: pwsh is not installed)");

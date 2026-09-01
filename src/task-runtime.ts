@@ -189,6 +189,20 @@ function parseMetadata(value: unknown, id: string): TaskMetadata {
 export class PwshTaskRuntime {
 	readonly taskDir: string;
 	private sessionId: string;
+	/**
+	 * Task ids known to belong to a different session.
+	 *
+	 * The task directory is shared by every pi session on the host and is only
+	 * pruned by retention, so it accumulates hundreds of entries. The observer
+	 * polls `list()` several times a second, and without this set every poll read
+	 * the metadata of every task just to discard the ones it does not own: with
+	 * 655 task directories that was thousands of filesystem operations per second
+	 * per session, enough to keep a core busy while the session sat idle.
+	 *
+	 * A task directory is created once with a fixed `sessionId`, so the decision
+	 * never changes and a foreign task never has to be read twice.
+	 */
+	private foreignTasks = new Set<string>();
 
 	constructor(
 		readonly pwsh: ResolvedPwshRuntime,
@@ -199,6 +213,7 @@ export class PwshTaskRuntime {
 	}
 
 	setSessionId(id: string): void {
+		if (id !== this.sessionId) this.foreignTasks.clear();
 		this.sessionId = id;
 	}
 
@@ -416,7 +431,10 @@ export class PwshTaskRuntime {
 	}
 
 	async list(sessionId = this.sessionId): Promise<TaskMetadata[]> {
-		const tasks = (await this.readAll()).filter((metadata) => !sessionId || metadata.sessionId === sessionId);
+		// Only the owning session's view can skip foreign tasks; a caller asking
+		// about someone else's session still needs the full read.
+		const ownView = sessionId !== "" && sessionId === this.sessionId;
+		const tasks = (await this.readAll({ skipForeign: ownView })).filter((metadata) => !sessionId || metadata.sessionId === sessionId);
 		return Promise.all(tasks.map((metadata) =>
 			metadata.sessionId === this.sessionId ? this.refreshOwned(metadata.id) : metadata
 		));
@@ -529,18 +547,35 @@ export class PwshTaskRuntime {
 		});
 	}
 
-	private async readAll(): Promise<TaskMetadata[]> {
+	/**
+	 * `skipForeign` omits tasks already known to belong to another session and is
+	 * only safe for the owning session's own view. `cleanupExpired` must see every
+	 * task regardless of owner, so it reads without it.
+	 */
+	private async readAll(options: { skipForeign?: boolean } = {}): Promise<TaskMetadata[]> {
 		await mkdir(this.taskDir, { recursive: true, mode: 0o700 });
 		const entries = await readdir(this.taskDir, { withFileTypes: true });
-		const values = await Promise.all(entries
+		const ids = entries
 			.filter((entry) => entry.isDirectory() && TASK_ID.test(entry.name))
-			.map(async (entry) => {
-				try {
-					return await this.readMetadata(entry.name);
-				} catch {
-					return undefined;
-				}
-			}));
+			.map((entry) => entry.name);
+		if (this.foreignTasks.size > 0) {
+			// Retention deletes task directories; drop their ids so the set cannot
+			// grow without bound across a long-lived session.
+			const present = new Set(ids);
+			for (const id of this.foreignTasks) {
+				if (!present.has(id)) this.foreignTasks.delete(id);
+			}
+		}
+		const values = await Promise.all(ids.map(async (id) => {
+			if (options.skipForeign && this.foreignTasks.has(id)) return undefined;
+			try {
+				const metadata = await this.readMetadata(id);
+				if (metadata.sessionId !== this.sessionId) this.foreignTasks.add(id);
+				return metadata;
+			} catch {
+				return undefined;
+			}
+		}));
 		return values.filter((value): value is TaskMetadata => value !== undefined);
 	}
 
