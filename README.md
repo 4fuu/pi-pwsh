@@ -11,7 +11,7 @@ A PowerShell-native shell tool for [pi](https://github.com/earendil-works/pi), w
 Windows shell work is more reliable when the tool name, syntax, process model, and paths all agree. `pi-pwsh` gives the model a real `pwsh` tool instead of asking it to translate bash assumptions at runtime.
 
 - **PowerShell-native** — commands use PowerShell 7 syntax and Windows paths from the start.
-- **Runs in the background and notifies automatically** — every command becomes a persistent task, so pi can continue other work and receive readiness or completion without polling.
+- **Waits for short work, then notifies automatically** — every command becomes a persistent task; quick work returns directly, while longer work continues in the background without polling.
 - **Durable across sessions** — tasks survive later tool calls, `/reload`, pi restarts, wait timeouts, and tool aborts.
 - **Progressive helper loading** — PTY and user-request helpers are loaded only when their PowerShell functions are referenced; detailed help remains available through `Get-PtyHelp` and `Get-PiRequestHelp`.
 - **Real interactive sessions** — persistent terminal sessions support REPLs, prompts, and full-screen applications.
@@ -29,7 +29,7 @@ Pi 0.84.3 added an optional built-in [`powershell` tool](https://github.com/eare
 | --- | --- | --- | --- |
 | Basic command execution | Built into pi with no extension dependencies | Separate extension with task, PTY, and coordination dependencies | **Built-in** for simple commands |
 | Shared baseline | Runs in the current directory, captures stdout/stderr, bounds returned output, and can terminate a process tree | Same | **Equivalent** |
-| Foreground experience | Waits for completion and streams live output into the current tool card | Starts a task and returns immediately by default; waiting returns a task snapshot rather than live tool updates | **Built-in** for short foreground work |
+| Foreground experience | Waits for completion and streams live output into the current tool card | Waits up to 60 seconds by default and returns a task snapshot; longer work continues in the background | **Built-in** for live streaming; **pi-pwsh** for bounded waiting with persistence |
 | Background work | No managed background-task API or task ID | Every command is a persistent task with inspect, wait, and stop operations | **pi-pwsh** |
 | Abort and timeout | Aborting the tool call or reaching its timeout terminates the process tree | Aborting or timing out a wait leaves the task running; only `stop=true` terminates it | Depends on whether work should stop or continue |
 | Readiness and completion | No readiness detection or deferred notification | Reports readiness from `notifyOn`, then completion, failure, or cancellation without polling | **pi-pwsh** |
@@ -48,9 +48,9 @@ Choose the built-in tool when commands are short-lived and native pi integration
 
 ### Background tasks and coordinated notifications
 
-Every `pwsh` command starts a persistent background task and returns immediately by default. Pi can continue reviewing code, editing files, or planning the next step while builds, tests, scripts, servers, and watchers run. There is no separate job mode and no need to wrap the command in another background layer.
+Every `pwsh` command starts a persistent task. When `wait` is omitted, the tool waits up to `defaultWaitSeconds` (60 by default): work that finishes in that window returns its result in the same call, while longer work returns a running task and continues in the background. Pass `wait: 0` to return immediately. There is no separate job mode and no need to wrap the command in another background layer.
 
-Completion, failure, and cancellation are reported automatically. Long-running services can also announce readiness as soon as a chosen literal appears in their output, without ending the task. If the current turn depends on the result, pi can wait on that same task; a timeout or cancelled wait leaves it running.
+Deferred completion, failure, and cancellation are reported automatically. Long-running services can also announce readiness as soon as a chosen literal appears in their output, without ending the task. Inspecting an existing task without `wait` uses the same configured default; a timeout or cancelled wait leaves it running.
 
 Each task remains available through its ID for later status and output snapshots or explicit process-tree termination. Snapshots are bounded and repeatable rather than consumable. Task state and notification markers survive `/reload` and pi restarts, and terminal records are retained for 24 hours.
 
@@ -108,7 +108,8 @@ Configuration is optional. Create `~/.pi/agent/pwsh.json` and run `/reload` afte
   "replaceUserBash": true,
   "stopOnError": false,
   "pythonUtf8": true,
-  "pythonUnbuffered": true
+  "pythonUnbuffered": true,
+  "defaultWaitSeconds": 60
 }
 ```
 
@@ -121,6 +122,7 @@ Configuration is optional. Create `~/.pi/agent/pwsh.json` and run `/reload` afte
 | `stopOnError` | `false` | Sets `$ErrorActionPreference = 'Stop'` before user commands. |
 | `pythonUtf8` | `true` | Defaults `PYTHONIOENCODING=utf-8` and `PYTHONUTF8=1` unless already set. |
 | `pythonUnbuffered` | `true` | Defaults `PYTHONUNBUFFERED=1` unless already set. |
+| `defaultWaitSeconds` | `60` | Wait used when `wait` is omitted for new commands and existing task queries. Accepts an integer from 0 to 300; `0` returns immediately. |
 
 Environment variables override the JSON file:
 
@@ -134,8 +136,9 @@ Environment variables override the JSON file:
 | `PI_PWSH_STOP_ON_ERROR` | `stopOnError` |
 | `PI_PWSH_PYTHON_UTF8` | `pythonUtf8` |
 | `PI_PWSH_PYTHON_UNBUFFERED` | `pythonUnbuffered` |
+| `PI_PWSH_DEFAULT_WAIT_SECONDS` | `defaultWaitSeconds` |
 
-Boolean environment values accept `true`/`false`, `1`/`0`, `yes`/`no`, and `on`/`off`. Configuration is strict: unknown fields, invalid values, or an unavailable configured executable produce an error instead of silently changing shell behavior.
+Boolean environment values accept `true`/`false`, `1`/`0`, `yes`/`no`, and `on`/`off`. `PI_PWSH_DEFAULT_WAIT_SECONDS` accepts a decimal integer from 0 to 300. Configuration is strict: unknown fields, invalid values, or an unavailable configured executable produce an error instead of silently changing shell behavior.
 
 ## Recommended Windows setup
 

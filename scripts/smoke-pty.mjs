@@ -103,7 +103,14 @@ for (const handler of fallbackHandlers.get("session_start") ?? []) {
 assert.ok(fallbackTools.includes("bash"));
 assert.ok(!fallbackTools.includes("pwsh"));
 
-extension(pi);
+const previousDefaultWaitSeconds = process.env.PI_PWSH_DEFAULT_WAIT_SECONDS;
+process.env.PI_PWSH_DEFAULT_WAIT_SECONDS = "3";
+try {
+	extension(pi);
+} finally {
+	if (previousDefaultWaitSeconds === undefined) delete process.env.PI_PWSH_DEFAULT_WAIT_SECONDS;
+	else process.env.PI_PWSH_DEFAULT_WAIT_SECONDS = previousDefaultWaitSeconds;
+}
 for (const handler of handlers.get("session_start") ?? []) {
 	await handler({ type: "session_start", reason: "startup" }, ctx);
 }
@@ -114,12 +121,18 @@ assert.ok(activeTools.includes("ls"));
 assert.ok(activeTools.includes("find"));
 assert.ok(activeTools.includes("grep"));
 assert.match(tool.description, /persistent background task/);
+assert.match(tool.description, /configured defaultWaitSeconds/);
+assert.match(tool.description, /wait: 0/);
 assert.match(tool.description, /USER REQUESTS:/);
 
 let call = 0;
-async function run(command, timeout) {
+async function execute(params) {
 	call++;
-	const result = await tool.execute(`pty-smoke-${call}`, { command, wait: timeout ?? 30 }, undefined, undefined, ctx);
+	return tool.execute(`pty-smoke-${call}`, params, undefined, undefined, ctx);
+}
+
+async function run(command, timeout) {
+	const result = await execute({ command, wait: timeout ?? 30 });
 	const text = result.content.map((item) => item.type === "text" ? item.text : "").join("\n");
 	// The task-based result prefixes metadata (taskId/status/...); the command's
 	// output starts after the "output:" (or "output: [N earlier bytes omitted]") line.
@@ -142,6 +155,16 @@ async function assertPtyExitCode(name, command, expected) {
 }
 
 try {
+	const defaultWait = await execute({ command: "Start-Sleep -Milliseconds 300; Write-Output DEFAULT_WAIT_COMPLETE" });
+	assert.equal(defaultWait.details.status, "completed");
+	assert.match(defaultWait.details.output, /DEFAULT_WAIT_COMPLETE/);
+
+	const immediate = await execute({ command: "Start-Sleep -Milliseconds 1500; Write-Output TASK_ID_DEFAULT_WAIT", wait: 0 });
+	assert.match(immediate.details.status, /^(?:starting|running)$/);
+	const waitedByTaskId = await execute({ taskId: immediate.details.taskId });
+	assert.equal(waitedByTaskId.details.status, "completed");
+	assert.match(waitedByTaskId.details.output, /TASK_ID_DEFAULT_WAIT/);
+
 	const selectedObject = await run("Write-Output 'before'; [pscustomobject]@{Name='x';State='y'} | Select-Object Name, State; Write-Output 'after'");
 	assert.match(selectedObject, /before/);
 	assert.match(selectedObject, /Name\s+State[\s\S]*x\s+y/);

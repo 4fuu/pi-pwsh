@@ -102,7 +102,9 @@ function parseExecutionPolicy(value: unknown, source: string): ExecutionPolicy |
 }
 
 function parseWaitSeconds(value: unknown, source: string): number {
-	const seconds = typeof value === "number" ? value : Number(String(value).trim());
+	let seconds = Number.NaN;
+	if (typeof value === "number") seconds = value;
+	else if (typeof value === "string" && /^\d+$/.test(value.trim())) seconds = Number(value.trim());
 	if (!Number.isInteger(seconds) || seconds < 0 || seconds > 300) {
 		throw new ConfigError(`${source}: defaultWaitSeconds must be an integer between 0 and 300`);
 	}

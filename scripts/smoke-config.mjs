@@ -27,18 +27,22 @@ function test(name, body) {
 
 try {
 	test("defaults-without-file", () => {
-		assert.deepEqual(loadConfig({ agentDir: directory, env: {} }).config, DEFAULT_CONFIG);
+		const config = loadConfig({ agentDir: directory, env: {} }).config;
+		assert.deepEqual(config, DEFAULT_CONFIG);
+		assert.equal(config.defaultWaitSeconds, 60);
 	});
 
-	writeFileSync(join(directory, "pwsh.json"), JSON.stringify({ loadProfile: true, pythonUtf8: false }));
+	writeFileSync(join(directory, "pwsh.json"), JSON.stringify({ loadProfile: true, pythonUtf8: false, defaultWaitSeconds: 15 }));
 	test("file-and-environment-precedence", () => {
+		assert.equal(loadConfig({ agentDir: directory, env: {} }).config.defaultWaitSeconds, 15);
 		const loaded = loadConfig({
 			agentDir: directory,
-			env: { PI_PWSH_LOAD_PROFILE: "off", PI_PWSH_STOP_ON_ERROR: "yes" },
+			env: { PI_PWSH_LOAD_PROFILE: "off", PI_PWSH_STOP_ON_ERROR: "yes", PI_PWSH_DEFAULT_WAIT_SECONDS: "25" },
 		});
 		assert.equal(loaded.config.loadProfile, false);
 		assert.equal(loaded.config.stopOnError, true);
 		assert.equal(loaded.config.pythonUtf8, false);
+		assert.equal(loaded.config.defaultWaitSeconds, 25);
 	});
 
 	test("strict-unknown-field", () => {
@@ -52,6 +56,24 @@ try {
 			() => loadConfig({ agentDir: directory, env: { PI_PWSH_EXECUTION_POLICY: "Anything" } }),
 			ConfigError,
 		);
+	});
+
+	test("default-wait-validation", () => {
+		for (const value of ["0", "300"]) {
+			assert.equal(
+				loadConfig({ agentDir: directory, env: { PI_PWSH_DEFAULT_WAIT_SECONDS: value } }).config.defaultWaitSeconds,
+				Number(value),
+			);
+		}
+		for (const value of ["", " ", "-1", "1.5", "301", "1e2"]) {
+			assert.throws(
+				() => loadConfig({ agentDir: directory, env: { PI_PWSH_DEFAULT_WAIT_SECONDS: value } }),
+				ConfigError,
+			);
+		}
+		writeFileSync(join(directory, "pwsh.json"), JSON.stringify({ defaultWaitSeconds: "" }));
+		assert.throws(() => loadConfig({ agentDir: directory, env: {} }), ConfigError);
+		rmSync(join(directory, "pwsh.json"));
 	});
 
 	test("explicit-config-file-is-required", () => {

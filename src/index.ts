@@ -33,7 +33,7 @@ export const DESCRIPTION = `Run a PowerShell 7 command as a persistent backgroun
 
 Write PowerShell 7 syntax. Use multiline commands with normal indentation and formatting when they improve readability; do not collapse them into a single line. Single quotes are literal; double quotes expand variables; backtick is the escape character. Set environment variables with $env:NAME = 'value'; command. Quote paths containing spaces. Prefer modern cross-platform tools such as rg and fd when available. PowerShell recursive searches do not honor .gitignore, so bound paths, depth, and output tightly.
 
-Exactly one of command or taskId is required. To start a new task, pass only command and omit taskId. To inspect, wait for, or stop an existing task, pass only taskId and omit command. A command always starts a persistent task. Omit wait to wait up to the configured defaultWaitSeconds (60 by default, set in ~/.pi/agent/pwsh.json): short commands return their completed result directly, longer ones keep running in the background and notify on completion. Pass wait: 0 to return immediately without waiting. With notifyOn, start and taskId waits end when that case-sensitive literal UTF-8 text appears or the task terminates; otherwise they wait for termination. A timeout or tool abort ends only waiting—the task continues. Only stop=true terminates its process tree. Queries are idempotent snapshots containing status and bounded latest output. Task IDs are usable only in the parent session that launched them.
+Exactly one of command or taskId is required. To start a new task, pass only command and omit taskId. To inspect, wait for, or stop an existing task, pass only taskId and omit command. A command always starts a persistent task. Omit wait to wait up to the configured defaultWaitSeconds: short commands return their completed result directly, longer ones keep running in the background and notify on completion. Pass wait: 0 to return immediately without waiting. With notifyOn, start and taskId waits end when that case-sensitive literal UTF-8 text appears or the task terminates; otherwise they wait for termination. A timeout or tool abort ends only waiting—the task continues. Only stop=true terminates its process tree. Queries are idempotent snapshots containing status and bounded latest output. Task IDs are usable only in the parent session that launched them.
 
 Do not create a second background layer inside the command. Use taskId in a later pwsh call to inspect or stop work.
 
@@ -60,7 +60,7 @@ export const PwshParams = Type.Object({
 	wait: Type.Optional(Type.Number({
 		minimum: 0,
 		maximum: 300,
-		description: "Seconds to wait (0-300). Omit to wait the configured defaultWaitSeconds (60 by default) — short commands finish within it and return their result directly, longer tasks switch to background and notify on completion. Pass wait: 0 to return immediately.",
+		description: "Seconds to wait (0-300). Omit to wait the configured defaultWaitSeconds: short commands finish within it and return their result directly, while longer tasks continue in the background and notify on completion. Pass wait: 0 to return immediately.",
 	})),
 	stop: Type.Optional(Type.Boolean({
 		description: "With taskId, terminate the complete process tree before returning its snapshot.",
@@ -317,9 +317,11 @@ export default function pwshExtension(pi: ExtensionAPI): void {
 				}
 			},
 			renderCall(args, theme) {
+				const effectiveWait = args.wait ?? config?.defaultWaitSeconds;
+				const waitAction = effectiveWait === undefined ? "wait default" : `wait ${effectiveWait}s`;
 				const action = args.taskId
-					? args.stop ? "stop" : args.wait !== undefined ? `wait ${args.wait}s` : "inspect"
-					: args.wait !== undefined ? `start · wait ${args.wait}s` : "start";
+					? args.stop ? "stop" : waitAction
+					: `start · ${waitAction}`;
 				let header = `${theme.fg("toolTitle", theme.bold("pwsh"))} ${theme.fg("accent", args.taskId ?? "new task")} ${theme.fg("dim", `· ${action}`)}`;
 				if (args.notifyOn) header += theme.fg("dim", ` · notify on ${JSON.stringify(args.notifyOn)}`);
 				const command = typeof args.command === "string" ? args.command.replace(/\r/g, "").replace(/\t/g, "   ") : "";
