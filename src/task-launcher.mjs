@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { closeSync, existsSync, openSync } from "node:fs";
-import { open, readFile, rm, writeFile } from "node:fs/promises";
+import { closeSync, existsSync, ftruncateSync, openSync, readSync, writeSync } from "node:fs";
+import { readFile, rm, writeFile } from "node:fs/promises";
 import { mutateMetadataSnapshots, readLatestMetadataSnapshot, renameWithRetry } from "./task-metadata-store.mjs";
 
 const configPath = process.argv[2];
@@ -70,53 +70,111 @@ function notify(message) {
 	}
 }
 
-let readinessOffset = 0;
-let readinessCarry = Buffer.alloc(0);
-let readinessScanning = false;
-async function scanReadiness() {
-	if (!config.notifyOn || readinessScanning || existsSync(config.readyMarkerPath)) return;
-	readinessScanning = true;
-	let handle;
-	try {
-		handle = await open(config.logPath, "r");
-		const size = (await handle.stat()).size;
-		const needle = Buffer.from(config.notifyOn, "utf8");
-		while (readinessOffset < size) {
-			const chunk = Buffer.alloc(Math.min(64 * 1024, size - readinessOffset));
-			const { bytesRead } = await handle.read(chunk, 0, chunk.length, readinessOffset);
-			if (bytesRead === 0) break;
-			readinessOffset += bytesRead;
-			const data = Buffer.concat([readinessCarry, chunk.subarray(0, bytesRead)]);
-			readinessCarry = data.subarray(Math.max(0, data.length - Math.max(0, needle.length - 1)));
-			if (data.indexOf(needle) !== -1) {
-				await writeFile(config.readyMarkerPath, "", { flag: "wx", mode: 0o600 }).catch((error) => {
-					if (error.code !== "EEXIST") throw error;
-				});
-				break;
-			}
-		}
-	} finally {
-		await handle?.close().catch(() => {});
-		readinessScanning = false;
-	}
+// The child's output is piped through this process rather than written straight
+// to the log file descriptor, so that its size can be bounded. A runaway task -
+// a build loop, a retry storm, anything verbose - would otherwise fill the disk
+// while it ran, and no retention sweep can help: the task is not terminal yet,
+// and cleanup only runs when a session or a task starts.
+//
+// The tail is what is kept, because the tail is what a reader wants and all the
+// task API can ever surface (PwshTaskRuntime.tail reads the last 50 KiB).
+// The override is clamped rather than trusted: a negative or tiny value would
+// otherwise make KEEP_LOG_BYTES exceed the cap and rotation read from a negative
+// offset. KEEP is always strictly below MAX, so the log cannot outgrow its cap.
+const DEFAULT_MAX_LOG_BYTES = 8 * 1024 * 1024;
+const MIN_MAX_LOG_BYTES = 64 * 1024;
+const requestedMaxLogBytes = Number.parseInt(process.env.PI_PWSH_MAX_LOG_BYTES ?? "", 10);
+const MAX_LOG_BYTES = Number.isFinite(requestedMaxLogBytes) && requestedMaxLogBytes > 0
+	? Math.max(MIN_MAX_LOG_BYTES, requestedMaxLogBytes)
+	: DEFAULT_MAX_LOG_BYTES;
+const KEEP_LOG_BYTES = Math.floor(MAX_LOG_BYTES / 2);
+
+let logBytes = 0;
+let truncations = 0;
+
+function truncationNotice() {
+	return Buffer.from(
+		`[pi-pwsh] earlier output discarded to keep this log under ${MAX_LOG_BYTES} bytes (truncation ${truncations})\n`,
+		"utf8",
+	);
 }
 
-const readinessTimer = config.notifyOn
-	? setInterval(() => void scanReadiness().catch(() => {}), 25)
-	: undefined;
-readinessTimer?.unref();
+/** Append to the log, discarding the oldest bytes once the budget is exceeded. */
+function appendToLog(chunk) {
+	writeSync(logFd, chunk, 0, chunk.length, logBytes);
+	logBytes += chunk.length;
+	if (logBytes <= MAX_LOG_BYTES) return;
+	truncations++;
+	const keepBytes = Math.min(KEEP_LOG_BYTES, logBytes);
+	const keep = Buffer.allocUnsafe(keepBytes);
+	const kept = readSync(logFd, keep, 0, keepBytes, logBytes - keepBytes);
+	const notice = truncationNotice();
+	ftruncateSync(logFd, 0);
+	writeSync(logFd, notice, 0, notice.length, 0);
+	writeSync(logFd, keep, 0, kept, notice.length);
+	logBytes = notice.length + kept;
+}
+
+// Readiness is matched on the stream itself. The previous implementation re-read
+// the file from a saved absolute offset every 25 ms, which cannot survive the
+// log being rewritten, and cost a poll per task even when nothing was writing.
+const readinessNeedle = config.notifyOn ? Buffer.from(config.notifyOn, "utf8") : undefined;
+let readinessCarry = Buffer.alloc(0);
+let readinessSettled = false;
+
+function scanReadiness(chunk) {
+	if (!readinessNeedle || readinessSettled) return;
+	const data = readinessCarry.length === 0 ? chunk : Buffer.concat([readinessCarry, chunk]);
+	if (data.indexOf(readinessNeedle) !== -1) {
+		readinessSettled = true;
+		readinessCarry = Buffer.alloc(0);
+		try {
+			closeSync(openSync(config.readyMarkerPath, "wx", 0o600));
+		} catch (error) {
+			if (error.code !== "EEXIST") throw error;
+		}
+		return;
+	}
+	// Keep just enough trailing bytes for a needle split across two chunks.
+	readinessCarry = data.subarray(Math.max(0, data.length - (readinessNeedle.length - 1)));
+}
+
+// Set once the completion promise exists, so a failure on the output path can
+// reach the handler that kills the child and records the task as failed.
+let failCompletion;
+let outputFailure;
+
+// A stream callback is outside the surrounding try/catch: an uncaught throw here
+// would kill the launcher without that cleanup, leaving the task looking alive.
+// Disk-full is exactly the condition this bound exists for, so the write path
+// has to fail into the normal termination handling rather than past it.
+function onOutput(chunk) {
+	try {
+		appendToLog(chunk);
+		scanReadiness(chunk);
+	} catch (error) {
+		if (outputFailure) return;
+		outputFailure = error;
+		child?.stdout?.off("data", onOutput);
+		child?.stderr?.off("data", onOutput);
+		failCompletion?.(error);
+	}
+}
 
 let child;
 let logFd;
 try {
-	logFd = openSync(config.logPath, "a");
+	// "r+" rather than "a": append mode ignores the explicit write positions that
+	// rewriting the log to keep only its tail depends on. The runtime creates this
+	// file before starting the launcher.
+	logFd = openSync(config.logPath, existsSync(config.logPath) ? "r+" : "w+");
 	// This flag makes a Bun standalone execute this launcher, but it must not
 	// alter Bun standalone executables started by the user's PowerShell command.
 	if (process.versions.bun) delete process.env.BUN_BE_BUN;
 	child = spawn(config.executable, config.args, {
 		cwd: config.cwd,
 		env: process.env,
-		stdio: [config.stdin === undefined ? "ignore" : "pipe", logFd, logFd],
+		stdio: [config.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
 		windowsHide: true,
 		// The detached launcher owns the Unix process group; PowerShell and all
 		// descendants inherit it so stop=true reaches the complete tree.
@@ -129,11 +187,24 @@ try {
 	}
 
 	const completion = new Promise((resolve, reject) => {
+		failCompletion = reject;
 		child.once("error", reject);
-		child.once("exit", (exitCode, signal) => resolve({ exitCode, signal }));
+		// "close", not "exit": the piped streams can still hold buffered output when
+		// the process itself exits, and the parent reads the log as soon as it sees a
+		// terminal status. Waiting for close is what makes the log complete by then.
+		child.once("close", (exitCode, signal) => resolve({ exitCode, signal }));
 	});
 	// Avoid an unhandled rejection if startup itself fails before completion is awaited.
 	void completion.catch(() => {});
+	// Attached after the completion promise exists, so a write failure on the very
+	// first chunk still has somewhere to be reported. Both streams land in the one
+	// log, as they did when both inherited its descriptor; draining them is also
+	// what keeps a noisy child from blocking on a full pipe once its output stops
+	// being retained.
+	child.stdout.on("data", onOutput);
+	child.stderr.on("data", onOutput);
+	child.stdout.on("error", () => {});
+	child.stderr.on("error", () => {});
 	await new Promise((resolve, reject) => {
 		child.once("spawn", resolve);
 		child.once("error", reject);
@@ -146,16 +217,12 @@ try {
 	await writeMetadata({ supervisorPid: process.pid, pid: child.pid, status: "running" });
 
 	const { exitCode, signal } = await completion;
-	if (readinessTimer) clearInterval(readinessTimer);
-	while (readinessScanning) await new Promise((resolve) => setTimeout(resolve, 5));
-	await scanReadiness();
 	await writeMetadata({
 		status: exitCode === 0 ? "completed" : "failed",
 		exitCode,
 		...(signal ? { error: `PowerShell exited after signal ${signal}` } : {}),
 	});
 } catch (error) {
-	if (readinessTimer) clearInterval(readinessTimer);
 	if (child?.pid && child.exitCode === null) {
 		if (process.platform === "win32") {
 			await new Promise((resolve) => {
