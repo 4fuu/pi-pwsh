@@ -23,6 +23,7 @@ export interface PwshConfig {
 	stopOnError: boolean;
 	pythonUtf8: boolean;
 	pythonUnbuffered: boolean;
+	defaultWaitSeconds: number;
 }
 
 export const DEFAULT_CONFIG: Readonly<PwshConfig> = Object.freeze({
@@ -33,6 +34,7 @@ export const DEFAULT_CONFIG: Readonly<PwshConfig> = Object.freeze({
 	stopOnError: false,
 	pythonUtf8: true,
 	pythonUnbuffered: true,
+	defaultWaitSeconds: 60,
 });
 
 const CONFIG_KEYS = new Set<keyof PwshConfig>(Object.keys(DEFAULT_CONFIG) as Array<keyof PwshConfig>);
@@ -44,6 +46,7 @@ const ENV_FIELDS = {
 	PI_PWSH_STOP_ON_ERROR: "stopOnError",
 	PI_PWSH_PYTHON_UTF8: "pythonUtf8",
 	PI_PWSH_PYTHON_UNBUFFERED: "pythonUnbuffered",
+	PI_PWSH_DEFAULT_WAIT_SECONDS: "defaultWaitSeconds",
 } as const;
 
 export class ConfigError extends Error {
@@ -98,6 +101,14 @@ function parseExecutionPolicy(value: unknown, source: string): ExecutionPolicy |
 	return policy;
 }
 
+function parseWaitSeconds(value: unknown, source: string): number {
+	const seconds = typeof value === "number" ? value : Number(String(value).trim());
+	if (!Number.isInteger(seconds) || seconds < 0 || seconds > 300) {
+		throw new ConfigError(`${source}: defaultWaitSeconds must be an integer between 0 and 300`);
+	}
+	return seconds;
+}
+
 function parseConfigObject(value: unknown, source: string): Partial<PwshConfig> {
 	if (!value || typeof value !== "object" || Array.isArray(value)) {
 		throw new ConfigError(`${source}: configuration must be a JSON object`);
@@ -111,6 +122,7 @@ function parseConfigObject(value: unknown, source: string): Partial<PwshConfig> 
 	const parsed: Partial<PwshConfig> = {};
 	if ("executable" in input) parsed.executable = parseExecutable(input.executable, source);
 	if ("executionPolicy" in input) parsed.executionPolicy = parseExecutionPolicy(input.executionPolicy, source);
+	if ("defaultWaitSeconds" in input) parsed.defaultWaitSeconds = parseWaitSeconds(input.defaultWaitSeconds, source);
 	for (const key of [
 		"loadProfile",
 		"replaceUserBash",
@@ -133,6 +145,7 @@ function parseEnvironment(env: NodeJS.ProcessEnv): Partial<PwshConfig> {
 		const source = `environment variable ${environmentName}`;
 		if (field === "executable") parsed.executable = parseExecutable(value, source);
 		else if (field === "executionPolicy") parsed.executionPolicy = parseExecutionPolicy(value, source);
+		else if (field === "defaultWaitSeconds") parsed.defaultWaitSeconds = parseWaitSeconds(value, source);
 		else parsed[field] = parseBoolean(value, field, source);
 	}
 	return parsed;
