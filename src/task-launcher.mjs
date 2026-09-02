@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { closeSync, existsSync, ftruncateSync, openSync, readSync, writeSync } from "node:fs";
 import { readFile, rm, writeFile } from "node:fs/promises";
+import { waitForChildProcess } from "./child-process-wait.mjs";
 import { mutateMetadataSnapshots, readLatestMetadataSnapshot, renameWithRetry } from "./task-metadata-store.mjs";
 
 const configPath = process.argv[2];
@@ -186,14 +187,10 @@ try {
 		child.stdin.end(config.stdin, "utf8");
 	}
 
-	const completion = new Promise((resolve, reject) => {
-		failCompletion = reject;
-		child.once("error", reject);
-		// "close", not "exit": the piped streams can still hold buffered output when
-		// the process itself exits, and the parent reads the log as soon as it sees a
-		// terminal status. Waiting for close is what makes the log complete by then.
-		child.once("close", (exitCode, signal) => resolve({ exitCode, signal }));
-	});
+	const completion = Promise.race([
+		waitForChildProcess(child),
+		new Promise((_, reject) => { failCompletion = reject; }),
+	]);
 	// Avoid an unhandled rejection if startup itself fails before completion is awaited.
 	void completion.catch(() => {});
 	// Attached after the completion promise exists, so a write failure on the very
@@ -259,5 +256,7 @@ try {
 	notify({ type: "error", error: error instanceof Error ? error.message : String(error) });
 	if (process.connected) process.disconnect();
 } finally {
+	child?.stdout?.off("data", onOutput);
+	child?.stderr?.off("data", onOutput);
 	if (logFd !== undefined) closeSync(logFd);
 }
