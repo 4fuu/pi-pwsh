@@ -632,19 +632,21 @@ const shared = new PwshTaskRuntime(
 	{ taskDir: sharedDir, sessionId: "mine" },
 );
 const sharedStamp = new Date().toISOString();
-const addTask = async (taskId, sessionId) => {
+const addTask = async (taskId, sessionId, updatedAt = sharedStamp) => {
 	const taskPath = shared.taskDirectoryPath(taskId);
 	await mkdir(taskPath);
 	await writeFile(join(taskPath, "meta.json"), JSON.stringify({
 		version: 1, id: taskId, instanceId: "b".repeat(32), sessionId, supervisorPid: 0,
 		cwd: sharedDir, command: "x", commandSummary: "x",
-		createdAt: sharedStamp, updatedAt: sharedStamp, status: "completed", exitCode: 0,
+		createdAt: updatedAt, updatedAt, status: "completed", exitCode: 0,
 	}));
 	await writeFile(join(taskPath, "output.log"), "ok");
 };
 await addTask("ps_aaaa0001", "mine");
 await addTask("ps_bbbb0002", "other");
 await addTask("ps_cccc0003", "other");
+const reusedId = "ps_dddd0004";
+await addTask(reusedId, "other", new Date(Date.now() - 48 * 60 * 60 * 1_000).toISOString());
 
 const metadataReads = [];
 const readThrough = shared.readMetadata.bind(shared);
@@ -665,6 +667,16 @@ assert.deepEqual(
 metadataReads.length = 0;
 await shared.cleanupExpired();
 assert.ok(metadataReads.includes("ps_bbbb0002"), "retention must still see tasks owned by other sessions");
+assert.equal(existsSync(shared.taskDirectoryPath(reusedId)), false, "retention removes an expired foreign task");
+
+// Successful retention must invalidate the cached owner. If the same id is
+// allocated again, the replacement task must be classified from fresh metadata.
+await addTask(reusedId, "mine");
+assert.deepEqual(
+	(await shared.list()).map(({ id }) => id).sort(),
+	["ps_aaaa0001", reusedId],
+	"a current-session task that reuses a deleted foreign id remains visible",
+);
 
 // Rebinding the session invalidates the cache: what was foreign can now be ours.
 shared.setSessionId("other");

@@ -244,6 +244,7 @@ export class PwshTaskRuntime {
 			directory = join(this.taskDir, id);
 			try {
 				await mkdir(directory, { mode: 0o700 });
+				this.foreignTasks.delete(id);
 				break;
 			} catch (error) {
 				if ((error as NodeJS.ErrnoException).code !== "EEXIST" || attempt === 4) throw error;
@@ -462,6 +463,7 @@ export class PwshTaskRuntime {
 		for (const metadata of await this.readAll()) {
 			if (TERMINAL.has(metadata.status) && Date.now() - Date.parse(metadata.updatedAt) > RETENTION_MS) {
 				await rm(this.taskDirectoryPath(metadata.id), { recursive: true, force: true });
+				this.foreignTasks.delete(metadata.id);
 			}
 		}
 	}
@@ -571,6 +573,7 @@ export class PwshTaskRuntime {
 			try {
 				const metadata = await this.readMetadata(id);
 				if (metadata.sessionId !== this.sessionId) this.foreignTasks.add(id);
+				else this.foreignTasks.delete(id);
 				return metadata;
 			} catch {
 				return undefined;
