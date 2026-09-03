@@ -38,6 +38,7 @@ export class TaskNotificationManager {
 	private closed = true;
 	private scanPromise: Promise<void> | undefined;
 	private lastScanError?: string;
+	private settledTerminalInstances = new Set<string>();
 
 	constructor(
 		private readonly coordinator: TaskCoordinator,
@@ -64,6 +65,7 @@ export class TaskNotificationManager {
 		this.timer = undefined;
 		await this.scanPromise?.catch(() => {});
 		this.lastScanError = undefined;
+		this.settledTerminalInstances.clear();
 		this.reporter.publishCatalog(this.sessionId, []);
 	}
 
@@ -83,13 +85,19 @@ export class TaskNotificationManager {
 		const tasks = (await this.runtime.list(this.sessionId)).sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
 		if (this.closed) return;
 		const snapshots: TaskSnapshot[] = [];
+		const snapshotsById = new Map<string, TaskSnapshot>();
 		for (const metadata of tasks) {
 			if (this.closed) return;
+			if (isTerminal(metadata) && this.isTerminalSettled(metadata)) continue;
 			const snapshot = await this.runtime.snapshot(metadata.id, 0, undefined, { claimTerminal: false });
 			if (this.closed) return;
 			snapshots.push(snapshot);
+			snapshotsById.set(metadata.id, snapshot);
 		}
-		const catalog: PresentedTask[] = snapshots.map(({ metadata, ready }) => {
+		const catalog: PresentedTask[] = tasks.map((listed) => {
+			const snapshot = snapshotsById.get(listed.id);
+			const metadata = snapshot?.metadata ?? listed;
+			const ready = snapshot?.ready ?? false;
 			const active = !isTerminal(metadata);
 			const createdAt = Date.parse(metadata.createdAt);
 			const updatedAt = Date.parse(metadata.updatedAt);
@@ -240,6 +248,15 @@ export class TaskNotificationManager {
 	private notifiedPath(metadata: TaskMetadata, kind: TaskNotificationKind): string { return `${this.base(metadata, kind)}.notified`; }
 	private presentedPath(metadata: TaskMetadata, kind: TaskNotificationKind): string {
 		return join(this.runtime.taskDirectoryPath(metadata.id), `${metadata.instanceId}.${kind === "terminal" ? "exit" : "ready"}.presented`);
+	}
+
+	private isTerminalSettled(metadata: TaskMetadata): boolean {
+		if (this.settledTerminalInstances.has(metadata.instanceId)) return true;
+		if (!existsSync(this.notifiedPath(metadata, "terminal")) && !existsSync(this.presentedPath(metadata, "terminal"))) {
+			return false;
+		}
+		this.settledTerminalInstances.add(metadata.instanceId);
+		return true;
 	}
 
 	private async claim(metadata: TaskMetadata, kind: TaskNotificationKind): Promise<ClaimState> {
