@@ -203,6 +203,7 @@ export class PwshTaskRuntime {
 	 * never changes and a foreign task never has to be read twice.
 	 */
 	private foreignTasks = new Set<string>();
+	/** Terminal metadata is immutable, so list polling only needs to refresh active tasks. */
 	private terminalTasks = new Map<string, TaskMetadata>();
 
 	constructor(

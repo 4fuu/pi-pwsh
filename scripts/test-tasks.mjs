@@ -483,6 +483,11 @@ assert.ok(
 	withdrawals.some(([taskKey, events, reason]) => taskKey === `pwsh:${ownId}` && events.includes("ready") && reason === "superseded"),
 	"a presented terminal task must still supersede its outstanding readiness event",
 );
+assert.equal(
+	await readFile(join(ownTask, `${ownInstance}.ready.notified`), "utf8"),
+	"",
+	"superseded readiness must be durably settled without a task snapshot",
+);
 snapshotCalls.length = 0;
 await manager.scanNow();
 assert.ok(!snapshotCalls.includes(ownId), "settled terminal tasks must not be resnapshotted on later scans");
