@@ -88,7 +88,7 @@ export class TaskNotificationManager {
 		const snapshotsById = new Map<string, TaskSnapshot>();
 		for (const metadata of tasks) {
 			if (this.closed) return;
-			if (isTerminal(metadata) && this.isTerminalSettled(metadata)) continue;
+			if (isTerminal(metadata) && await this.settleWithoutSnapshot(metadata)) continue;
 			const snapshot = await this.runtime.snapshot(metadata.id, 0, undefined, { claimTerminal: false });
 			if (this.closed) return;
 			snapshots.push(snapshot);
@@ -250,10 +250,14 @@ export class TaskNotificationManager {
 		return join(this.runtime.taskDirectoryPath(metadata.id), `${metadata.instanceId}.${kind === "terminal" ? "exit" : "ready"}.presented`);
 	}
 
-	private isTerminalSettled(metadata: TaskMetadata): boolean {
+	private async settleWithoutSnapshot(metadata: TaskMetadata): Promise<boolean> {
 		if (this.settledTerminalInstances.has(metadata.instanceId)) return true;
 		if (!existsSync(this.notifiedPath(metadata, "terminal")) && !existsSync(this.presentedPath(metadata, "terminal"))) {
 			return false;
+		}
+		if (metadata.notifyOn && existsSync(join(this.runtime.taskDirectoryPath(metadata.id), `${metadata.instanceId}.ready.detected`))) {
+			this.coordinator.withdrawTask(`pwsh:${metadata.id}`, ["ready"], "superseded");
+			await this.settleNotified(metadata, "ready");
 		}
 		this.settledTerminalInstances.add(metadata.instanceId);
 		return true;

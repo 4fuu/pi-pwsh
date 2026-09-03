@@ -447,10 +447,10 @@ assert.equal(bunDone.output, "<unset>");
 
 // Offers use the shared aggregation schema. Submission and delivery have
 // distinct durable markers, and either one prevents a repeated offer.
-const offers = [], catalogs = [];
+const offers = [], catalogs = [], withdrawals = [];
 const coordinator = {
 	offer(update, callbacks) { offers.push({ update, callbacks }); },
-	withdrawTask() {},
+	withdrawTask(...args) { withdrawals.push(args); },
 };
 const reporter = {
 	publishCatalog(sessionId, catalog) { catalogs.push({ sessionId, catalog }); },
@@ -479,6 +479,10 @@ assert.deepEqual(terminalPresented, {
 	startedAt: Date.parse(launchMeta.createdAt), endedAt: Date.parse((await runtime.readMetadata(launchId)).updatedAt), summary: "x",
 });
 assert.ok(!offers.some(({ update }) => update.taskId === ownId), "presented terminal events must be skipped entirely");
+assert.ok(
+	withdrawals.some(([taskKey, events, reason]) => taskKey === `pwsh:${ownId}` && events.includes("ready") && reason === "superseded"),
+	"a presented terminal task must still supersede its outstanding readiness event",
+);
 snapshotCalls.length = 0;
 await manager.scanNow();
 assert.ok(!snapshotCalls.includes(ownId), "settled terminal tasks must not be resnapshotted on later scans");
