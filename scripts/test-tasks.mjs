@@ -447,10 +447,10 @@ assert.equal(bunDone.output, "<unset>");
 
 // Offers use the shared aggregation schema. Submission and delivery have
 // distinct durable markers, and either one prevents a repeated offer.
-const offers = [], catalogs = [];
+const offers = [], catalogs = [], withdrawals = [];
 const coordinator = {
 	offer(update, callbacks) { offers.push({ update, callbacks }); },
-	withdrawTask() {},
+	withdrawTask(...args) { withdrawals.push(args); },
 };
 const reporter = {
 	publishCatalog(sessionId, catalog) { catalogs.push({ sessionId, catalog }); },
@@ -460,6 +460,12 @@ const ctx = {
 	hasUI: true,
 	mode: "print",
 	ui: { notify() {} },
+};
+const snapshotCalls = [];
+const snapshotThrough = runtime.snapshot.bind(runtime);
+runtime.snapshot = async (...args) => {
+	snapshotCalls.push(args[0]);
+	return snapshotThrough(...args);
 };
 const manager = new TaskNotificationManager(coordinator, reporter, ctx, runtime, "one", 0);
 await manager.start();
@@ -473,6 +479,18 @@ assert.deepEqual(terminalPresented, {
 	startedAt: Date.parse(launchMeta.createdAt), endedAt: Date.parse((await runtime.readMetadata(launchId)).updatedAt), summary: "x",
 });
 assert.ok(!offers.some(({ update }) => update.taskId === ownId), "presented terminal events must be skipped entirely");
+assert.ok(
+	withdrawals.some(([taskKey, events, reason]) => taskKey === `pwsh:${ownId}` && events.includes("ready") && reason === "superseded"),
+	"a presented terminal task must still supersede its outstanding readiness event",
+);
+assert.equal(
+	await readFile(join(ownTask, `${ownInstance}.ready.notified`), "utf8"),
+	"",
+	"superseded readiness must be durably settled without a task snapshot",
+);
+snapshotCalls.length = 0;
+await manager.scanNow();
+assert.ok(!snapshotCalls.includes(ownId), "settled terminal tasks must not be resnapshotted on later scans");
 const terminalOffer = offers.find(({ update }) => update.taskId === launchId);
 assert.deepEqual({
 	eventId: terminalOffer.update.eventId,
@@ -658,11 +676,7 @@ assert.ok(metadataReads.includes("ps_bbbb0002"), "the first list must read a for
 metadataReads.length = 0;
 const ownedOnly = await shared.list();
 assert.deepEqual(ownedOnly.map(({ id }) => id), ["ps_aaaa0001"], "list still returns only the owned task");
-assert.deepEqual(
-	metadataReads.filter((taskId) => taskId !== "ps_aaaa0001"),
-	[],
-	"a later list must not re-read metadata for tasks owned by another session",
-);
+assert.deepEqual(metadataReads, [], "a later list must not re-read immutable terminal metadata");
 
 metadataReads.length = 0;
 await shared.cleanupExpired();

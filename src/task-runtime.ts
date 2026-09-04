@@ -203,6 +203,8 @@ export class PwshTaskRuntime {
 	 * never changes and a foreign task never has to be read twice.
 	 */
 	private foreignTasks = new Set<string>();
+	/** Terminal metadata is immutable, so list polling only needs to refresh active tasks. */
+	private terminalTasks = new Map<string, TaskMetadata>();
 
 	constructor(
 		readonly pwsh: ResolvedPwshRuntime,
@@ -213,7 +215,10 @@ export class PwshTaskRuntime {
 	}
 
 	setSessionId(id: string): void {
-		if (id !== this.sessionId) this.foreignTasks.clear();
+		if (id !== this.sessionId) {
+			this.foreignTasks.clear();
+			this.terminalTasks.clear();
+		}
 		this.sessionId = id;
 	}
 
@@ -245,6 +250,7 @@ export class PwshTaskRuntime {
 			try {
 				await mkdir(directory, { mode: 0o700 });
 				this.foreignTasks.delete(id);
+				this.terminalTasks.delete(id);
 				break;
 			} catch (error) {
 				if ((error as NodeJS.ErrnoException).code !== "EEXIST" || attempt === 4) throw error;
@@ -436,9 +442,12 @@ export class PwshTaskRuntime {
 		// about someone else's session still needs the full read.
 		const ownView = sessionId !== "" && sessionId === this.sessionId;
 		const tasks = (await this.readAll({ skipForeign: ownView })).filter((metadata) => !sessionId || metadata.sessionId === sessionId);
-		return Promise.all(tasks.map((metadata) =>
-			metadata.sessionId === this.sessionId ? this.refreshOwned(metadata.id) : metadata
-		));
+		return Promise.all(tasks.map(async (metadata) => {
+			if (metadata.sessionId !== this.sessionId || TERMINAL.has(metadata.status)) return metadata;
+			const refreshed = await this.refreshOwned(metadata.id);
+			if (TERMINAL.has(refreshed.status)) this.terminalTasks.set(refreshed.id, refreshed);
+			return refreshed;
+		}));
 	}
 
 	async readMetadata(id: string): Promise<TaskMetadata> {
@@ -464,6 +473,7 @@ export class PwshTaskRuntime {
 			if (TERMINAL.has(metadata.status) && Date.now() - Date.parse(metadata.updatedAt) > RETENTION_MS) {
 				await rm(this.taskDirectoryPath(metadata.id), { recursive: true, force: true });
 				this.foreignTasks.delete(metadata.id);
+				this.terminalTasks.delete(metadata.id);
 			}
 		}
 	}
@@ -560,20 +570,31 @@ export class PwshTaskRuntime {
 		const ids = entries
 			.filter((entry) => entry.isDirectory() && TASK_ID.test(entry.name))
 			.map((entry) => entry.name);
-		if (this.foreignTasks.size > 0) {
-			// Retention deletes task directories; drop their ids so the set cannot
-			// grow without bound across a long-lived session.
+		if (this.foreignTasks.size > 0 || this.terminalTasks.size > 0) {
 			const present = new Set(ids);
 			for (const id of this.foreignTasks) {
 				if (!present.has(id)) this.foreignTasks.delete(id);
 			}
+			for (const id of this.terminalTasks.keys()) {
+				if (!present.has(id)) this.terminalTasks.delete(id);
+			}
 		}
 		const values = await Promise.all(ids.map(async (id) => {
-			if (options.skipForeign && this.foreignTasks.has(id)) return undefined;
+			if (options.skipForeign) {
+				if (this.foreignTasks.has(id)) return undefined;
+				const terminal = this.terminalTasks.get(id);
+				if (terminal) return terminal;
+			}
 			try {
 				const metadata = await this.readMetadata(id);
-				if (metadata.sessionId !== this.sessionId) this.foreignTasks.add(id);
-				else this.foreignTasks.delete(id);
+				if (metadata.sessionId !== this.sessionId) {
+					this.foreignTasks.add(id);
+					this.terminalTasks.delete(id);
+				} else {
+					this.foreignTasks.delete(id);
+					if (TERMINAL.has(metadata.status)) this.terminalTasks.set(id, metadata);
+					else this.terminalTasks.delete(id);
+				}
 				return metadata;
 			} catch {
 				return undefined;
