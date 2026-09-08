@@ -32,8 +32,10 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "npm run typecheck && npm run test:tasks && npm run test:config && npm run test:runtime && npm run test:transport && npm run test:exitcode && npm run test:output && npm run test:launcher && npm run test:logcap && npm run test:timeout && npm run test:pty",
+    "test": "npm run typecheck && npm run test:controls && npm run test:tasks && npm run test:config && npm run test:runtime && npm run test:transport && npm run test:exitcode && npm run test:output && npm run test:launcher && npm run test:logcap && npm run test:timeout && npm run test:pty",
     "test:tasks": "tsx scripts/test-tasks.mjs",
+    "test:controls": "tsx --test scripts/test-controls.mjs",
+    "test:controls-ui": "node scripts/smoke-controls-ui.mjs",
     "test:config": "tsx scripts/smoke-config.mjs",
     "test:exitcode": "tsx scripts/smoke-exitcode.mjs",
     "test:launcher": "tsx scripts/smoke-launcher-descendant.mjs",

@@ -414,7 +414,7 @@ export class PwshTaskRuntime {
 		await this.markPresented(metadata, "ready");
 	}
 
-	async stop(id: string): Promise<TaskSnapshot> {
+	async stop(id: string, options: SnapshotOptions = {}): Promise<TaskSnapshot> {
 		let metadata = await this.refreshOwned(id);
 		if (!TERMINAL.has(metadata.status)) {
 			const instanceId = metadata.instanceId;
@@ -434,7 +434,7 @@ export class PwshTaskRuntime {
 				};
 			});
 		}
-		return this.snapshot(id);
+		return this.snapshot(id, 0, undefined, options);
 	}
 
 	async list(sessionId = this.sessionId): Promise<TaskMetadata[]> {
