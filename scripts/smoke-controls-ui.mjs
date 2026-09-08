@@ -43,6 +43,14 @@ await writeFile(fixture, `
 import pwsh from ${JSON.stringify((process.env.PI_TEST_PWSH_ENTRY ?? join(root, "src/index.ts")).replaceAll("\\", "/"))};
 import { registerTaskReporter } from ${JSON.stringify((process.env.PI_TEST_TASKS_ENTRY ?? fileURLToPath(import.meta.resolve("@4fu/pi-tasks"))).replaceAll("\\", "/"))};
 export default function(pi) {
+  const registerCommand = pi.registerCommand.bind(pi);
+  pi.registerCommand = (name, options) => registerCommand(name, name === "tasks" ? {
+    ...options, handler: async (...args) => {
+      await options.handler(...args);
+      args[1].ui.notify("SOAK_TASKS_CLOSED", "info");
+    }
+  } : options);
+  pi.registerCommand("soak-prompt-ready", { handler: async (_args, ctx) => ctx.ui.notify("SOAK_PROMPT_READY", "info") });
   // Elect a read-only reporter first to exercise routing to the pwsh owner.
   const reporter = registerTaskReporter(pi, "python");
   let catalogTimer;
@@ -90,7 +98,16 @@ try {
 	console.log(`PASS foreground detach: ${taskId}, child ${processPid} still alive`);
 	output = "";
 	send("/tasks\r");
-	await until(() => text().includes("READ_ONLY_REPORTER"), "shared task manager");
+	await until(() => text().includes("Enter inspect") && text().includes(`#${taskId}`), "active task manager");
+	assert.ok(!text().includes("READ_ONLY_REPORTER"), "inactive task leaked into default active view");
+	output = "";
+	send("\t");
+	// This is a render stream, not a screen: a late Active frame can precede the Inactive frame.
+	await until(() => text().includes("Tasks · Inactive") && text().includes("READ_ONLY_REPORTER"), "inactive history");
+	output = "";
+	send("\t");
+	await until(() => text().includes(`#${taskId}`) && text().includes("Enter inspect"), "return to active tasks");
+	console.log("PASS active default and Tab history toggle");
 	output = "";
 	send("\r");
 	await until(() => text().includes("log:") && text().includes("SOAK_STARTED"), "task output inspection");
@@ -111,6 +128,17 @@ try {
 	send("y");
 	await until(() => { try { process.kill(processPid, 0); return false; } catch { return true; } }, "confirmed process termination");
 	console.log("PASS cancel confirmation preserves process; confirmed stop terminates it");
+	await until(() => text().includes("SOAK_TASKS_CLOSED"), "last active stop closes viewer");
+	output = "";
+	send("/soak-prompt-ready\r");
+	await until(() => text().includes("SOAK_PROMPT_READY"), "prompt editor accepts commands after stop");
+	output = "";
+	send("/tasks\r");
+	await until(() => /No active tasks/i.test(text()), "empty active view remains accessible");
+	output = "";
+	send("\t");
+	await until(() => text().includes(`#${taskId}`) && text().includes("READ_ONLY_REPORTER"), "stopped task retained in inactive history");
+	console.log("PASS last-active stop returns to prompt; inactive history retains stopped task");
 	await writeFile(join(dir, "terminal.log"), transcript);
 	console.log(`PASS real ConPTY controls using ${runtime}\nArtifacts: ${dir}`);
 } finally {

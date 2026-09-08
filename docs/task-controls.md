@@ -20,10 +20,16 @@ The shortcut applies to waits after a task starts. It does not detach `!` or
 
 ## Inspect and stop tasks
 
-Open `/tasks` to select a task. Press **Enter** to inspect output, or **r** to
-refresh the view. For a running PowerShell task, press **k**, then confirm with
-**y** to stop its process tree. **Esc** cancels confirmation or returns from the
-output view without stopping anything.
+Open `/tasks` to select an active task. Press **Tab** to switch between active
+and inactive tasks. Press **Enter** to inspect output, or **r** to refresh the
+view. For a running PowerShell task, press **k**, then confirm with **y** to
+stop its process tree. **Esc** cancels confirmation or returns from the output
+view without stopping anything.
+
+After a successful stop, the task moves to inactive history. The viewer returns
+to the active list, or closes to the prompt if no active tasks remain. A failed
+stop keeps the error visible. Natural completion does not close the viewer, and
+an empty active view stays open so **Tab** can reach history. Logs are retained.
 
 The PowerShell output view includes the latest bounded snapshot and the full log
 path. A UI inspection does not consume the agent's completion notification. A UI
