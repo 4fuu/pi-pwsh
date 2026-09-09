@@ -466,6 +466,14 @@ export class PwshTaskRuntime {
 		}
 	}
 
+	async deleteInactive(id: string): Promise<TaskMetadata> {
+		const metadata = await this.refreshOwned(id);
+		if (!TERMINAL.has(metadata.status)) throw new Error("pwsh: active tasks cannot be deleted");
+		await rm(this.taskDirectoryPath(id), { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+		this.foreignTasks.delete(id);
+		this.terminalTasks.delete(id);
+		return metadata;
+	}
 	async cleanupExpired(): Promise<void> {
 		await mkdir(this.taskDir, { recursive: true, mode: 0o700 });
 		await chmod(this.taskDir, 0o700);

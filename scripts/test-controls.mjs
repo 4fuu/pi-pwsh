@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtemp, rm, access } from "node:fs/promises";
+import { mkdtemp, rm, access, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TaskWaits } from "../src/task-waits.ts";
 import { PwshTaskRuntime } from "../src/task-runtime.ts";
 import { DEFAULT_CONFIG } from "../src/config.ts";
 import { resolvePowerShellRuntime } from "../src/runtime.ts";
+import { TaskNotificationManager } from "../src/task-notifications.ts";
 
 const sample = { metadata: { id: "ps_1234abcd", status: "running" }, output: "working", ready: false, omittedBytes: 0 };
 function fakeRuntime() {
@@ -117,4 +118,77 @@ test("user stop kills the Windows process tree without consuming the agent notif
 		if (id) await runtime.stop(id);
 		await rm(dir, { recursive: true, force: true });
 	}
+});
+
+async function deletionFixture() {
+	const dir = await mkdtemp(join(tmpdir(), "pi-pwsh-delete-"));
+	const runtime = new PwshTaskRuntime({ ...DEFAULT_CONFIG, executable: process.execPath, args: [] }, { taskDir: dir, sessionId: "owner" });
+	const add = async (id, status = "completed", sessionId = "owner") => {
+		const directory = runtime.taskDirectoryPath(id), now = new Date().toISOString();
+		const metadata = { version: 1, id, instanceId: id.slice(3).repeat(4), sessionId, supervisorPid: process.pid,
+			cwd: dir, command: "fixture", commandSummary: "fixture", createdAt: now, updatedAt: now, status, exitCode: status === "completed" ? 0 : null };
+		await mkdir(directory);
+		await writeFile(join(directory, "meta.json"), JSON.stringify(metadata));
+		await writeFile(join(directory, "output.log"), "retained log");
+		return metadata;
+	};
+	return { dir, runtime, add };
+}
+
+test("delete removes owned inactive records and logs but rejects active, foreign and invalid IDs", async () => {
+	const { dir, runtime, add } = await deletionFixture();
+	try {
+		for (const [id, phase] of [["ps_11111111", "completed"], ["ps_22222222", "failed"], ["ps_33333333", "cancelled"]]) {
+			await add(id, phase);
+			assert.equal((await runtime.list()).length, 1); // Populate the terminal cache before deletion.
+			assert.equal((await runtime.deleteInactive(id)).id, id);
+			await assert.rejects(access(runtime.taskDirectoryPath(id)), { code: "ENOENT" });
+			assert.deepEqual(await runtime.list(), []);
+		}
+		await add("ps_44444444", "running");
+		await add("ps_55555555", "completed", "foreign");
+		await assert.rejects(runtime.deleteInactive("ps_44444444"), /active tasks cannot be deleted/);
+		await assert.rejects(runtime.deleteInactive("ps_55555555"), /different session/);
+		await assert.rejects(runtime.deleteInactive("../outside"));
+		await access(join(runtime.taskDirectoryPath("ps_44444444"), "output.log"));
+		await access(join(runtime.taskDirectoryPath("ps_55555555"), "output.log"));
+	} finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("observer deletion updates the catalog and late notification callbacks tolerate removed logs", async () => {
+	const { dir, runtime, add } = await deletionFixture();
+	let callbacks, catalog;
+	const observer = new TaskNotificationManager({ offer(_event, value) { callbacks = value; }, withdrawTask() {} },
+		{ publishCatalog(_session, tasks) { catalog = tasks; } }, { hasUI: false }, runtime, "owner", 0);
+	try {
+		const task = await add("ps_66666666");
+		await observer.start();
+		assert.equal(catalog.length, 1); assert.ok(callbacks);
+		await observer.deleteInactive(task.id);
+		assert.deepEqual(catalog, []);
+		await callbacks.onSubmitted();
+		await callbacks.onDelivered();
+		await callbacks.onWithdrawn("retry-exhausted");
+		await assert.rejects(access(runtime.taskDirectoryPath(task.id)), { code: "ENOENT" });
+	} finally { await observer.close(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test("deletion waits for an in-flight scan and concurrent deletions remain serialized", async () => {
+	const { dir, runtime, add } = await deletionFixture();
+	let release, entered, catalog;
+	const gate = new Promise(resolve => { release = resolve; });
+	const scanning = new Promise(resolve => { entered = resolve; });
+	const originalList = runtime.list.bind(runtime);
+	let blocked = true;
+	runtime.list = async (...args) => { if (blocked) { blocked = false; entered(); await gate; } return originalList(...args); };
+	const observer = new TaskNotificationManager({ offer() {}, withdrawTask() {} },
+		{ publishCatalog(_session, tasks) { catalog = tasks; } }, { hasUI: false }, runtime, "owner", 0);
+	try {
+		await add("ps_77777777"); await add("ps_88888888");
+		const started = observer.start(); await scanning;
+		const one = observer.deleteInactive("ps_77777777"), two = observer.deleteInactive("ps_88888888");
+		await access(runtime.taskDirectoryPath("ps_77777777"));
+		release(); await Promise.all([started, one, two]);
+		assert.deepEqual(catalog, []); assert.deepEqual(await runtime.list(), []);
+	} finally { release(); await observer.close(); await rm(dir, { recursive: true, force: true }); }
 });

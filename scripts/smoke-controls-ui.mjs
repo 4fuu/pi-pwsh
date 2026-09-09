@@ -2,7 +2,7 @@
 // PI_TEST_CLI selects the Pi CLI; PI_TEST_RUNTIME selects node or bun.
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { mkdtemp, writeFile, readFile } from "node:fs/promises";
+import { mkdtemp, writeFile, readFile, access } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -50,6 +50,13 @@ export default function(pi) {
       args[1].ui.notify("SOAK_TASKS_CLOSED", "info");
     }
   } : options);
+  const registerShortcut = pi.registerShortcut.bind(pi);
+  pi.registerShortcut = (key, options) => registerShortcut(key, key === "ctrl+alt+t" ? {
+    ...options, handler: async ctx => {
+      await options.handler(ctx);
+      ctx.ui.notify("SOAK_SHORTCUT_CLOSED", "info");
+    }
+  } : options);
   pi.registerCommand("soak-prompt-ready", { handler: async (_args, ctx) => ctx.ui.notify("SOAK_PROMPT_READY", "info") });
   // Elect a read-only reporter first to exercise routing to the pwsh owner.
   const reporter = registerTaskReporter(pi, "python");
@@ -94,6 +101,14 @@ try {
 	send("Start the soak task\r");
 	await until(async () => { try { processPid = Number((await readFile(readyPath, "utf8")).trim()); return processPid > 0; } catch { return false; } }, "PowerShell readiness");
 	await until(() => text().includes("Ctrl+Alt+B background"), "wait hint");
+	output = "";
+	send("\x1b\x14");
+	await until(() => text().includes("Tasks · Active") && text().includes("[inspect/stop]"), "task shortcut during foreground wait");
+	process.kill(processPid, 0);
+	send("\x1b");
+	await until(() => text().includes("SOAK_SHORTCUT_CLOSED"), "close task shortcut without aborting foreground wait");
+	output = "";
+	console.log("PASS Ctrl+Alt+T during a foreground wait");
 	send("\x1b\x02"); // Ctrl+Alt+B in legacy terminal encoding.
 	await until(() => text().includes("SOAK_DIALOG_AVAILABLE") && !!taskId, "foreground detach and model continuation");
 	process.kill(processPid, 0);
@@ -135,12 +150,22 @@ try {
 	send("/soak-prompt-ready\r");
 	await until(() => text().includes("SOAK_PROMPT_READY"), "prompt editor accepts commands after stop");
 	output = "";
-	send("/tasks\r");
+	send("\x1b\x14"); // Ctrl+Alt+T opens the same task viewer.
 	await until(() => /No active tasks/i.test(text()), "empty active view remains accessible");
 	output = "";
 	send("\t");
 	await until(() => text().includes(`#${taskId}`) && text().includes("READ_ONLY_REPORTER"), "stopped task retained in inactive history");
 	console.log("PASS last-active stop returns to prompt; inactive history retains stopped task");
+	output = "";
+	send("\x1b[F");
+	await until(() => text().includes(`> #${taskId}`) && text().includes("d delete"), "inactive delete action");
+	const taskDirectory = join(tmpdir(), "pi-pwsh-tasks", taskId);
+	await access(taskDirectory);
+	output = "";
+	send("d");
+	await until(async () => { try { await access(taskDirectory); return false; } catch (error) { return error.code === "ENOENT"; } }, "single deletion without confirmation");
+	await until(() => text().includes("READ_ONLY_REPORTER"), "inactive list after deletion");
+	console.log("PASS Ctrl+Alt+T and immediate inactive deletion, with logs removed");
 	await writeFile(join(dir, "terminal.log"), transcript);
 	console.log(`PASS real ConPTY controls using ${runtime}\nArtifacts: ${dir}`);
 } finally {

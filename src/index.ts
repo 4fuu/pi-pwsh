@@ -274,6 +274,12 @@ export default function pwshExtension(pi: ExtensionAPI): void {
 				await observer?.scanNow();
 				return taskText(snapshot);
 			},
+			async delete(taskId) {
+				const observer = notifications;
+				if (!observer) throw new Error("pwsh: task observer is unavailable");
+				await observer.deleteInactive(taskId);
+				return `Deleted ${taskId} and its logs.`;
+			},
 		},
 	});
 	const background = (ctx: ExtensionContext): void => {
