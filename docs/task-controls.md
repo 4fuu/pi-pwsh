@@ -12,8 +12,8 @@ The agent can continue the conversation and receives completion automatically.
 Use `/pwsh-background` if the terminal does not report that key combination. The
 command releases all current `pwsh` tool waits in this session.
 
-**Esc** still interrupts the agent turn. It does not stop persistent `pwsh`
-tasks. The new background control does not interrupt the agent turn.
+**Esc** interrupts the agent turn. It does not stop persistent `pwsh` tasks. The
+background control does not interrupt the agent turn.
 
 The shortcut applies to waits after a task starts. It does not detach `!` or
 `!!` commands, PTY attachment, Python tasks, MCP calls, or other tools.
@@ -46,6 +46,7 @@ checkout, install its normal dependencies, then install that local build:
 
 ```powershell
 npm ci
+Remove-Item -Recurse -Force node_modules/@4fu/pi-tasks
 npm install --no-save --package-lock=false --install-links ../pi-tasks-research-current
 npm test
 bun test ./scripts/test-controls.mjs
@@ -53,9 +54,11 @@ bun test ./scripts/test-controls.mjs
 
 The local package is a development override, not a published dependency change.
 `--install-links` installs a copy instead of a symlink, so both packages resolve
-the same Pi peer types. Reinstall the copy after rebuilding the shared package.
-Before upstream submission, agree on the shared package release and update the
-PowerShell dependency accordingly.
+the same Pi peer types. After rebuilding the shared package, remove the
+installed copy and repeat the local install command. Without removal, npm can
+reuse an older copy with the same package version. Before upstream submission,
+agree on the shared package release and update the PowerShell dependency
+accordingly.
 
 On Windows, `npm run test:controls-ui` tests the actual Pi TUI in ConPTY with a
 local scripted provider. It makes no paid model calls. `PI_TEST_CLI` can select

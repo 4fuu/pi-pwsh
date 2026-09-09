@@ -82,9 +82,11 @@ async function until(predicate, label, ms = 20000) {
 }
 function send(value) { terminal.write(value); }
 try {
+	// The fixture uses defaults, not the caller's executable, profile or config file.
+	const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.toUpperCase().startsWith("PI_PWSH_")));
 	terminal = pty.spawn(runtime, [cli, "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "-e", fixture, "--provider", "soak-local", "--model", "soak", "--thinking", "off"], {
 		cwd: dir, name: "xterm-256color", cols: 110, rows: 38,
-		env: { ...process.env, PI_CODING_AGENT_DIR: join(dir, "agent"), PI_SKIP_VERSION_CHECK: "1", PI_PWSH_REPLACE_USER_BASH: "false", BUN_BE_BUN: "1" },
+		env: { ...env, PI_CODING_AGENT_DIR: join(dir, "agent"), PI_SKIP_VERSION_CHECK: "1", PI_PWSH_REPLACE_USER_BASH: "false", BUN_BE_BUN: "1" },
 	});
 	terminal.onData(data => { output += data; transcript += data; });
 	terminal.onExit(() => { exited = true; });
