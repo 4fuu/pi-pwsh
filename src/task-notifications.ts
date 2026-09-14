@@ -81,6 +81,19 @@ export class TaskNotificationManager {
 		}
 	}
 
+	async deleteInactive(id: string): Promise<void> {
+		if (this.closed) throw new Error("pwsh: task observer is closed");
+		// Serialize deletion with catalog scans so no scan reads a removed directory.
+		const operation = (this.scanPromise ?? Promise.resolve()).then(async () => {
+			if (this.closed) throw new Error("pwsh: task observer is closed");
+			const metadata = await this.runtime.deleteInactive(id);
+			this.settledTerminalInstances.delete(metadata.instanceId);
+			await this.performScan();
+		});
+		this.scanPromise = operation;
+		try { await operation; }
+		finally { if (this.scanPromise === operation) this.scanPromise = undefined; }
+	}
 	private async performScan(): Promise<void> {
 		const tasks = (await this.runtime.list(this.sessionId)).sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
 		if (this.closed) return;
@@ -171,9 +184,14 @@ export class TaskNotificationManager {
 	}
 
 	private async settleNotified(metadata: TaskMetadata, kind: TaskNotificationKind): Promise<void> {
-		const handle = await open(this.notifiedPath(metadata, kind), "a", 0o600);
-		await handle.close();
-		await Promise.all([this.claimPath(metadata, kind), this.submittedPath(metadata, kind)].map(path => rm(path, { force: true })));
+		try {
+			const handle = await open(this.notifiedPath(metadata, kind), "a", 0o600);
+			await handle.close();
+			await Promise.all([this.claimPath(metadata, kind), this.submittedPath(metadata, kind)].map(path => rm(path, { force: true })));
+		} catch (error) {
+			// An in-flight notification may settle after the user deletes its task.
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
 	}
 
 	private async withdraw(metadata: TaskMetadata, kind: TaskNotificationKind, reason: TaskWithdrawalReason): Promise<void> {
@@ -188,16 +206,22 @@ export class TaskNotificationManager {
 				try {
 					await renameWithRetry(submitted, claim);
 				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
 					if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
 					await rm(submitted, { force: true });
 				}
 			}
 			if (!existsSync(claim)) {
-				const handle = await open(claim, "a", 0o600);
-				await handle.close();
+				try {
+					const handle = await open(claim, "a", 0o600);
+					await handle.close();
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+					throw error;
+				}
 			}
 			const now = new Date();
-			await utimes(claim, now, now);
+			await utimes(claim, now, now).catch((error: NodeJS.ErrnoException) => { if (error.code !== "ENOENT") throw error; });
 			return;
 		}
 		await Promise.all([this.claimPath(metadata, kind), this.submittedPath(metadata, kind)].map(path => rm(path, { force: true })));

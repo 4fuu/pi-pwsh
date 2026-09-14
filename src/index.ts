@@ -6,6 +6,7 @@ import {
 	getAgentDir,
 	type BashOperations,
 	type ExtensionAPI,
+	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { registerTaskCoordinator } from "@4fu/pi-task-coordinator";
@@ -22,6 +23,7 @@ import {
 } from "./spawn.ts";
 import { TaskNotificationManager } from "./task-notifications.ts";
 import { PwshTaskRuntime, type TaskSnapshot, type TaskStatus } from "./task-runtime.ts";
+import { TaskWaits } from "./task-waits.ts";
 
 const SOURCE_DIR = dirname(fileURLToPath(import.meta.url));
 const PTY_PATH = join(SOURCE_DIR, "powershell", "pty.ps1");
@@ -77,6 +79,7 @@ interface PwshParamsValue {
 
 interface PwshDetails {
 	version: 1;
+	backgrounded?: boolean;
 	taskId: string;
 	status: TaskStatus;
 	ready: boolean;
@@ -243,7 +246,7 @@ function statusTone(status: TaskStatus): "success" | "error" | "warning" | "mute
 }
 
 export default function pwshExtension(pi: ExtensionAPI): void {
-	const reporter = registerTaskReporter(pi, "pwsh");
+	const waits = new TaskWaits();
 	const coordinator = registerTaskCoordinator(pi, "pwsh");
 	let sessions: PwshSessionRuntime | undefined;
 	let tasks: PwshTaskRuntime | undefined;
@@ -251,6 +254,46 @@ export default function pwshExtension(pi: ExtensionAPI): void {
 	let operations: BashOperations | undefined;
 	let config: ReturnType<typeof loadConfig>["config"] | undefined;
 	let setupError: string | undefined;
+	const reporter = registerTaskReporter(pi, "pwsh", {
+		controls: {
+			async inspect(taskId) {
+				const runtime = tasks;
+				if (!runtime) throw new Error("pwsh: task runtime is unavailable");
+				const snapshot = await runtime.snapshot(taskId, 0, undefined, { claimTerminal: false });
+				let start = Math.max(0, snapshot.output.length - 12_000);
+				if (start && /[\uDC00-\uDFFF]/.test(snapshot.output[start])) start++;
+				snapshot.omittedBytes += Buffer.byteLength(snapshot.output.slice(0, start), "utf8");
+				snapshot.output = snapshot.output.slice(start);
+				return `log: ${join(runtime.taskDirectoryPath(taskId), "output.log")}\n${taskText(snapshot)}`;
+			},
+			async stop(taskId) {
+				const runtime = tasks, observer = notifications;
+				if (!runtime) throw new Error("pwsh: task runtime is unavailable");
+				// A user action must not consume the agent's cancellation notification.
+				const snapshot = await runtime.stop(taskId, { claimTerminal: false });
+				await observer?.scanNow();
+				return taskText(snapshot);
+			},
+			async delete(taskId) {
+				const observer = notifications;
+				if (!observer) throw new Error("pwsh: task observer is unavailable");
+				await observer.deleteInactive(taskId);
+				return `Deleted ${taskId} and its logs.`;
+			},
+		},
+	});
+	const background = (ctx: ExtensionContext): void => {
+		const count = waits.background();
+		ctx.ui.notify(count ? `Released ${count} pwsh wait(s); tasks keep running.` : "No foreground pwsh wait to release.", "info");
+	};
+	pi.registerCommand("pwsh-background", {
+		description: "Release foreground pwsh waits without stopping their tasks",
+		handler: async (_args, ctx) => background(ctx),
+	});
+	pi.registerShortcut("ctrl+alt+b", {
+		description: "Move waiting pwsh tasks to the background",
+		handler: background,
+	});
 	try {
 		config = loadConfig({ agentDir: getAgentDir() }).config;
 	} catch (error) {
@@ -280,10 +323,10 @@ export default function pwshExtension(pi: ExtensionAPI): void {
 					: coordinator.holdSource();
 				try {
 					let snapshot: TaskSnapshot;
+					let backgrounded = false;
 					if (params.taskId !== undefined) {
-						snapshot = params.stop
-							? await activeTasks.stop(params.taskId)
-							: await activeTasks.snapshot(params.taskId, waitSeconds, signal);
+						if (params.stop) snapshot = await activeTasks.stop(params.taskId);
+						else ({ snapshot, backgrounded } = await waits.snapshot(activeTasks, params.taskId, waitSeconds, signal));
 					} else {
 						const command = params.command as string;
 						const helper = helperPrelude(command);
@@ -297,7 +340,7 @@ export default function pwshExtension(pi: ExtensionAPI): void {
 						const releaseSource = release;
 						release = coordinator.holdTask(`pwsh:${metadata.id}`);
 						releaseSource();
-						snapshot = await activeTasks.snapshot(metadata.id, waitSeconds, signal);
+						({ snapshot, backgrounded } = await waits.snapshot(activeTasks, metadata.id, waitSeconds, signal));
 					}
 					if (snapshot.metadata.status !== "starting" && snapshot.metadata.status !== "running") {
 						coordinator.withdrawTask(`pwsh:${snapshot.metadata.id}`, ["ready", "terminal"], "presented");
@@ -309,8 +352,9 @@ export default function pwshExtension(pi: ExtensionAPI): void {
 						? activeTasks.taskDirectoryPath(snapshot.metadata.id)
 						: undefined;
 					return {
-						content: [{ type: "text" as const, text: taskText(snapshot, diagnosticsPath) }],
-						details: taskDetails(snapshot, diagnosticsPath),
+						content: [{ type: "text" as const, text: taskText(snapshot, diagnosticsPath)
+							+ (backgrounded ? "\nThe user moved this task to the background. Continue the conversation; do not immediately wait again. Completion will be reported automatically." : "") }],
+						details: { ...taskDetails(snapshot, diagnosticsPath), ...(backgrounded ? { backgrounded: true } : {}) },
 					};
 				} finally {
 					release();
@@ -324,6 +368,7 @@ export default function pwshExtension(pi: ExtensionAPI): void {
 					: `start · ${waitAction}`;
 				let header = `${theme.fg("toolTitle", theme.bold("pwsh"))} ${theme.fg("accent", args.taskId ?? "new task")} ${theme.fg("dim", `· ${action}`)}`;
 				if (args.notifyOn) header += theme.fg("dim", ` · notify on ${JSON.stringify(args.notifyOn)}`);
+				if (!args.stop && effectiveWait !== undefined && effectiveWait > 0) header += theme.fg("dim", " · Ctrl+Alt+B background");
 				const command = typeof args.command === "string" ? args.command.replace(/\r/g, "").replace(/\t/g, "   ") : "";
 				if (!command) return new Text(header, 0, 0);
 				const lines = command.split("\n");
@@ -336,7 +381,7 @@ export default function pwshExtension(pi: ExtensionAPI): void {
 				const elapsed = Math.max(0, Date.now() - Date.parse(details.createdAt));
 				const duration = `${(elapsed / 1_000).toFixed(1)}s`;
 				const tone = statusTone(details.status);
-				const header = `${theme.fg("toolTitle", theme.bold("pwsh"))} ${theme.fg("accent", details.taskId)} ${theme.fg(tone, details.status)} ${theme.fg("dim", `· ${duration}`)}`;
+				const header = `${theme.fg("toolTitle", theme.bold("pwsh"))} ${theme.fg("accent", details.taskId)} ${theme.fg(tone, details.status)} ${theme.fg("dim", `· ${duration}${details.backgrounded ? " · backgrounded" : ""}`)}`;
 				const output = sanitizeOutput(details.output).trimEnd();
 				const note = details.omittedBytes > 0 ? theme.fg("warning", `[${details.omittedBytes} earlier bytes omitted]`) : "";
 				if (!options.expanded) {

@@ -24,6 +24,7 @@ function createEventBus() {
 }
 
 const handlers = new Map();
+const commands = new Map(), shortcuts = new Map();
 let tool;
 let activeTools = ["bash", "read", "ls", "find", "grep"];
 const pi = {
@@ -33,7 +34,8 @@ const pi = {
 		handlers.set(event, values);
 	},
 	events: createEventBus(),
-	registerCommand() {},
+	registerCommand(name, definition) { commands.set(name, definition); },
+	registerShortcut(key, definition) { shortcuts.set(key, definition); },
 	registerTool(definition) { tool = definition; },
 	registerMessageRenderer() {},
 	sendMessage() {},
@@ -89,6 +91,7 @@ extension({
 	on(event, handler) { fallbackHandlers.set(event, [...(fallbackHandlers.get(event) ?? []), handler]); },
 	events: createEventBus(),
 	registerCommand() {},
+	registerShortcut() {},
 	registerTool() {},
 	registerMessageRenderer() {},
 	sendMessage() {},
@@ -155,6 +158,22 @@ async function assertPtyExitCode(name, command, expected) {
 }
 
 try {
+	assert.ok(commands.has("pwsh-background"));
+	assert.ok(shortcuts.has("ctrl+alt+b"));
+	const backgroundTask = await execute({ command: "Start-Sleep -Seconds 30", wait: 0 });
+	try {
+		const waiting = execute({ taskId: backgroundTask.details.taskId, wait: 120 });
+		shortcuts.get("ctrl+alt+b").handler(ctx);
+		const backgrounded = await waiting;
+		assert.equal(backgrounded.details.backgrounded, true);
+		assert.match(backgrounded.details.status, /^(?:starting|running)$/);
+		assert.match(backgrounded.content[0].text, /do not immediately wait again/);
+		const secondWait = execute({ taskId: backgroundTask.details.taskId, wait: 120 });
+		await commands.get("pwsh-background").handler("", ctx);
+		assert.equal((await secondWait).details.backgrounded, true);
+	} finally {
+		await execute({ taskId: backgroundTask.details.taskId, stop: true });
+	}
 	const defaultWait = await execute({ command: "Start-Sleep -Milliseconds 300; Write-Output DEFAULT_WAIT_COMPLETE" });
 	assert.equal(defaultWait.details.status, "completed");
 	assert.match(defaultWait.details.output, /DEFAULT_WAIT_COMPLETE/);

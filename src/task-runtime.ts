@@ -414,7 +414,7 @@ export class PwshTaskRuntime {
 		await this.markPresented(metadata, "ready");
 	}
 
-	async stop(id: string): Promise<TaskSnapshot> {
+	async stop(id: string, options: SnapshotOptions = {}): Promise<TaskSnapshot> {
 		let metadata = await this.refreshOwned(id);
 		if (!TERMINAL.has(metadata.status)) {
 			const instanceId = metadata.instanceId;
@@ -434,7 +434,7 @@ export class PwshTaskRuntime {
 				};
 			});
 		}
-		return this.snapshot(id);
+		return this.snapshot(id, 0, undefined, options);
 	}
 
 	async list(sessionId = this.sessionId): Promise<TaskMetadata[]> {
@@ -466,6 +466,14 @@ export class PwshTaskRuntime {
 		}
 	}
 
+	async deleteInactive(id: string): Promise<TaskMetadata> {
+		const metadata = await this.refreshOwned(id);
+		if (!TERMINAL.has(metadata.status)) throw new Error("pwsh: active tasks cannot be deleted");
+		await rm(this.taskDirectoryPath(id), { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+		this.foreignTasks.delete(id);
+		this.terminalTasks.delete(id);
+		return metadata;
+	}
 	async cleanupExpired(): Promise<void> {
 		await mkdir(this.taskDir, { recursive: true, mode: 0o700 });
 		await chmod(this.taskDir, 0o700);
