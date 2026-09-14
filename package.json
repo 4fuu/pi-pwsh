@@ -61,7 +61,7 @@
   },
   "dependencies": {
     "@4fu/pi-task-coordinator": "0.2.1",
-    "@4fu/pi-tasks": "0.1.2",
+    "@4fu/pi-tasks": "0.2.0",
     "@xterm/headless": "^6.0.0",
     "node-pty": "1.1.0"
   }
