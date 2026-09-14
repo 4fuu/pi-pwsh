@@ -74,7 +74,7 @@ test("background does not mask unrelated runtime failures", async () => {
 	assert.equal(waits.background(), 0);
 });
 
-test("real PowerShell task survives detach, then completes with its output", { timeout: 30000 }, async () => {
+test("real PowerShell task survives detach, then completes with its output", { timeout: 30000, skip: process.platform !== "win32" }, async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-pwsh-controls-"));
 	const runtime = new PwshTaskRuntime(await resolvePowerShellRuntime(DEFAULT_CONFIG), { taskDir: dir, sessionId: "controls" });
 	let id;
