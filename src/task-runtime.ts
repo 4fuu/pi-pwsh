@@ -183,6 +183,8 @@ function parseMetadata(value: unknown, id: string): TaskMetadata {
 	if (input.exitCode !== undefined && input.exitCode !== null && !Number.isInteger(input.exitCode)) throw new Error("invalid exit code");
 	if (input.error !== undefined && typeof input.error !== "string") throw new Error("invalid error");
 	if (input.failureKind !== undefined && input.failureKind !== "infrastructure") throw new Error("invalid failure kind");
+	// SAFETY: every field of `input` was validated above against the TaskMetadata
+	// invariants, so the unchecked widening cannot surface an invalid instance.
 	return input as unknown as TaskMetadata;
 }
 
