@@ -17,7 +17,12 @@ const id = "ps_1234abcd", task = runtime.taskDirectoryPath(id), now = new Date()
 await mkdir(task);
 const meta = { version: 1, id, instanceId: "a".repeat(32), sessionId: "two", supervisorPid: 0, cwd: dir, command: "x", commandSummary: "x", createdAt: now, updatedAt: now, status: "completed", exitCode: 0 };
 await writeFile(join(task, "meta.json"), JSON.stringify(meta)); await writeFile(join(task, "output.log"), "ok");
-for (const operation of [() => runtime.snapshot(id), () => runtime.snapshot(id, 1), () => runtime.stop(id)]) await assert.rejects(operation, /different session/);
+for (const operation of [() => runtime.snapshot(id), () => runtime.snapshot(id, 1)]) await assert.rejects(operation, /different session/);
+// Stop is intentionally not session-gated: tasks outlive their session, so a
+// zombie process from an ended session must remain stoppable.
+const stopped = await runtime.stop(id, { claimTerminal: false });
+assert.equal(stopped.metadata.status, "completed");
+assert.equal(stopped.output, "ok");
 
 runtime.setSessionId("two");
 const controller = new AbortController(); controller.abort(new Error("cancel wait"));

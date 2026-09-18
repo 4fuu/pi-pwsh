@@ -415,13 +415,17 @@ export class PwshTaskRuntime {
 	}
 
 	async stop(id: string, options: SnapshotOptions = {}): Promise<TaskSnapshot> {
-		let metadata = await this.refreshOwned(id);
+		// Session ownership is intentionally not enforced here: task ids are
+		// unguessable tokens, tasks outlive their session (zombie processes from
+		// an ended session were previously unstoppable), and stop is destructive
+		// by definition.
+		let metadata = await this.refresh(id);
 		if (!TERMINAL.has(metadata.status)) {
 			const instanceId = metadata.instanceId;
 			await writeFile(join(this.taskDirectoryPath(id), `${instanceId}.cancelled`), "", { flag: "a", mode: 0o600 });
 			await killProcessTree(metadata.supervisorPid || metadata.pid);
 			metadata = await this.updateMetadata(id, (current) => {
-				if (!current || current.sessionId !== this.sessionId || current.instanceId !== instanceId) {
+				if (!current || current.instanceId !== instanceId) {
 					throw new Error(`pwsh: task ${JSON.stringify(id)} changed while stopping`);
 				}
 				return {
@@ -434,7 +438,9 @@ export class PwshTaskRuntime {
 				};
 			});
 		}
-		return this.snapshot(id, 0, undefined, options);
+		const output = await this.tail(id);
+		if ((options.claimTerminal ?? true) && TERMINAL.has(metadata.status)) await this.markPresented(metadata);
+		return { metadata, ...output, ready: this.isReady(metadata) };
 	}
 
 	async list(sessionId = this.sessionId): Promise<TaskMetadata[]> {
