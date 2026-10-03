@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PwshTaskRuntime, renameWithRetry } from "../src/task-runtime.ts";
 import { mutateMetadataSnapshots, readLatestMetadataSnapshot } from "../src/task-metadata-store.mjs";
-import { validate, DESCRIPTION, PROMPT_GUIDELINE, PwshParams, taskDetails, taskText } from "../src/index.ts";
+import { validate, DESCRIPTION, PROMPT_GUIDELINE, PwshParams, taskDetails, taskText, waitGuidance } from "../src/index.ts";
 import { TaskNotificationManager } from "../src/task-notifications.ts";
 
 const dir = await mkdtemp(join(tmpdir(), "pi-pwsh-test-"));
@@ -224,6 +224,24 @@ assert.doesNotMatch(taskText(commandFailure, infraPath), /diagnosticsPath/);
 const signalFailure = { metadata: { ...modelMeta, status: "failed", exitCode: null, error: "PowerShell exited after signal SIGTERM" }, ready: false, output: "", omittedBytes: 0 };
 assert.match(taskText(signalFailure, infraPath), /error: PowerShell exited after signal SIGTERM/);
 assert.doesNotMatch(taskText(signalFailure, infraPath), /diagnosticsPath/);
+
+// An expired wait returns a running snapshot. Without guidance the model reads
+// it as an unfinished tool call and polls, burning a round trip per wait even
+// though the task notifies on its own. Every other outcome stays silent so the
+// model text keeps carrying only the snapshot it asked for.
+const waiting = { ...running, ready: false }; // no notifyOn: the snapshot is running because the window expired
+assert.match(waitGuidance(waiting, 60, false), /Do not poll it/);
+assert.match(waitGuidance(waiting, 1, false), /completion, failure, or cancellation arrives as a notification/);
+assert.equal(waitGuidance(waiting, 0, false), "", "an explicit wait: 0 is not an expired window");
+assert.equal(waitGuidance(successful, 60, false), "", "a terminal snapshot needs no guidance");
+assert.equal(waitGuidance(commandFailure, 60, false), "", "a failed snapshot needs no guidance");
+assert.equal(waitGuidance(cancelled, 60, false), "", "a cancelled snapshot needs no guidance");
+assert.match(waitGuidance(waiting, 60, true), /do not immediately wait again/, "the released-wait message replaces the timeout message");
+assert.match(waitGuidance(successful, 60, true), /do not immediately wait again/);
+// notifyOn ends the wait on readiness rather than on expiry, so the deadline
+// wording would be wrong even though the task is still running.
+assert.equal(waitGuidance(running, 60, false), "", "a readiness result is not an expired wait");
+assert.match(DESCRIPTION, /do not answer an expired wait with another wait/);
 
 // A launcher failure after task-directory allocation leaves real, useful
 // diagnostics behind and names that existing location in the thrown error.

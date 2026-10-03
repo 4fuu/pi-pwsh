@@ -180,9 +180,22 @@ try {
 
 	const immediate = await execute({ command: "Start-Sleep -Milliseconds 1500; Write-Output TASK_ID_DEFAULT_WAIT", wait: 0 });
 	assert.match(immediate.details.status, /^(?:starting|running)$/);
+	assert.doesNotMatch(immediate.content[0].text, /Do not poll it/, "an explicit wait: 0 asks for the snapshot without a window");
 	const waitedByTaskId = await execute({ taskId: immediate.details.taskId });
 	assert.equal(waitedByTaskId.details.status, "completed");
 	assert.match(waitedByTaskId.details.output, /TASK_ID_DEFAULT_WAIT/);
+	assert.doesNotMatch(waitedByTaskId.content[0].text, /Do not poll it/, "a wait that reaches a terminal status needs no guidance");
+
+	// Only a real expiry reaches the timeout branch, so the instruction not to
+	// poll is asserted end to end against a task that outlives its window.
+	const expiring = await execute({ command: "Start-Sleep -Seconds 30", wait: 1 });
+	try {
+		assert.match(expiring.details.status, /^(?:starting|running)$/);
+		assert.equal(expiring.details.backgrounded, undefined);
+		assert.match(expiring.content[0].text, /Do not poll it/);
+	} finally {
+		await execute({ taskId: expiring.details.taskId, stop: true });
+	}
 
 	const selectedObject = await run("Write-Output 'before'; [pscustomobject]@{Name='x';State='y'} | Select-Object Name, State; Write-Output 'after'");
 	assert.match(selectedObject, /before/);
