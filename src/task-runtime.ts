@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import {
 	chmod,
 	mkdir,
@@ -58,6 +58,23 @@ const MAX_OUTPUT_BYTES = 50 * 1024;
 const MAX_NOTIFY_BYTES = 256;
 const RETENTION_MS = 24 * 60 * 60 * 1000;
 const START_GRACE_MS = 10_000;
+const SUPERVISOR_LOST_ERROR = "Task supervisor exited without final status";
+const LAUNCHER_STALE_ERROR = "Task launcher did not become ready";
+
+function supervisorLost(metadata: TaskMetadata): boolean {
+	return metadata.status === "failed"
+		&& metadata.failureKind === "infrastructure"
+		&& (metadata.error === SUPERVISOR_LOST_ERROR || metadata.error === LAUNCHER_STALE_ERROR);
+}
+
+/** A real command exit. A supervisor-loss record is not one: its child can still be running. */
+function commandExited(metadata: TaskMetadata): boolean {
+	if (metadata.status === "completed" || metadata.status === "cancelled") return true;
+	return metadata.status === "failed"
+		&& !supervisorLost(metadata)
+		&& metadata.exitCode !== undefined
+		&& metadata.exitCode !== null;
+}
 const LAUNCHER = join(dirname(fileURLToPath(import.meta.url)), "task-launcher.mjs");
 
 async function writeJsonAtomic(path: string, value: unknown): Promise<void> {
@@ -116,25 +133,77 @@ async function killProcessTree(pid?: number): Promise<void> {
 		return;
 	}
 
-	try {
-		process.kill(-pid, "SIGTERM");
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ESRCH") return;
-		throw error;
-	}
-	await new Promise((resolve) => setTimeout(resolve, 300));
-	if (isProcessGroupAlive(pid)) {
+	const signaled = (target: number, sig: NodeJS.Signals): boolean => {
 		try {
-			process.kill(-pid, "SIGKILL");
+			process.kill(target, sig);
+			return true;
 		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+			if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
+			throw error;
 		}
+	};
+	if (signaled(-pid, "SIGTERM")) {
+		await new Promise((resolve) => setTimeout(resolve, 300));
+		if (isProcessGroupAlive(pid)) signaled(-pid, "SIGKILL");
+		const deadline = Date.now() + 2_000;
+		while (isProcessGroupAlive(pid) && Date.now() < deadline) {
+			await new Promise((resolve) => setTimeout(resolve, 50));
+		}
+		if (isProcessGroupAlive(pid)) throw new Error(`pwsh: process tree ${pid} did not terminate`);
+		return;
 	}
+	// Not a process group. Snapshot descendants before the signal: a default
+	// action exits the root immediately and reparents them away from this pid.
+	const descendants = descendantPids(pid);
+	const rootSignaled = signaled(pid, "SIGTERM");
+	let signaledDescendant = false;
+	for (const child of descendants) {
+		if (signaled(child, "SIGTERM")) signaledDescendant = true;
+	}
+	if (!rootSignaled && !signaledDescendant) return;
+	await new Promise((resolve) => setTimeout(resolve, 300));
+	if (isAlive(pid)) signaled(pid, "SIGKILL");
+	for (const child of descendants) if (isAlive(child)) signaled(child, "SIGKILL");
 	const deadline = Date.now() + 2_000;
-	while (isProcessGroupAlive(pid) && Date.now() < deadline) {
+	const alive = (): boolean => isAlive(pid) || descendants.some((child) => isAlive(child));
+	while (alive() && Date.now() < deadline) {
 		await new Promise((resolve) => setTimeout(resolve, 50));
 	}
-	if (isProcessGroupAlive(pid)) throw new Error(`pwsh: process tree ${pid} did not terminate`);
+	if (alive()) throw new Error(`pwsh: process tree ${pid} did not terminate`);
+}
+
+function descendantPids(root: number): number[] {
+	if (process.platform !== "linux") return [];
+	const children = new Map<number, number[]>();
+	try {
+		for (const name of readdirSync("/proc")) {
+			if (!/^\d+$/.test(name)) continue;
+			let stat: string;
+			try {
+				stat = readFileSync(`/proc/${name}/stat`, "utf8");
+			} catch {
+				continue;
+			}
+			const close = stat.lastIndexOf(")");
+			if (close < 0) continue;
+			const ppid = Number(stat.slice(close + 2).trim().split(/\s+/)[1]);
+			const pid = Number(name);
+			const list = children.get(ppid);
+			if (list) list.push(pid);
+			else children.set(ppid, [pid]);
+		}
+	} catch {
+		return [];
+	}
+	const result: number[] = [];
+	const stack = [...(children.get(root) ?? [])];
+	while (stack.length > 0) {
+		const pid = stack.pop();
+		if (pid === undefined) break;
+		result.push(pid);
+		stack.push(...(children.get(pid) ?? []));
+	}
+	return result;
 }
 
 function waitDelay(ms: number, signal?: AbortSignal): Promise<void> {
@@ -205,8 +274,13 @@ export class PwshTaskRuntime {
 	 * never changes and a foreign task never has to be read twice.
 	 */
 	private foreignTasks = new Set<string>();
-	/** Terminal metadata is immutable, so list polling only needs to refresh active tasks. */
+	/**
+	 * Cached terminal snapshots for list polling. Active tasks are not stored.
+	 * stop() replaces an entry when it rewrites a supervisor-loss record.
+	 */
 	private terminalTasks = new Map<string, TaskMetadata>();
+	/** Bumped when a terminal snapshot is published, so an in-flight read cannot put the old one back. */
+	private terminalEpoch = new Map<string, number>();
 
 	constructor(
 		readonly pwsh: ResolvedPwshRuntime,
@@ -220,6 +294,7 @@ export class PwshTaskRuntime {
 		if (id !== this.sessionId) {
 			this.foreignTasks.clear();
 			this.terminalTasks.clear();
+			this.terminalEpoch.clear();
 		}
 		this.sessionId = id;
 	}
@@ -235,11 +310,13 @@ export class PwshTaskRuntime {
 		notifyOn?: string,
 		executionPrefix = "",
 		extraEnv: Readonly<Record<string, string>> = {},
+		signal?: AbortSignal,
 	): Promise<TaskMetadata> {
 		if (!command) throw new Error("pwsh: command must not be empty");
 		if (notifyOn !== undefined && (notifyOn.length === 0 || Buffer.byteLength(notifyOn, "utf8") > MAX_NOTIFY_BYTES)) {
 			throw new Error("pwsh: notifyOn must contain 1 to 256 UTF-8 bytes");
 		}
+		if (signal?.aborted) throw new Error("aborted");
 		await this.cleanupExpired();
 		await mkdir(this.taskDir, { recursive: true, mode: 0o700 });
 		await chmod(this.taskDir, 0o700);
@@ -323,12 +400,18 @@ export class PwshTaskRuntime {
 				windowsHide: true,
 			});
 			launcherPid = launcher.pid ?? 0;
-			await new Promise<void>((resolve, reject) => {
-				let settled = false;
-				const finish = (error?: Error) => {
+			// The launcher sends ready and disconnects as soon as its child spawns.
+			// Those IPC events are dropped if nobody is listening, so the handlers
+			// have to be attached before the first await.
+			let settled = false;
+			let finish: (error?: Error) => void;
+			const ready = new Promise<void>((resolve, reject) => {
+				const onAbort = () => finish(new Error("aborted"));
+				finish = (error?: Error) => {
 					if (settled) return;
 					settled = true;
 					clearTimeout(timer);
+					signal?.removeEventListener("abort", onAbort);
 					launcher.removeListener("error", onError);
 					launcher.removeListener("exit", onExit);
 					launcher.removeListener("disconnect", onDisconnect);
@@ -350,9 +433,30 @@ export class PwshTaskRuntime {
 				launcher.once("exit", onExit);
 				launcher.once("disconnect", onDisconnect);
 				launcher.on("message", onMessage);
+				if (signal) {
+					if (signal.aborted) onAbort();
+					else signal.addEventListener("abort", onAbort, { once: true });
+				}
 			});
+			let readyError: Error | undefined;
+			const readySettled = ready.then(() => undefined, (error: unknown) => {
+				readyError = error instanceof Error ? error : new Error(String(error));
+			});
+			// stop() needs this pid if the call is aborted before the launcher publishes its own.
+			if (launcherPid > 0) {
+				await this.updateMetadata(id, (current) => {
+					if (!current || current.instanceId !== instanceId) {
+						throw new Error("pwsh: task metadata changed during startup");
+					}
+					if (current.supervisorPid > 0) return undefined;
+					return { ...current, supervisorPid: launcherPid, updatedAt: new Date().toISOString() };
+				});
+			}
+			await readySettled;
+			if (readyError) throw readyError;
 			if (launcher.connected) launcher.disconnect();
 			launcher.unref();
+			if (signal?.aborted) throw new Error("aborted");
 			return await this.refreshOwned(id);
 		} catch (error) {
 			const startupMessage = error instanceof Error ? error.message : String(error);
@@ -362,27 +466,84 @@ export class PwshTaskRuntime {
 			} catch (cleanupError) {
 				cleanupErrors.push(`cancel marker: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`);
 			}
+			const aborted = signal?.aborted || startupMessage === "aborted";
+			// refresh() marks the supervisor failed as soon as its pid is dead.
+			// The marker has to exist before taskkill, or that scan offers a terminal task.
 			try {
-				await killProcessTree(launcherPid);
-			} catch (cleanupError) {
-				cleanupErrors.push(`process cleanup: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`);
+				const handle = await open(join(directory, `${instanceId}.exit.presented`), "wx", 0o600);
+				await handle.close();
+			} catch (markerError) {
+				if ((markerError as NodeJS.ErrnoException).code !== "EEXIST") {
+					cleanupErrors.push(`presented marker: ${markerError instanceof Error ? markerError.message : String(markerError)}`);
+				}
 			}
+			// taskkill /T on a live launcher already includes its child. Killing that
+			// pid again can hit whoever reused the number. A dead launcher does not.
+			let childPid: number | undefined;
+			try {
+				const current = await this.readMetadata(id);
+				if (current.instanceId === instanceId && current.pid && current.pid > 0 && !commandExited(current)) {
+					childPid = current.pid;
+				}
+			} catch {
+				// The record may not exist yet. The launcher pid is still killed below.
+			}
+			const launcherAlive = launcherPid > 0 && isAlive(launcherPid);
+			const startupTargets = [launcherPid];
+			if (!launcherAlive && childPid && childPid !== launcherPid) startupTargets.push(childPid);
+			for (const pid of startupTargets.filter((pid) => pid > 0)) {
+				try {
+					await killProcessTree(pid);
+				} catch (cleanupError) {
+					cleanupErrors.push(`process cleanup: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`);
+				}
+			}
+			if (aborted) {
+				try {
+					const updated = await this.updateMetadata(id, (current) => {
+						if (!current || current.instanceId !== instanceId) return undefined;
+						// A scan during taskkill may already have stored infrastructure failed.
+						if (current.status === "completed" || current.status === "cancelled") return undefined;
+						if (current.status === "failed" && !supervisorLost(current)) return undefined;
+						return {
+							...current,
+							status: "cancelled",
+							exitCode: null,
+							error: undefined,
+							failureKind: undefined,
+							updatedAt: new Date().toISOString(),
+						};
+					});
+					this.rememberTerminal(updated);
+				} catch {
+					// The abort still has to surface if the record cannot be updated.
+				}
+				if (cleanupErrors.length > 0) throw new Error(`aborted; cleanup failed (${cleanupErrors.join("; ")})`);
+				throw new Error("aborted");
+			}
+			// Allocation succeeded, so retain the task artifacts and make startup
+			// failures inspectable just like asynchronous infrastructure failures.
 			const message = cleanupErrors.length > 0
 				? `${startupMessage}; cleanup failed (${cleanupErrors.join("; ")})`
 				: startupMessage;
-			// Allocation succeeded, so retain the task artifacts and make startup
-			// failures inspectable just like asynchronous infrastructure failures.
-			const failed = {
-				...metadata,
-				status: "failed" as const,
-				exitCode: null,
-				error: message,
-				failureKind: "infrastructure" as const,
-				updatedAt: new Date().toISOString(),
-			};
 			await Promise.allSettled([
 				writeFile(logPath, `[pi-pwsh startup failure] ${message}\n`, { encoding: "utf8", mode: 0o600, flag: "a" }),
-				this.updateMetadata(id, () => failed, true),
+				this.updateMetadata(id, (current) => {
+					if (current && current.instanceId !== instanceId) return undefined;
+					if (current?.status === "completed" || current?.status === "cancelled") return undefined;
+					if (current?.status === "failed" && !supervisorLost(current)) return undefined;
+					// The object captured at allocation still has supervisorPid 0.
+					// The pid written before ready has to survive this failure record.
+					const base = current?.instanceId === instanceId ? current : metadata;
+					return {
+						...base,
+						status: "failed",
+						exitCode: null,
+						error: message,
+						failureKind: "infrastructure",
+						updatedAt: new Date().toISOString(),
+					};
+				}, true),
 				writeFile(join(directory, `${instanceId}.exit.presented`), "", { flag: "a", mode: 0o600 }),
 			]);
 			if (directory && existsSync(directory)) {
@@ -412,6 +573,56 @@ export class PwshTaskRuntime {
 		return { metadata, ...output, ready };
 	}
 
+	/** Wait until the task exits. Abort stops the process tree instead of leaving it running. */
+	async waitUntilExit(id: string, signal?: AbortSignal): Promise<TaskSnapshot> {
+		try {
+			signal?.throwIfAborted();
+			let metadata = await this.refreshOwned(id);
+			while (!TERMINAL.has(metadata.status)) {
+				await waitDelay(50, signal);
+				metadata = await this.refreshOwned(id);
+			}
+			signal?.throwIfAborted();
+			// This status means the supervisor pid is dead, not that the child exited.
+			// Foreground mode has no later stop, so the wait has to kill the child itself.
+			if (supervisorLost(metadata)) {
+				let stopped: TaskSnapshot;
+				try {
+					stopped = await this.stop(id);
+				} catch (stopError) {
+					if (!signal?.aborted) throw stopError;
+					// stop already ran. Calling it again sees cancelled and will not kill.
+					const detail = stopError instanceof Error ? stopError.message : String(stopError);
+					const nested = detail.startsWith("cleanup failed (") && detail.endsWith(")")
+						? detail.slice("cleanup failed (".length, -1)
+						: detail;
+					throw new Error(`aborted; cleanup failed (${nested})`);
+				}
+				signal?.throwIfAborted();
+				return stopped;
+			}
+			const output = await this.tail(id);
+			await this.markPresented(metadata);
+			return { metadata, ...output, ready: this.isReady(metadata) };
+		} catch (error) {
+			if (signal?.aborted) {
+				const detail = error instanceof Error ? error.message : String(error);
+				if (detail === "aborted" || detail.startsWith("aborted;")) throw error;
+				try {
+					await this.stop(id);
+				} catch (stopError) {
+					const stopDetail = stopError instanceof Error ? stopError.message : String(stopError);
+					const nested = stopDetail.startsWith("cleanup failed (") && stopDetail.endsWith(")")
+						? stopDetail.slice("cleanup failed (".length, -1)
+						: stopDetail;
+					throw new Error(`aborted; cleanup failed (${nested})`);
+				}
+				throw new Error("aborted");
+			}
+			throw error;
+		}
+	}
+
 	async markReadyPresented(metadata: TaskMetadata): Promise<void> {
 		await this.markPresented(metadata, "ready");
 	}
@@ -422,14 +633,55 @@ export class PwshTaskRuntime {
 		// an ended session were previously unstoppable), and stop is destructive
 		// by definition.
 		let metadata = await this.refresh(id);
-		if (!TERMINAL.has(metadata.status)) {
+		// Those two errors are refresh() giving up on a dead supervisor, not a
+		// command result. The child can still be running.
+		const lost = supervisorLost(metadata);
+		if (!TERMINAL.has(metadata.status) || lost) {
 			const instanceId = metadata.instanceId;
-			await writeFile(join(this.taskDirectoryPath(id), `${instanceId}.cancelled`), "", { flag: "a", mode: 0o600 });
-			await killProcessTree(metadata.supervisorPid || metadata.pid);
+			const cleanupErrors: string[] = [];
+			try {
+				await writeFile(join(this.taskDirectoryPath(id), `${instanceId}.cancelled`), "", { flag: "a", mode: 0o600 });
+			} catch (cleanupError) {
+				cleanupErrors.push(`cancel marker: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`);
+			}
+			// refresh() publishes failed as soon as the supervisor pid is dead.
+			// The marker has to exist before taskkill, or that scan offers the task.
+			if (options.claimTerminal ?? true) {
+				try {
+					await this.markPresented(metadata);
+				} catch (cleanupError) {
+					cleanupErrors.push(`presented marker: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`);
+				}
+			}
+			// taskkill /T on a live supervisor already includes its child. The child
+			// pid is a separate target only once that supervisor has died.
+			const supervisorAlive = metadata.supervisorPid > 0 && isAlive(metadata.supervisorPid);
+			const targets: number[] = [];
+			if (metadata.supervisorPid > 0) targets.push(metadata.supervisorPid);
+			if (
+				!supervisorAlive
+				&& metadata.pid
+				&& metadata.pid > 0
+				&& metadata.pid !== metadata.supervisorPid
+				&& !commandExited(metadata)
+			) {
+				targets.push(metadata.pid);
+			}
+			for (const pid of targets) {
+				try {
+					await killProcessTree(pid);
+				} catch (cleanupError) {
+					cleanupErrors.push(`process cleanup: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`);
+				}
+			}
 			metadata = await this.updateMetadata(id, (current) => {
 				if (!current || current.instanceId !== instanceId) {
 					throw new Error(`pwsh: task ${JSON.stringify(id)} changed while stopping`);
 				}
+				// The command can finish on its own before this write.
+				// A failed record it published is that result. Only supervisor loss is rewritten.
+				if (current.status === "completed" || current.status === "cancelled") return undefined;
+				if (current.status === "failed" && !supervisorLost(current)) return undefined;
 				return {
 					...current,
 					status: "cancelled",
@@ -439,6 +691,8 @@ export class PwshTaskRuntime {
 					updatedAt: new Date().toISOString(),
 				};
 			});
+			this.rememberTerminal(metadata);
+			if (cleanupErrors.length > 0) throw new Error(`cleanup failed (${cleanupErrors.join("; ")})`);
 		}
 		const output = await this.tail(id);
 		if ((options.claimTerminal ?? true) && TERMINAL.has(metadata.status)) await this.markPresented(metadata);
@@ -452,7 +706,11 @@ export class PwshTaskRuntime {
 		const tasks = (await this.readAll({ skipForeign: ownView })).filter((metadata) => !sessionId || metadata.sessionId === sessionId);
 		return Promise.all(tasks.map(async (metadata) => {
 			if (metadata.sessionId !== this.sessionId || TERMINAL.has(metadata.status)) return metadata;
+			const seen = this.terminalEpoch.get(metadata.id) ?? 0;
 			const refreshed = await this.refreshOwned(metadata.id);
+			if ((this.terminalEpoch.get(metadata.id) ?? 0) !== seen) {
+				return this.terminalTasks.get(metadata.id) ?? refreshed;
+			}
 			if (TERMINAL.has(refreshed.status)) this.terminalTasks.set(refreshed.id, refreshed);
 			return refreshed;
 		}));
@@ -536,6 +794,15 @@ export class PwshTaskRuntime {
 		return validated;
 	}
 
+	private rememberTerminal(metadata: TaskMetadata): void {
+		this.terminalEpoch.set(metadata.id, (this.terminalEpoch.get(metadata.id) ?? 0) + 1);
+		if (metadata.sessionId !== this.sessionId || !TERMINAL.has(metadata.status)) {
+			this.terminalTasks.delete(metadata.id);
+			return;
+		}
+		this.terminalTasks.set(metadata.id, metadata);
+	}
+
 	private async refreshOwned(id: string): Promise<TaskMetadata> {
 		const initial = await this.readMetadata(id);
 		if (initial.sessionId !== this.sessionId) {
@@ -567,7 +834,7 @@ export class PwshTaskRuntime {
 				...current,
 				status: "failed",
 				exitCode: null,
-				error: staleStart ? "Task launcher did not become ready" : "Task supervisor exited without final status",
+				error: staleStart ? LAUNCHER_STALE_ERROR : SUPERVISOR_LOST_ERROR,
 				failureKind: "infrastructure",
 				updatedAt: new Date().toISOString(),
 			};
@@ -602,12 +869,17 @@ export class PwshTaskRuntime {
 				if (terminal) return terminal;
 			}
 			try {
+				const seen = this.terminalEpoch.get(id) ?? 0;
 				const metadata = await this.readMetadata(id);
 				if (metadata.sessionId !== this.sessionId) {
 					this.foreignTasks.add(id);
 					this.terminalTasks.delete(id);
 				} else {
 					this.foreignTasks.delete(id);
+					// stop() may have published a newer snapshot while this read was in flight.
+					if ((this.terminalEpoch.get(id) ?? 0) !== seen) {
+						return this.terminalTasks.get(id) ?? metadata;
+					}
 					if (TERMINAL.has(metadata.status)) this.terminalTasks.set(id, metadata);
 					else this.terminalTasks.delete(id);
 				}
