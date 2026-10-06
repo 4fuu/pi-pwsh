@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { TaskCoordinator, TaskNotificationKind, TaskWithdrawalReason } from "@4fu/pi-task-coordinator";
 import type { PresentedTask, TaskReporter } from "@4fu/pi-tasks";
-import { PwshTaskRuntime, renameWithRetry, type TaskMetadata, type TaskSnapshot } from "./task-runtime.ts";
+import { PwshTaskRuntime, renameWithRetry, supervisorLost, type TaskMetadata, type TaskSnapshot } from "./task-runtime.ts";
 
 const DEFAULT_POLL_MS = 400;
 const MAX_NOTIFICATION_LINES = 20;
@@ -109,7 +109,7 @@ export class TaskNotificationManager {
 		}
 		const catalog: PresentedTask[] = tasks.map((listed) => {
 			const snapshot = snapshotsById.get(listed.id);
-			const metadata = snapshot?.metadata ?? listed;
+			const metadata = this.announced(snapshot?.metadata ?? listed);
 			const ready = snapshot?.ready ?? false;
 			const active = !isTerminal(metadata);
 			const createdAt = Date.parse(metadata.createdAt);
@@ -150,12 +150,13 @@ export class TaskNotificationManager {
 			return;
 		}
 		const eventId = `pwsh:${metadata.instanceId}:${kind}`;
+		const visible = this.announced(metadata);
 		this.coordinator.offer({
 			eventId, taskKey: `pwsh:${metadata.id}`, source: "pwsh", taskId: metadata.id, event: kind,
-			status: kind === "ready" ? "ready" : metadata.status,
+			status: kind === "ready" ? "ready" : visible.status,
 			durationMs: Math.max(0, Date.now() - Date.parse(metadata.createdAt)),
 			summary: metadata.commandSummary, output: boundedOutput(output),
-			ok: kind === "ready" || metadata.status === "completed", occurredAt: Date.parse(metadata.updatedAt),
+			ok: kind === "ready" || visible.status === "completed", occurredAt: Date.parse(metadata.updatedAt),
 		}, {
 			onSubmitted: async () => this.moveToSubmitted(metadata, kind),
 			onDelivered: async () => this.settleNotified(metadata, kind),
@@ -262,6 +263,21 @@ export class TaskNotificationManager {
 		} catch {
 			void this.close().catch(() => {});
 		}
+	}
+
+	/**
+	 * Stop writes the cancel marker before taskkill, and refresh publishes
+	 * supervisor-loss as soon as that pid is dead. The one terminal event has
+	 * to say cancelled. A presented marker belongs to startup, which writes
+	 * its own failure after the kill and must not be relabeled.
+	 */
+	private announced(metadata: TaskMetadata): TaskMetadata {
+		if (!supervisorLost(metadata)) return metadata;
+		const directory = this.runtime.taskDirectoryPath(metadata.id);
+		const cancelled = existsSync(join(directory, `${metadata.instanceId}.cancelled`));
+		const presented = existsSync(join(directory, `${metadata.instanceId}.exit.presented`));
+		if (!cancelled || presented) return metadata;
+		return { ...metadata, status: "cancelled", exitCode: null, error: undefined, failureKind: undefined };
 	}
 
 	private base(metadata: TaskMetadata, kind: TaskNotificationKind): string {

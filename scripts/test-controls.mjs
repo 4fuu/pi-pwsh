@@ -271,6 +271,19 @@ function detachedSleeper() {
 	return spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore", windowsHide: true });
 }
 
+function deadSupervisorPid() {
+	const ghost = 2_147_483_647;
+	let alive = false;
+	try {
+		process.kill(ghost, 0);
+		alive = true;
+	} catch (error) {
+		alive = error?.code === "EPERM";
+	}
+	assert.equal(alive, false);
+	return ghost;
+}
+
 async function parkedTask(runtime, id, fields) {
 	const directory = runtime.taskDirectoryPath(id);
 	const now = new Date().toISOString();
@@ -494,6 +507,132 @@ test("list does not keep a supervisor-loss failure after stop", async () => {
 		assert.equal((await runtime.stop(id)).metadata.status, "cancelled");
 		assert.equal((await runtime.list()).find((task) => task.id === id)?.status, "cancelled");
 	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("a cancel marker is announced as cancelled while the record is still supervisor loss", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-pwsh-announce-cancel-"));
+	const runtime = new PwshTaskRuntime(await resolvePowerShellRuntime(DEFAULT_CONFIG), { taskDir: dir, sessionId: "foreground" });
+	const child = detachedSleeper();
+	const ghost = deadSupervisorPid();
+	let offered;
+	let catalog = [];
+	const observer = new TaskNotificationManager(
+		{ offer(event) { offered = event; }, withdrawTask() {} },
+		{ publishCatalog(_session, tasks) { catalog = tasks; } },
+		{ hasUI: false }, runtime, "foreground", 0,
+	);
+	try {
+		await new Promise((resolve, reject) => { child.once("spawn", resolve); child.once("error", reject); });
+		const id = "ps_c99c99c9";
+		const parked = await parkedTask(runtime, id, { supervisorPid: ghost, pid: child.pid });
+		await writeFile(join(parked.directory, `${parked.instanceId}.cancelled`), "");
+		await observer.start();
+		assert.equal(offered?.status, "cancelled");
+		assert.equal(catalog.find((task) => task.taskId === id)?.phase, "cancelled");
+		process.kill(child.pid, 0);
+		const disk = await runtime.readMetadata(id);
+		assert.equal(disk.status, "failed");
+		assert.equal(disk.error, "Task supervisor exited without final status");
+		const stopped = await runtime.stop(id);
+		assert.equal(stopped.metadata.status, "cancelled");
+		assert.throws(() => process.kill(child.pid, 0));
+	} finally {
+		await observer.close();
+		if (child.exitCode === null) child.kill();
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("a presented startup failure is not announced as a user cancellation", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-pwsh-announce-startup-"));
+	const runtime = new PwshTaskRuntime(await resolvePowerShellRuntime(DEFAULT_CONFIG), { taskDir: dir, sessionId: "foreground" });
+	const child = detachedSleeper();
+	const ghost = deadSupervisorPid();
+	let offered;
+	let catalog = [];
+	const observer = new TaskNotificationManager(
+		{ offer(event) { offered = event; }, withdrawTask() {} },
+		{ publishCatalog(_session, tasks) { catalog = tasks; } },
+		{ hasUI: false }, runtime, "foreground", 0,
+	);
+	try {
+		await new Promise((resolve, reject) => { child.once("spawn", resolve); child.once("error", reject); });
+		const id = "ps_d00d00d0";
+		const parked = await parkedTask(runtime, id, { supervisorPid: ghost, pid: child.pid });
+		await writeFile(join(parked.directory, `${parked.instanceId}.cancelled`), "");
+		await writeFile(join(parked.directory, `${parked.instanceId}.exit.presented`), "");
+		await observer.start();
+		assert.equal(offered, undefined);
+		assert.equal(catalog.find((task) => task.taskId === id)?.statusLabel, "failed");
+		process.kill(child.pid, 0);
+	} finally {
+		await observer.close();
+		if (child.exitCode === null) child.kill();
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("deleting supervisor loss kills the recorded child and keeps an exited command", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-pwsh-delete-orphan-"));
+	const runtime = new PwshTaskRuntime(await resolvePowerShellRuntime(DEFAULT_CONFIG), { taskDir: dir, sessionId: "foreground" });
+	const orphan = detachedSleeper();
+	const exited = detachedSleeper();
+	const ghost = deadSupervisorPid();
+	const loss = {
+		status: "failed", failureKind: "infrastructure", exitCode: null,
+		error: "Task supervisor exited without final status",
+	};
+	try {
+		await Promise.all([orphan, exited].map((proc) => new Promise((resolve, reject) => {
+			proc.once("spawn", resolve);
+			proc.once("error", reject);
+		})));
+		await parkedTask(runtime, "ps_e11e11e1", { supervisorPid: ghost, pid: orphan.pid, ...loss });
+		await parkedTask(runtime, "ps_e22e22e2", { supervisorPid: ghost, pid: exited.pid, status: "failed", exitCode: 3, error: "command failed" });
+		await runtime.deleteInactive("ps_e11e11e1");
+		await runtime.deleteInactive("ps_e22e22e2");
+		assert.throws(() => process.kill(orphan.pid, 0));
+		process.kill(exited.pid, 0);
+		await assert.rejects(access(runtime.taskDirectoryPath("ps_e11e11e1")), { code: "ENOENT" });
+		await assert.rejects(access(runtime.taskDirectoryPath("ps_e22e22e2")), { code: "ENOENT" });
+	} finally {
+		if (orphan.exitCode === null) orphan.kill();
+		if (exited.exitCode === null) exited.kill();
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("retention kills an expired supervisor-loss child and keeps an exited command", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-pwsh-retain-orphan-"));
+	const runtime = new PwshTaskRuntime(await resolvePowerShellRuntime(DEFAULT_CONFIG), { taskDir: dir, sessionId: "foreground" });
+	const orphan = detachedSleeper();
+	const exited = detachedSleeper();
+	const ghost = deadSupervisorPid();
+	const expired = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();
+	try {
+		await Promise.all([orphan, exited].map((proc) => new Promise((resolve, reject) => {
+			proc.once("spawn", resolve);
+			proc.once("error", reject);
+		})));
+		await parkedTask(runtime, "ps_f11f11f1", {
+			supervisorPid: ghost, pid: orphan.pid, updatedAt: expired,
+			status: "failed", failureKind: "infrastructure", exitCode: null,
+			error: "Task supervisor exited without final status",
+		});
+		await parkedTask(runtime, "ps_f22f22f2", {
+			supervisorPid: ghost, pid: exited.pid, updatedAt: expired,
+			status: "failed", exitCode: 3, error: "command failed",
+		});
+		await runtime.cleanupExpired();
+		assert.throws(() => process.kill(orphan.pid, 0));
+		process.kill(exited.pid, 0);
+		await assert.rejects(access(runtime.taskDirectoryPath("ps_f11f11f1")), { code: "ENOENT" });
+		await assert.rejects(access(runtime.taskDirectoryPath("ps_f22f22f2")), { code: "ENOENT" });
+	} finally {
+		if (orphan.exitCode === null) orphan.kill();
+		if (exited.exitCode === null) exited.kill();
 		await rm(dir, { recursive: true, force: true });
 	}
 });

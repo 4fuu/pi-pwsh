@@ -61,7 +61,7 @@ const START_GRACE_MS = 10_000;
 const SUPERVISOR_LOST_ERROR = "Task supervisor exited without final status";
 const LAUNCHER_STALE_ERROR = "Task launcher did not become ready";
 
-function supervisorLost(metadata: TaskMetadata): boolean {
+export function supervisorLost(metadata: TaskMetadata): boolean {
 	return metadata.status === "failed"
 		&& metadata.failureKind === "infrastructure"
 		&& (metadata.error === SUPERVISOR_LOST_ERROR || metadata.error === LAUNCHER_STALE_ERROR);
@@ -655,19 +655,7 @@ export class PwshTaskRuntime {
 			}
 			// taskkill /T on a live supervisor already includes its child. The child
 			// pid is a separate target only once that supervisor has died.
-			const supervisorAlive = metadata.supervisorPid > 0 && isAlive(metadata.supervisorPid);
-			const targets: number[] = [];
-			if (metadata.supervisorPid > 0) targets.push(metadata.supervisorPid);
-			if (
-				!supervisorAlive
-				&& metadata.pid
-				&& metadata.pid > 0
-				&& metadata.pid !== metadata.supervisorPid
-				&& !commandExited(metadata)
-			) {
-				targets.push(metadata.pid);
-			}
-			for (const pid of targets) {
+			for (const pid of this.terminationTargets(metadata)) {
 				try {
 					await killProcessTree(pid);
 				} catch (cleanupError) {
@@ -735,6 +723,8 @@ export class PwshTaskRuntime {
 	async deleteInactive(id: string): Promise<TaskMetadata> {
 		const metadata = await this.refreshOwned(id);
 		if (!TERMINAL.has(metadata.status)) throw new Error("pwsh: active tasks cannot be deleted");
+		// The record is the only remaining pid. Remove it only after the orphan is gone.
+		await this.reapLostCommand(metadata);
 		await rm(this.taskDirectoryPath(id), { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
 		this.foreignTasks.delete(id);
 		this.terminalTasks.delete(id);
@@ -745,11 +735,52 @@ export class PwshTaskRuntime {
 		await chmod(this.taskDir, 0o700);
 		for (const metadata of await this.readAll()) {
 			if (TERMINAL.has(metadata.status) && Date.now() - Date.parse(metadata.updatedAt) > RETENTION_MS) {
+				try {
+					await this.reapLostCommand(metadata);
+				} catch {
+					// Keep the directory. A later stop can still signal the child it records.
+					continue;
+				}
 				await rm(this.taskDirectoryPath(metadata.id), { recursive: true, force: true });
 				this.foreignTasks.delete(metadata.id);
 				this.terminalTasks.delete(metadata.id);
 			}
 		}
+	}
+
+	/** Pids a stop signals. A live supervisor already contains its child. */
+	private terminationTargets(metadata: TaskMetadata): number[] {
+		const supervisorAlive = metadata.supervisorPid > 0 && isAlive(metadata.supervisorPid);
+		const targets: number[] = [];
+		if (metadata.supervisorPid > 0) targets.push(metadata.supervisorPid);
+		if (
+			!supervisorAlive
+			&& metadata.pid
+			&& metadata.pid > 0
+			&& metadata.pid !== metadata.supervisorPid
+			&& !commandExited(metadata)
+		) {
+			targets.push(metadata.pid);
+		}
+		return targets;
+	}
+
+	/**
+	 * Supervisor loss is already terminal, so delete and retention would treat
+	 * it as history. The child can still be running, and the directory is the
+	 * only place its pid is stored.
+	 */
+	private async reapLostCommand(metadata: TaskMetadata): Promise<void> {
+		if (!supervisorLost(metadata)) return;
+		const errors: string[] = [];
+		for (const pid of this.terminationTargets(metadata)) {
+			try {
+				await killProcessTree(pid);
+			} catch (error) {
+				errors.push(error instanceof Error ? error.message : String(error));
+			}
+		}
+		if (errors.length > 0) throw new Error(`cleanup failed (${errors.join("; ")})`);
 	}
 
 	private metaPath(id: string): string {
