@@ -226,11 +226,25 @@ function userBashOperations(session: PwshSessionRuntime): BashOperations {
 				&& !options.signal?.aborted
 			) {
 				options.onData(Buffer.from("\n[pi-pwsh] direct spawn failed; retrying via cmd /c.\n"));
+				// chcp on a redirected cmd.exe does not change its output bytes.
+				// Run cmd under the prefixed pwsh so it inherits code page 65001,
+				// and pass the original text as one /c string so PowerShell does
+				// not parse it again. The epilogue keeps cmd's exit code.
+				const encodedCommand = Buffer.from(command, "utf8").toString("base64");
+				const retrySource =
+					`${UTF8_PREFIX}$global:LASTEXITCODE = $null; ` +
+					wrapPowerShellCommand(
+						`& 'cmd.exe' '/d' '/s' '/c' ([System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${encodedCommand}')))`,
+					);
 				const retry = await spawnAndStream(
-					"cmd",
-					["/d", "/s", "/c", `chcp 65001>nul & ${command}`],
+					session.pwsh.executable,
+					[...userPowerShellArguments(session.pwsh, { nonInteractive: true }), "-Command", SOURCE_BOOTSTRAP],
 					cwd,
-					{ ...options, env },
+					{
+						...options,
+						env,
+						stdin: Buffer.from(retrySource, "utf8").toString("base64"),
+					},
 				);
 				return { exitCode: retry.exitCode };
 			}

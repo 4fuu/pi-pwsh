@@ -50,9 +50,23 @@ export function createRuntimeEnv(
 	return env;
 }
 
+/**
+ * Live console page. [Console]::OutputEncoding stays on the object just
+ * assigned even when SetConsoleOutputCP fails and does not throw, so the
+ * property cannot see that the console is still OEM. A failed lookup prints
+ * the same kind of ASCII line and does not stop the command.
+ */
+export const WINDOWS_CONSOLE_PAGE_CHECK =
+	"if ($IsWindows) { try { " +
+	"$__pipwsh_cp = [int][System.Console].Assembly.GetType('Interop+Kernel32').GetMethod('GetConsoleOutputCP',[Reflection.BindingFlags]'Public,NonPublic,Static').Invoke($null,$null); " +
+	"if ($__pipwsh_cp -ne 65001) { Write-Output ('[pi-pwsh] console output code page is ' + $__pipwsh_cp + ', not 65001; native output was not forced to UTF-8') } " +
+	"} catch { Write-Output '[pi-pwsh] console output code page could not be read; native output was not forced to UTF-8' } }; ";
+
 /** Force plain UTF-8 output without adding a BOM to native-command stdin. */
 export const UTF8_PREFIX =
-	"$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $PSStyle.OutputRendering = 'PlainText'; ";
+	"$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); " +
+	WINDOWS_CONSOLE_PAGE_CHECK +
+	"$PSStyle.OutputRendering = 'PlainText'; ";
 
 /** Fixed ASCII bootstrap; the complete UTF-8 source is base64-encoded on stdin. */
 export const SOURCE_BOOTSTRAP =
