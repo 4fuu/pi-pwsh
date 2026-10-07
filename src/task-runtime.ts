@@ -477,21 +477,22 @@ export class PwshTaskRuntime {
 					cleanupErrors.push(`presented marker: ${markerError instanceof Error ? markerError.message : String(markerError)}`);
 				}
 			}
-			// taskkill /T on a live launcher already includes its child. Killing that
-			// pid again can hit whoever reused the number. A dead launcher does not.
+			// taskkill /T on a live launcher already includes its child. Killing a
+			// pid that is already dead can hit whoever reused the number. A dead
+			// launcher does not contain its child, so only that child is signaled.
 			let childPid: number | undefined;
 			try {
 				const current = await this.readMetadata(id);
-				if (current.instanceId === instanceId && current.pid && current.pid > 0 && !commandExited(current)) {
+				if (current.instanceId === instanceId && current.pid && current.pid > 0 && !commandExited(current) && isAlive(current.pid)) {
 					childPid = current.pid;
 				}
 			} catch {
-				// The record may not exist yet. The launcher pid is still killed below.
+				// The record may not exist yet. A live launcher pid is still killed below.
 			}
 			const launcherAlive = launcherPid > 0 && isAlive(launcherPid);
-			const startupTargets = [launcherPid];
+			const startupTargets = launcherAlive ? [launcherPid] : [];
 			if (!launcherAlive && childPid && childPid !== launcherPid) startupTargets.push(childPid);
-			for (const pid of startupTargets.filter((pid) => pid > 0)) {
+			for (const pid of startupTargets) {
 				try {
 					await killProcessTree(pid);
 				} catch (cleanupError) {
@@ -748,17 +749,23 @@ export class PwshTaskRuntime {
 		}
 	}
 
-	/** Pids a stop signals. A live supervisor already contains its child. */
+	/**
+	 * Pids a stop signals. A live supervisor already contains its child.
+	 * A dead pid is not signaled: Windows can reuse it, and taskkill would
+	 * then hit the new process. The child is a separate target only once the
+	 * supervisor is already gone and that child pid is still alive.
+	 */
 	private terminationTargets(metadata: TaskMetadata): number[] {
 		const supervisorAlive = metadata.supervisorPid > 0 && isAlive(metadata.supervisorPid);
 		const targets: number[] = [];
-		if (metadata.supervisorPid > 0) targets.push(metadata.supervisorPid);
+		if (supervisorAlive) targets.push(metadata.supervisorPid);
 		if (
 			!supervisorAlive
 			&& metadata.pid
 			&& metadata.pid > 0
 			&& metadata.pid !== metadata.supervisorPid
 			&& !commandExited(metadata)
+			&& isAlive(metadata.pid)
 		) {
 			targets.push(metadata.pid);
 		}
