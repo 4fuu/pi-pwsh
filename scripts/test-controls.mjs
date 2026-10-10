@@ -195,7 +195,7 @@ test("deletion waits for an in-flight scan and concurrent deletions remain seria
 	} finally { release(); await observer.close(); await rm(dir, { recursive: true, force: true }); }
 });
 
-test("an already aborted start does not launch", async () => {
+test("an already aborted start does not launch", { timeout: 30000, skip: process.platform !== "win32" }, async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-pwsh-foreground-preabort-"));
 	const runtime = new PwshTaskRuntime(await resolvePowerShellRuntime(DEFAULT_CONFIG), { taskDir: dir, sessionId: "foreground" });
 	try {
@@ -207,7 +207,7 @@ test("an already aborted start does not launch", async () => {
 	}
 });
 
-test("abort during start presents the cancellation before it is observable", async () => {
+test("abort during start presents the cancellation before it is observable", { timeout: 30000, skip: process.platform !== "win32" }, async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-pwsh-foreground-present-"));
 	const runtime = new PwshTaskRuntime(await resolvePowerShellRuntime(DEFAULT_CONFIG), { taskDir: dir, sessionId: "foreground" });
 	try {
@@ -224,7 +224,7 @@ test("abort during start presents the cancellation before it is observable", asy
 	}
 });
 
-test("waitUntilExit returns only after the command exits", async () => {
+test("waitUntilExit returns only after the command exits", { timeout: 30000, skip: process.platform !== "win32" }, async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-pwsh-foreground-exit-"));
 	const runtime = new PwshTaskRuntime(await resolvePowerShellRuntime(DEFAULT_CONFIG), { taskDir: dir, sessionId: "foreground" });
 	let id;
@@ -299,7 +299,7 @@ async function parkedTask(runtime, id, fields) {
 	return { directory, metadata, instanceId };
 }
 
-test("aborting a foreground wait still kills when the presented marker fails", async () => {
+test("aborting a foreground wait still kills when the presented marker fails", { timeout: 30000, skip: process.platform !== "win32" }, async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-pwsh-marker-fail-"));
 	const runtime = new PwshTaskRuntime(await resolvePowerShellRuntime(DEFAULT_CONFIG), { taskDir: dir, sessionId: "foreground" });
 	const child = detachedSleeper();
@@ -322,7 +322,7 @@ test("aborting a foreground wait still kills when the presented marker fails", a
 	}
 });
 
-test("stop keeps a completion that lands while the tree is being killed", async () => {
+test("stop keeps a completion that lands while the tree is being killed", { timeout: 30000, skip: process.platform !== "win32" }, async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-pwsh-stop-completed-"));
 	const runtime = new PwshTaskRuntime(await resolvePowerShellRuntime(DEFAULT_CONFIG), { taskDir: dir, sessionId: "foreground" });
 	const child = detachedSleeper();
@@ -349,7 +349,7 @@ test("stop keeps a completion that lands while the tree is being killed", async 
 	}
 });
 
-test("stop keeps a command failure that lands while the tree is being killed", async () => {
+test("stop keeps a command failure that lands while the tree is being killed", { timeout: 30000, skip: process.platform !== "win32" }, async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-pwsh-stop-failed-"));
 	const runtime = new PwshTaskRuntime(await resolvePowerShellRuntime(DEFAULT_CONFIG), { taskDir: dir, sessionId: "foreground" });
 	const child = detachedSleeper();
@@ -377,7 +377,7 @@ test("stop keeps a command failure that lands while the tree is being killed", a
 	}
 });
 
-test("stop kills a reparented child after refresh already recorded a dead supervisor", async () => {
+test("stop kills a reparented child after refresh already recorded a dead supervisor", { timeout: 30000, skip: process.platform !== "win32" }, async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-pwsh-stop-orphan-"));
 	const runtime = new PwshTaskRuntime(await resolvePowerShellRuntime(DEFAULT_CONFIG), { taskDir: dir, sessionId: "foreground" });
 	const child = detachedSleeper();
@@ -405,7 +405,7 @@ test("stop kills a reparented child after refresh already recorded a dead superv
 	}
 });
 
-test("a foreground wait kills a reparented child when the supervisor is already dead", async () => {
+test("a foreground wait kills a reparented child when the supervisor is already dead", { timeout: 30000, skip: process.platform !== "win32" }, async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-pwsh-wait-orphan-"));
 	const runtime = new PwshTaskRuntime(await resolvePowerShellRuntime(DEFAULT_CONFIG), { taskDir: dir, sessionId: "foreground" });
 	const child = detachedSleeper();
@@ -431,7 +431,7 @@ test("a foreground wait kills a reparented child when the supervisor is already 
 	}
 });
 
-test("stop does not kill a recorded child while its supervisor is still alive", async () => {
+test("stop does not kill a recorded child while its supervisor is still alive", { timeout: 30000, skip: process.platform !== "win32" }, async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-pwsh-stop-live-supervisor-"));
 	const runtime = new PwshTaskRuntime(await resolvePowerShellRuntime(DEFAULT_CONFIG), { taskDir: dir, sessionId: "foreground" });
 	const supervisor = detachedSleeper();
@@ -454,7 +454,7 @@ test("stop does not kill a recorded child while its supervisor is still alive", 
 	}
 });
 
-test("an abort during a supervisor-loss stop keeps the cleanup error", async () => {
+test("an abort during a supervisor-loss stop keeps the cleanup error", { timeout: 30000, skip: process.platform !== "win32" }, async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-pwsh-stop-abort-cleanup-"));
 	const runtime = new PwshTaskRuntime(await resolvePowerShellRuntime(DEFAULT_CONFIG), { taskDir: dir, sessionId: "foreground" });
 	const child = detachedSleeper();
@@ -488,7 +488,7 @@ test("an abort during a supervisor-loss stop keeps the cleanup error", async () 
 	}
 });
 
-test("list does not keep a supervisor-loss failure after stop", async () => {
+test("list does not keep a supervisor-loss failure after stop", { timeout: 30000, skip: process.platform !== "win32" }, async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-pwsh-stop-cache-"));
 	const runtime = new PwshTaskRuntime(await resolvePowerShellRuntime(DEFAULT_CONFIG), { taskDir: dir, sessionId: "foreground" });
 	const ghost = 2_147_483_647;
@@ -511,7 +511,7 @@ test("list does not keep a supervisor-loss failure after stop", async () => {
 	}
 });
 
-test("a cancel marker is announced as cancelled while the record is still supervisor loss", async () => {
+test("a cancel marker is announced as cancelled while the record is still supervisor loss", { timeout: 30000, skip: process.platform !== "win32" }, async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-pwsh-announce-cancel-"));
 	const runtime = new PwshTaskRuntime(await resolvePowerShellRuntime(DEFAULT_CONFIG), { taskDir: dir, sessionId: "foreground" });
 	const child = detachedSleeper();
@@ -545,7 +545,7 @@ test("a cancel marker is announced as cancelled while the record is still superv
 	}
 });
 
-test("a presented startup failure is not announced as a user cancellation", async () => {
+test("a presented startup failure is not announced as a user cancellation", { timeout: 30000, skip: process.platform !== "win32" }, async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-pwsh-announce-startup-"));
 	const runtime = new PwshTaskRuntime(await resolvePowerShellRuntime(DEFAULT_CONFIG), { taskDir: dir, sessionId: "foreground" });
 	const child = detachedSleeper();
@@ -574,7 +574,7 @@ test("a presented startup failure is not announced as a user cancellation", asyn
 	}
 });
 
-test("deleting supervisor loss kills the recorded child and keeps an exited command", async () => {
+test("deleting supervisor loss kills the recorded child and keeps an exited command", { timeout: 30000, skip: process.platform !== "win32" }, async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-pwsh-delete-orphan-"));
 	const runtime = new PwshTaskRuntime(await resolvePowerShellRuntime(DEFAULT_CONFIG), { taskDir: dir, sessionId: "foreground" });
 	const orphan = detachedSleeper();
@@ -604,7 +604,7 @@ test("deleting supervisor loss kills the recorded child and keeps an exited comm
 	}
 });
 
-test("retention kills an expired supervisor-loss child and keeps an exited command", async () => {
+test("retention kills an expired supervisor-loss child and keeps an exited command", { timeout: 30000, skip: process.platform !== "win32" }, async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-pwsh-retain-orphan-"));
 	const runtime = new PwshTaskRuntime(await resolvePowerShellRuntime(DEFAULT_CONFIG), { taskDir: dir, sessionId: "foreground" });
 	const orphan = detachedSleeper();
