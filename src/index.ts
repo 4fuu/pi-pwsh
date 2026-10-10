@@ -35,7 +35,7 @@ export const DESCRIPTION = `Run a PowerShell 7 command as a persistent backgroun
 
 Write PowerShell 7 syntax. Use multiline commands with normal indentation and formatting when they improve readability; do not collapse them into a single line. Single quotes are literal; double quotes expand variables; backtick is the escape character. Set environment variables with $env:NAME = 'value'; command. Quote paths containing spaces. Prefer modern cross-platform tools such as rg and fd when available. PowerShell recursive searches do not honor .gitignore, so bound paths, depth, and output tightly.
 
-Exactly one of command or taskId is required. To start a new task, pass only command and omit taskId. To inspect, wait for, or stop an existing task, pass only taskId and omit command. A command always starts a persistent task. Omit wait to wait up to the configured defaultWaitSeconds: short commands return their completed result directly, longer ones keep running in the background and notify on completion. Pass wait: 0 to return immediately without waiting. With notifyOn, start and taskId waits end when that case-sensitive literal UTF-8 text appears or the task terminates; otherwise they wait for termination. A timeout or tool abort ends only waiting—the task continues. Only stop=true terminates its process tree. Queries are idempotent snapshots containing status and bounded latest output. Task IDs are usable only in the parent session that launched them.
+Exactly one of command or taskId is required. To start a new task, pass only command and omit taskId. To inspect, wait for, or stop an existing task, pass only taskId and omit command. A command always starts a persistent task. Omit wait to wait up to the configured defaultWaitSeconds: short commands return their completed result directly, longer ones keep running in the background and notify on completion. Pass wait: 0 to return immediately without waiting. With notifyOn, start and taskId waits end when that case-sensitive literal UTF-8 text appears or the task terminates; otherwise they wait for termination. A timeout or tool abort ends only waiting—the task continues and reports its completion automatically, so do not answer an expired wait with another wait: continue with independent work or end the turn, and extend the wait once only when the result is required before you can continue. Only stop=true terminates its process tree. Queries are idempotent snapshots containing status and bounded latest output. Task IDs are usable only in the parent session that launched them.
 
 Do not create a second background layer inside the command. Use taskId in a later pwsh call to inspect or stop work.
 
@@ -152,7 +152,7 @@ export function taskText(
 	return [
 		...(options?.includeTaskId === false ? [] : [`taskId: ${metadata.id}`]),
 		`status: ${metadata.status}`,
-		...(snapshot.ready && (metadata.status === "starting" || metadata.status === "running") ? ["ready: true"] : []),
+		...(snapshot.ready && isActive(metadata.status) ? ["ready: true"] : []),
 		...(exitCode ? [exitCode] : []),
 		...(hasOutput ? [
 			snapshot.omittedBytes > 0 ? `output: [${snapshot.omittedBytes} earlier bytes omitted]` : "output:",
@@ -177,6 +177,29 @@ export function taskDetails(snapshot: TaskSnapshot, diagnosticsPath?: string): P
 		error: snapshot.metadata.error,
 		diagnosticsPath: snapshot.metadata.failureKind === "infrastructure" ? diagnosticsPath : undefined,
 	};
+}
+
+function isActive(status: TaskStatus): boolean {
+	return status === "starting" || status === "running";
+}
+
+/**
+ * Model-facing guidance appended to a snapshot that still has work in flight.
+ * An expired wait is neither a failure nor a reason to poll: the task reports
+ * its own completion, so another wait only burns a round trip. Releasing the
+ * wait is the other early return, and it accounts for ending it there. The
+ * foreground path never consults this: it returns only after the task exits.
+ */
+export function waitGuidance(snapshot: TaskSnapshot, waitSeconds: number, backgrounded: boolean): string {
+	if (backgrounded) {
+		return "The user moved this task to the background. Continue the conversation; do not immediately wait again. Completion will be reported automatically.";
+	}
+	if (waitSeconds <= 0 || !isActive(snapshot.metadata.status) || snapshot.ready) return "";
+	return [
+		"The wait window ended and the task is still running.",
+		"Do not poll it: continue with independent work or end the turn — completion, failure, or cancellation arrives as a notification.",
+		"Use a single longer wait only when the result is required before you can continue.",
+	].join(" ");
 }
 
 function quotePowerShell(value: string): string {
@@ -400,7 +423,7 @@ export default function pwshExtension(pi: ExtensionAPI): void {
 						if (foreground) snapshot = await activeTasks.waitUntilExit(metadata.id, signal);
 						else ({ snapshot, backgrounded } = await waits.snapshot(activeTasks, metadata.id, waitSeconds, signal));
 					}
-					if (snapshot.metadata.status !== "starting" && snapshot.metadata.status !== "running") {
+					if (!isActive(snapshot.metadata.status)) {
 						coordinator.withdrawTask(`pwsh:${snapshot.metadata.id}`, ["ready", "terminal"], "presented");
 					} else if (snapshot.ready) {
 						await activeTasks.markReadyPresented(snapshot.metadata);
@@ -409,10 +432,13 @@ export default function pwshExtension(pi: ExtensionAPI): void {
 					const diagnosticsPath = snapshot.metadata.failureKind === "infrastructure"
 						? activeTasks.taskDirectoryPath(snapshot.metadata.id)
 						: undefined;
-					const text = taskText(snapshot, diagnosticsPath, foreground ? { includeTaskId: false } : undefined);
+					// The foreground path waits until exit, so a still-running
+					// snapshot with guidance cannot exist there; keep it excluded
+					// outright rather than relying on that invariant alone.
+					const guidance = foreground ? "" : waitGuidance(snapshot, waitSeconds, backgrounded);
 					return {
-						content: [{ type: "text" as const, text: text
-							+ (backgrounded ? "\nThe user moved this task to the background. Continue the conversation; do not immediately wait again. Completion will be reported automatically." : "") }],
+						content: [{ type: "text" as const, text: taskText(snapshot, diagnosticsPath, foreground ? { includeTaskId: false } : undefined)
+							+ (guidance ? `\n${guidance}` : "") }],
 						details: { ...taskDetails(snapshot, diagnosticsPath), ...(backgrounded ? { backgrounded: true } : {}) },
 					};
 				} finally {
