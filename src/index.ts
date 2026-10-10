@@ -45,27 +45,39 @@ const ELEVATION_DESCRIPTION = `\n\nELEVATION: Windows sudo is available in inlin
 
 export const PROMPT_GUIDELINE = "Use pwsh for shell tasks; every command starts a persistent background task. Write PowerShell syntax; prefer modern cross-platform tools (rg, fd, etc.) when available, otherwise use native PowerShell cmdlets with tightly bounded scope, and avoid Unix-only commands.";
 
+export const FOREGROUND_DESCRIPTION = `Run a PowerShell 7 command and wait until it exits.
+
+Write PowerShell 7 syntax. Use multiline commands with normal indentation and formatting when they improve readability; do not collapse them into a single line. Single quotes are literal; double quotes expand variables; backtick is the escape character. Set environment variables with $env:NAME = 'value'; command. Quote paths containing spaces. Prefer modern cross-platform tools such as rg and fd when available. PowerShell recursive searches do not honor .gitignore, so bound paths, depth, and output tightly.
+
+This session is not the interactive TUI. Pass only command. Do not pass taskId, stop, notifyOn, or wait: taskId, stop, and notifyOn are rejected, and wait is ignored. The call returns only when the process exits or this call is aborted. Aborting the call terminates the process tree. There is no background task, no task id to poll, and no later completion notification.
+
+Do not create a second background layer inside the command. Do not use Start-Job, Start-Process without -Wait, or a nested background harness.
+
+Interactive PTY sessions and user-request UI are not available outside the TUI. Do not call Start-Pty or Request-Pi*.`;
+
+export const FOREGROUND_PROMPT_GUIDELINE = "Use pwsh for shell tasks. Outside the TUI, every command runs in the foreground until it exits or the call is aborted; do not pass wait, taskId, stop, or notifyOn, and do not start a background job. Write PowerShell syntax; prefer modern cross-platform tools (rg, fd, etc.) when available, otherwise use native PowerShell cmdlets with tightly bounded scope, and avoid Unix-only commands.";
+
 export const PwshParams = Type.Object({
 	command: Type.Optional(Type.String({
 		minLength: 1,
-		description: "PowerShell 7 command that starts a persistent task.",
+		description: "PowerShell 7 command. Outside the TUI it runs in the foreground until it exits or the call is aborted.",
 	})),
 	notifyOn: Type.Optional(Type.String({
 		minLength: 1,
 		maxLength: 256,
-		description: "Command-only, case-sensitive literal readiness text (1–256 UTF-8 bytes).",
+		description: "TUI only. Case-sensitive literal readiness text (1-256 UTF-8 bytes). Rejected outside the TUI.",
 	})),
 	taskId: Type.Optional(Type.String({
 		pattern: "^ps_[0-9a-f]{8}$",
-		description: "Persistent task ID returned by an earlier pwsh call in this parent session.",
+		description: "TUI only. Persistent task ID from an earlier pwsh call in this parent session. Rejected outside the TUI.",
 	})),
 	wait: Type.Optional(Type.Number({
 		minimum: 0,
 		maximum: 300,
-		description: "Seconds to wait (0-300). Omit to wait the configured defaultWaitSeconds: short commands finish within it and return their result directly, while longer tasks continue in the background and notify on completion. Pass wait: 0 to return immediately.",
+		description: "TUI only. Seconds to wait (0-300). Omit to wait the configured defaultWaitSeconds. Pass 0 to return immediately. Ignored outside the TUI: the call waits until exit or abort.",
 	})),
 	stop: Type.Optional(Type.Boolean({
-		description: "With taskId, terminate the complete process tree before returning its snapshot.",
+		description: "TUI only. With taskId, terminate the process tree before returning its snapshot. Rejected outside the TUI.",
 	})),
 }, { additionalProperties: false });
 
@@ -117,7 +129,18 @@ export function validate(params: PwshParamsValue): void {
 	}
 }
 
-export function taskText(snapshot: TaskSnapshot, diagnosticsPath?: string): string {
+/** Background controls stay in the schema, but print, json, and rpc reject them. */
+export function rejectForegroundControls(params: PwshParamsValue): void {
+	if (params.taskId !== undefined || params.stop !== undefined || params.notifyOn !== undefined) {
+		throw new Error("pwsh: taskId, stop, and notifyOn are unavailable outside the TUI. Pass only command; the call waits until the process exits or this call is aborted, and abort kills the process tree. wait is ignored.");
+	}
+}
+
+export function taskText(
+	snapshot: TaskSnapshot,
+	diagnosticsPath?: string,
+	options?: { includeTaskId?: boolean },
+): string {
 	const metadata = snapshot.metadata;
 	const output = snapshot.output.trimEnd();
 	const hasOutput = output.length > 0 || snapshot.omittedBytes > 0;
@@ -127,7 +150,7 @@ export function taskText(snapshot: TaskSnapshot, diagnosticsPath?: string): stri
 			? "exitCode: unknown"
 			: undefined;
 	return [
-		`taskId: ${metadata.id}`,
+		...(options?.includeTaskId === false ? [] : [`taskId: ${metadata.id}`]),
 		`status: ${metadata.status}`,
 		...(snapshot.ready && (metadata.status === "starting" || metadata.status === "running") ? ["ready: true"] : []),
 		...(exitCode ? [exitCode] : []),
@@ -203,11 +226,25 @@ function userBashOperations(session: PwshSessionRuntime): BashOperations {
 				&& !options.signal?.aborted
 			) {
 				options.onData(Buffer.from("\n[pi-pwsh] direct spawn failed; retrying via cmd /c.\n"));
+				// chcp on a redirected cmd.exe does not change its output bytes.
+				// Run cmd under the prefixed pwsh so it inherits code page 65001,
+				// and pass the original text as one /c string so PowerShell does
+				// not parse it again. The epilogue keeps cmd's exit code.
+				const encodedCommand = Buffer.from(command, "utf8").toString("base64");
+				const retrySource =
+					`${UTF8_PREFIX}$global:LASTEXITCODE = $null; ` +
+					wrapPowerShellCommand(
+						`& 'cmd.exe' '/d' '/s' '/c' ([System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${encodedCommand}')))`,
+					);
 				const retry = await spawnAndStream(
-					"cmd",
-					["/d", "/s", "/c", `chcp 65001>nul & ${command}`],
+					session.pwsh.executable,
+					[...userPowerShellArguments(session.pwsh, { nonInteractive: true }), "-Command", SOURCE_BOOTSTRAP],
 					cwd,
-					{ ...options, env },
+					{
+						...options,
+						env,
+						stdin: Buffer.from(retrySource, "utf8").toString("base64"),
+					},
 				);
 				return { exitCode: retry.exitCode };
 			}
@@ -254,6 +291,7 @@ export default function pwshExtension(pi: ExtensionAPI): void {
 	let operations: BashOperations | undefined;
 	let config: ReturnType<typeof loadConfig>["config"] | undefined;
 	let setupError: string | undefined;
+	let sessionMode: "tui" | "rpc" | "json" | "print" | undefined;
 	const reporter = registerTaskReporter(pi, "pwsh", {
 		controls: {
 			async inspect(taskId) {
@@ -304,6 +342,19 @@ export default function pwshExtension(pi: ExtensionAPI): void {
 		pi.on("user_bash", () => operations ? { operations } : undefined);
 	}
 
+	const foregroundPresentation = (toolDescription: string): object => ({
+		prepareLoadout: () => {
+			if (!sessionMode || sessionMode === "tui") return undefined;
+			return {
+				descriptions: {
+					pwsh: toolDescription.includes("ELEVATION:")
+						? `${FOREGROUND_DESCRIPTION}${ELEVATION_DESCRIPTION}`
+						: FOREGROUND_DESCRIPTION,
+				},
+			};
+		},
+	});
+
 	const registerTool = (description: string): void => {
 		pi.registerTool({
 			name: "pwsh",
@@ -313,8 +364,13 @@ export default function pwshExtension(pi: ExtensionAPI): void {
 			promptGuidelines: [PROMPT_GUIDELINE],
 			parameters: PwshParams,
 			executionMode: "sequential",
+			// prepareLoadout exists on pi 1.0. The 0.84 tool type does not declare it;
+			// spreading a widened object keeps that baseline compiling and is ignored there.
+			...foregroundPresentation(description),
 			async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 				validate(params);
+				const foreground = ctx.mode !== "tui";
+				if (foreground) rejectForegroundControls(params);
 				if (!tasks || !sessions) throw new Error(`pwsh: ${setupError ?? "PowerShell runtime is unavailable"}`);
 				const activeTasks = tasks;
 				const waitSeconds = params.wait ?? config?.defaultWaitSeconds ?? 0;
@@ -333,14 +389,16 @@ export default function pwshExtension(pi: ExtensionAPI): void {
 						const metadata = await activeTasks.start(
 							command,
 							ctx.cwd,
-							params.notifyOn,
+							foreground ? undefined : params.notifyOn,
 							helper.source,
 							helper.needsRpc ? sessions.env : {},
+							foreground ? signal : undefined,
 						);
 						const releaseSource = release;
 						release = coordinator.holdTask(`pwsh:${metadata.id}`);
 						releaseSource();
-						({ snapshot, backgrounded } = await waits.snapshot(activeTasks, metadata.id, waitSeconds, signal));
+						if (foreground) snapshot = await activeTasks.waitUntilExit(metadata.id, signal);
+						else ({ snapshot, backgrounded } = await waits.snapshot(activeTasks, metadata.id, waitSeconds, signal));
 					}
 					if (snapshot.metadata.status !== "starting" && snapshot.metadata.status !== "running") {
 						coordinator.withdrawTask(`pwsh:${snapshot.metadata.id}`, ["ready", "terminal"], "presented");
@@ -351,8 +409,9 @@ export default function pwshExtension(pi: ExtensionAPI): void {
 					const diagnosticsPath = snapshot.metadata.failureKind === "infrastructure"
 						? activeTasks.taskDirectoryPath(snapshot.metadata.id)
 						: undefined;
+					const text = taskText(snapshot, diagnosticsPath, foreground ? { includeTaskId: false } : undefined);
 					return {
-						content: [{ type: "text" as const, text: taskText(snapshot, diagnosticsPath)
+						content: [{ type: "text" as const, text: text
 							+ (backgrounded ? "\nThe user moved this task to the background. Continue the conversation; do not immediately wait again. Completion will be reported automatically." : "") }],
 						details: { ...taskDetails(snapshot, diagnosticsPath), ...(backgrounded ? { backgrounded: true } : {}) },
 					};
@@ -361,14 +420,15 @@ export default function pwshExtension(pi: ExtensionAPI): void {
 				}
 			},
 			renderCall(args, theme) {
+				const foreground = sessionMode !== undefined && sessionMode !== "tui";
 				const effectiveWait = args.wait ?? config?.defaultWaitSeconds;
 				const waitAction = effectiveWait === undefined ? "wait default" : `wait ${effectiveWait}s`;
 				const action = args.taskId
 					? args.stop ? "stop" : waitAction
-					: `start · ${waitAction}`;
+					: foreground ? "foreground until exit" : `start · ${waitAction}`;
 				let header = `${theme.fg("toolTitle", theme.bold("pwsh"))} ${theme.fg("accent", args.taskId ?? "new task")} ${theme.fg("dim", `· ${action}`)}`;
 				if (args.notifyOn) header += theme.fg("dim", ` · notify on ${JSON.stringify(args.notifyOn)}`);
-				if (!args.stop && effectiveWait !== undefined && effectiveWait > 0) header += theme.fg("dim", " · Ctrl+Alt+B background");
+				if (!foreground && !args.stop && effectiveWait !== undefined && effectiveWait > 0) header += theme.fg("dim", " · Ctrl+Alt+B background");
 				const command = typeof args.command === "string" ? args.command.replace(/\r/g, "").replace(/\t/g, "   ") : "";
 				if (!command) return new Text(header, 0, 0);
 				const lines = command.split("\n");
@@ -419,7 +479,25 @@ export default function pwshExtension(pi: ExtensionAPI): void {
 		await currentSessions?.close();
 	});
 
+	pi.on("before_agent_start", (event, ctx) => {
+		sessionMode = ctx.mode;
+		if (ctx.mode === "tui") return;
+		const options = event.systemPromptOptions as typeof event.systemPromptOptions & {
+			toolGuidelines?: Record<string, string[]>;
+		};
+		const guidelines = options.toolGuidelines?.pwsh;
+		if (guidelines) {
+			options.toolGuidelines!.pwsh = guidelines.map((rule) =>
+				rule === PROMPT_GUIDELINE ? FOREGROUND_PROMPT_GUIDELINE : rule,
+			);
+			return;
+		}
+		if (!event.systemPrompt.includes(PROMPT_GUIDELINE)) return;
+		return { systemPrompt: event.systemPrompt.replace(PROMPT_GUIDELINE, FOREGROUND_PROMPT_GUIDELINE) };
+	});
+
 	pi.on("session_start", async (_event, ctx) => {
+		sessionMode = ctx.mode;
 		await notifications?.close();
 		await sessions?.close();
 		notifications = undefined;
@@ -471,7 +549,12 @@ export default function pwshExtension(pi: ExtensionAPI): void {
 		sessions = nextSessions;
 		tasks = nextTasks;
 		operations = userBashOperations(nextSessions);
-		if (sudoAvailable) registerTool(`${DESCRIPTION}${ELEVATION_DESCRIPTION}`);
+		// pi before prepareLoadout keeps the description registered at load time.
+		// Re-register so print, json, and rpc see the foreground contract directly.
+		const sessionDescription = ctx.mode === "tui" ? DESCRIPTION : FOREGROUND_DESCRIPTION;
+		if (ctx.mode !== "tui" || sudoAvailable) {
+			registerTool(sudoAvailable ? `${sessionDescription}${ELEVATION_DESCRIPTION}` : sessionDescription);
+		}
 		activatePwsh(pi);
 	});
 }

@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PwshTaskRuntime, renameWithRetry } from "../src/task-runtime.ts";
 import { mutateMetadataSnapshots, readLatestMetadataSnapshot } from "../src/task-metadata-store.mjs";
-import { validate, DESCRIPTION, PROMPT_GUIDELINE, PwshParams, taskDetails, taskText } from "../src/index.ts";
+import { validate, rejectForegroundControls, DESCRIPTION, FOREGROUND_DESCRIPTION, PROMPT_GUIDELINE, FOREGROUND_PROMPT_GUIDELINE, PwshParams, taskDetails, taskText } from "../src/index.ts";
 import { TaskNotificationManager } from "../src/task-notifications.ts";
 
 const dir = await mkdtemp(join(tmpdir(), "pi-pwsh-test-"));
@@ -199,6 +199,12 @@ assert.throws(() => validate({ taskId: id, stop: true, wait: 1 }), /wait is not 
 assert.throws(() => validate({ command: "x", notifyOn: "😀".repeat(65) }), /UTF-8 bytes/);
 assert.doesNotThrow(() => validate({ command: "Get-ChildItem", notifyOn: "ready", wait: 1 }));
 assert.match(DESCRIPTION, /PowerShell 7/); assert.match(DESCRIPTION, /\$env:NAME/); assert.match(DESCRIPTION, /bound paths/); assert.match(PROMPT_GUIDELINE, /persistent background task/);
+assert.match(FOREGROUND_DESCRIPTION, /wait until it exits/); assert.match(FOREGROUND_DESCRIPTION, /terminates the process tree/); assert.doesNotMatch(FOREGROUND_DESCRIPTION, /return immediately/);
+assert.match(FOREGROUND_PROMPT_GUIDELINE, /foreground until it exits/); assert.doesNotMatch(FOREGROUND_PROMPT_GUIDELINE, /persistent background task/);
+assert.throws(() => rejectForegroundControls({ command: "x", taskId: "ps_1234abcd" }), /unavailable outside the TUI/);
+assert.throws(() => rejectForegroundControls({ command: "x", notifyOn: "ready" }), /unavailable outside the TUI/);
+assert.throws(() => rejectForegroundControls({ taskId: "ps_1234abcd", stop: true }), /unavailable outside the TUI/);
+assert.doesNotThrow(() => rejectForegroundControls({ command: "Get-ChildItem", wait: 0 }));
 assert.ok(PwshParams);
 
 // Model text stays lean while structured details retain everything needed by
@@ -206,6 +212,7 @@ assert.ok(PwshParams);
 const modelMeta = { ...meta, sessionId: "one", pid: 4321 };
 const successful = { metadata: modelMeta, ready: true, output: "", omittedBytes: 0 };
 assert.equal(taskText(successful), `taskId: ${id}\nstatus: completed`);
+assert.equal(taskText(successful, undefined, { includeTaskId: false }), "status: completed");
 assert.deepEqual(taskDetails(successful), {
 	version: 1, taskId: id, status: "completed", ready: true, exitCode: 0, pid: 4321,
 	createdAt: now, omittedBytes: 0, output: "", error: undefined, diagnosticsPath: undefined,
@@ -240,6 +247,7 @@ const startupConfig = JSON.parse(await readFile(join(startupPath, "config.json")
 const startupMetadata = await brokenRuntime.readMetadata(startupConfig.id);
 assert.equal(startupMetadata.status, "failed");
 assert.equal(startupMetadata.failureKind, "infrastructure");
+assert.ok(startupMetadata.supervisorPid > 0, String(startupMetadata.supervisorPid));
 assert.equal((await readdir(join(startupPath, "metadata"))).filter(name => name.endsWith(".json")).length, 3);
 assert.match(await readFile(join(startupPath, "output.log"), "utf8"), /startup failure/);
 assert.equal(existsSync(join(startupPath, `${startupMetadata.instanceId}.exit.presented`)), true);

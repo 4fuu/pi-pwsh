@@ -48,11 +48,13 @@ Choose the built-in tool when commands are short-lived and native pi integration
 
 ### Background tasks and coordinated notifications
 
-Every `pwsh` command starts a persistent task. When `wait` is omitted, the tool waits up to `defaultWaitSeconds` (60 by default): work that finishes in that window returns its result in the same call, while longer work returns a running task and continues in the background. Pass `wait: 0` to return immediately. There is no separate job mode and no need to wrap the command in another background layer.
+In the interactive TUI, every `pwsh` command starts a persistent task. When `wait` is omitted, the tool waits up to `defaultWaitSeconds` (60 by default): work that finishes in that window returns its result in the same call, while longer work returns a running task and continues in the background. Pass `wait: 0` to return immediately. There is no separate job mode and no need to wrap the command in another background layer.
 
-Deferred completion, failure, and cancellation are reported automatically. Long-running services can also announce readiness as soon as a chosen literal appears in their output, without ending the task. Inspecting an existing task without `wait` uses the same configured default; a timeout or cancelled wait leaves it running.
+Outside the TUI (`print`, `json`, and `rpc`, including headless subagents) the same call does not background. It returns only when the process exits or the call is aborted, and aborting it terminates the process tree. `wait` is ignored. `taskId`, `stop`, and `notifyOn` are rejected. Background tasks, readiness notifications, and interactive terminals stay TUI-only.
 
-Each task remains available through its ID for later status and output snapshots or explicit process-tree termination. Snapshots are bounded and repeatable rather than consumable. Task state and notification markers survive `/reload` and pi restarts, and terminal records are retained for 24 hours.
+In the TUI, deferred completion, failure, and cancellation are reported automatically. Long-running services can also announce readiness as soon as a chosen literal appears in their output, without ending the task. Inspecting an existing task without `wait` uses the same configured default; a timeout or cancelled wait leaves it running.
+
+Each TUI task remains available through its ID for later status and output snapshots or explicit process-tree termination. Snapshots are bounded and repeatable rather than consumable. Task state and notification markers survive `/reload` and pi restarts, and terminal records are retained for 24 hours. Outside the TUI the call does not return a live task id, and there is no later notification.
 
 ### Interactive terminals
 
