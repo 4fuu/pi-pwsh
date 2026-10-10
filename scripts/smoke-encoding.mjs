@@ -20,6 +20,12 @@ const MARK = `${HELLO} ${EMOJI}`;
 const MARK_BYTES = Buffer.from(MARK, "utf8");
 const OEM866_HELLO = Buffer.from("8fe0a8a2a5e2", "hex");
 
+// The console code page and cmd.exe contracts are Windows-only.
+if (process.platform !== "win32") {
+	console.log("SKIP [encoding e2e] non-win32 platform: the console page and cmd /c contracts are Windows-only");
+	process.exit(0);
+}
+
 const probe = spawnSync("pwsh", ["-NoProfile", "-Command", "(Get-Command pwsh -ErrorAction Stop).Source"], {
 	encoding: "utf8",
 	windowsHide: true,
@@ -228,6 +234,29 @@ try {
 			assert.ok(retry.output.includes(hello), `prefixed cmd child is not UTF-8: ${hexPreview(retry.output)}`);
 		}
 		console.log("PASS [encoding e2e] batch retry inherits UTF-8; redirected chcp does not");
+
+		// The retry passes the whole user command as one /c string. A batch file
+		// in a quoted path with quoted arguments must still be found, receive its
+		// arguments, and keep its exit code (cmd keeps %2 in raw quoted form).
+		const batchDir = join(root, "dir with space");
+		await mkdir(batchDir, { recursive: true });
+		const batchPath = join(batchDir, "my tool.bat");
+		await writeFile(batchPath, '@echo off\r\necho BAT-RAN %1 %2\r\nexit /b 7\r\n', "ascii");
+		const batchCommand = `"${batchPath}" one "two three"`;
+		const encodedBatch = Buffer.from(batchCommand, "utf8").toString("base64");
+		const batchRetry = await streamSource(
+			`${UTF8_PREFIX}$global:LASTEXITCODE = $null; ` +
+				wrapPowerShellCommand(
+					`& 'cmd.exe' '/d' '/s' '/c' ([System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${encodedBatch}')))`,
+				),
+			root,
+		);
+		assert.equal(batchRetry.exitCode, 7, `batch retry exit ${batchRetry.exitCode}: ${batchRetry.output}`);
+		assert.ok(
+			batchRetry.output.includes('BAT-RAN one "two three"'),
+			`batch retry lost the quoted path or arguments: ${batchRetry.output}`,
+		);
+		console.log("PASS [encoding e2e] batch retry preserves a quoted path and arguments");
 	}
 } finally {
 	await rm(root, { recursive: true, force: true });
