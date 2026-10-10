@@ -52,7 +52,7 @@ In the interactive TUI, every `pwsh` command starts a persistent task. When `wai
 
 Outside the TUI (`print`, `json`, and `rpc`, including headless subagents) the same call does not background. It returns only when the process exits or the call is aborted, and aborting it terminates the process tree. `wait` is ignored. `taskId`, `stop`, and `notifyOn` are rejected. Background tasks, readiness notifications, and interactive terminals stay TUI-only.
 
-In the TUI, deferred completion, failure, and cancellation are reported automatically. Long-running services can also announce readiness as soon as a chosen literal appears in their output, without ending the task. Inspecting an existing task without `wait` uses the same configured default; a timeout or cancelled wait leaves it running.
+In the TUI, deferred completion, failure, and cancellation are reported automatically. Long-running services can also announce readiness as soon as a chosen literal appears in their output, without ending the task. Inspecting an existing task without `wait` uses the same configured default; a timeout or cancelled wait leaves it running. A snapshot that still has work in flight therefore carries explicit guidance telling the agent not to poll: it should keep working or end its turn, since the task reports its own completion, and extend the wait only once when the result is required before it can continue.
 
 Each TUI task remains available through its ID for later status and output snapshots or explicit process-tree termination. Snapshots are bounded and repeatable rather than consumable. Task state and notification markers survive `/reload` and pi restarts, and terminal records are retained for 24 hours. Outside the TUI the call does not return a live task id, and there is no later notification.
 
@@ -194,6 +194,8 @@ npm pack --dry-run
 ```
 
 The test suite covers configuration and runtime resolution, UTF-8 source transport, exit codes, persistent tasks, notifications, timeouts, process-tree cleanup, PTYs, and UI requests.
+
+For an end-to-end run against a real pi install (Windows only, pi 0.99+ on `PATH` or pointed to by `PI_BIN`), use `npm run test:e2e`. It loads this plugin into actual `pi -p`/`json`/`rpc`/TUI sessions through a scripted fake provider and checks the model-facing tool contract; other platforms print SKIP.
 
 ## License
 
