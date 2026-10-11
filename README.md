@@ -23,26 +23,30 @@ This lets pi use PowerShell without blocking on long-running work: task persiste
 
 ## Compared with pi's built-in PowerShell tool
 
-Pi 0.84.3 added an optional built-in [`powershell` tool](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/windows.md#powershell-tool) for Windows. It is a lightweight foreground command executor built on pi's existing shell-tool infrastructure. `pi-pwsh` adds a persistent task and interaction layer for work that must continue independently of one tool call.
+Pi 0.84.3 added an optional built-in [`powershell` tool](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/windows.md#powershell-tool) for Windows. It is a lightweight foreground command executor built on pi's existing shell-tool infrastructure. In the interactive TUI, `pi-pwsh` adds a persistent task and interaction layer for work that must continue independently of one tool call. Outside the TUI it runs each command in the foreground, closer to the built-in tool; see [Outside the TUI](#outside-the-tui) below. The `pi-pwsh` column describes the TUI unless a cell says otherwise.
 
 | Area | Pi built-in `powershell` | `pi-pwsh` | Better fit |
 | --- | --- | --- | --- |
 | Basic command execution | Built into pi with no extension dependencies | Separate extension with task, PTY, and coordination dependencies | **Built-in** for simple commands |
 | Shared baseline | Runs in the current directory, captures stdout/stderr, bounds returned output, and can terminate a process tree | Same | **Equivalent** |
-| Foreground experience | Waits for completion and streams live output into the current tool card | Waits up to 60 seconds by default and returns a task snapshot; longer work continues in the background | **Built-in** for live streaming; **pi-pwsh** for bounded waiting with persistence |
-| Background work | No managed background-task API or task ID | Every command is a persistent task with inspect, wait, and stop operations | **pi-pwsh** |
-| Abort and timeout | Aborting the tool call or reaching its timeout terminates the process tree | Aborting or timing out a wait leaves the task running; only `stop=true` terminates it | Depends on whether work should stop or continue |
-| Readiness and completion | No readiness detection or deferred notification | Reports readiness from `notifyOn`, then completion, failure, or cancellation without polling | **pi-pwsh** |
-| Durability and output | Returns the last 2,000 lines or 50 KiB and writes truncated full output to a temporary file | Persists task metadata and full logs across later calls, `/reload`, and pi restarts; snapshots return the latest 50 KiB and terminal records are retained for 24 hours | **pi-pwsh** |
-| Interactive programs | Non-interactive process with no stdin or terminal session | Persistent ConPTY sessions with input, screen snapshots, transcript reads, waiting, resizing, and process control | **pi-pwsh** |
-| User interaction | No command-to-UI request API | Commands can request text, confirmation, selection, masked input, or secret input sent directly to a PTY | **pi-pwsh** |
+| Foreground experience | Waits for completion and streams live output into the current tool card | In the TUI, waits up to 60 seconds by default and returns a task snapshot; longer work continues in the background. Outside the TUI, waits until the command exits and returns its output at the end, without live streaming | **Built-in** for live streaming; **pi-pwsh** for bounded waiting with persistence |
+| Background work | No managed background-task API or task ID | In the TUI, every command is a persistent task with inspect, wait, and stop operations. Not available outside the TUI | **pi-pwsh** |
+| Abort and timeout | Aborting the tool call or reaching its optional timeout terminates the process tree | In the TUI, aborting or timing out a wait leaves the task running; only `stop=true` terminates it. Outside the TUI, aborting terminates the process tree, and there is no timeout parameter | Depends on whether work should stop or continue |
+| Readiness and completion | No readiness detection or deferred notification | In the TUI, reports readiness from `notifyOn`, then completion, failure, or cancellation without polling. Not available outside the TUI | **pi-pwsh** |
+| Durability and output | Returns the last 2,000 lines or 50 KiB to the model and writes truncated full output to a temporary file; codemode scripts receive up to 1 MiB | Persists task metadata and full logs across later calls, `/reload`, and pi restarts; snapshots return the latest 50 KiB and terminal records are retained for 24 hours. Outside the TUI, the call returns the latest 50 KiB and no task id for later access | **pi-pwsh** |
+| Interactive programs | Non-interactive process with no stdin or terminal session | In the TUI, persistent ConPTY sessions with input, screen snapshots, transcript reads, waiting, resizing, and process control. Not available outside the TUI | **pi-pwsh** |
+| User interaction | No command-to-UI request API | In the TUI, commands can request text, confirmation, selection, masked input, or secret input sent directly to a PTY. Not available outside the TUI | **pi-pwsh** |
 | PowerShell runtime | Prefers `pwsh.exe` but falls back to Windows PowerShell; fixed `-NoProfile -NonInteractive -ExecutionPolicy Bypass` | Requires and verifies PowerShell 7+; executable, profile loading, execution policy, and stop-on-error behavior are configurable | Built-in for broad availability; **pi-pwsh** for consistent behavior |
-| Encoding and source transport | Sets console output to UTF-8 and passes the command as a process argument | Sends UTF-8 source through stdin, configures PowerShell and native-command encodings, strips styling for task output, and can default Python to unbuffered UTF-8 | **pi-pwsh** |
-| Exit status | Reports the outer PowerShell process exit code | Preserves the final native command's exact exit code and maps final PowerShell command failures consistently | **pi-pwsh** |
+| Encoding and source transport | Sets console output to UTF-8 and passes the command as a process argument | Sends UTF-8 source through stdin, configures PowerShell and native-command encodings, strips styling for task output, warns when the Windows console page is not UTF-8, and can default Python to unbuffered UTF-8 | **pi-pwsh** |
+| Exit status | Reports the outer PowerShell process exit code; a signal-terminated command is reported as failed | Preserves the final native command's exact exit code and maps final PowerShell command failures consistently | **pi-pwsh** |
 | `!` and `!!` shortcuts | Continue to use Bash | Use the configured PowerShell runtime by default; this replacement is optional | **pi-pwsh** for a consistent shell |
 | Pi integration | Core tool, available through `defaultTools` and the SDK, with current `PI_*` session/model environment variables | Custom task UI, coordinated notifications, and the shared `/tasks` catalog | Depends on the integration needed |
 
 Choose the built-in tool when commands are short-lived and native pi integration matters most. Choose `pi-pwsh` for builds, tests, servers, watchers, interactive applications, durable output, or commands that need to ask the user for input. The tools have different names and can coexist, but enabling both gives the model two PowerShell tools with different lifecycle semantics; most setups should select one.
+
+### Outside the TUI
+
+In `print`, `json`, and `rpc` modes, including headless subagents, both tools run a command in the foreground and terminate its process tree when the call is aborted. `pi-pwsh` rejects `taskId`, `stop`, and `notifyOn`, ignores `wait`, and offers no PTY sessions or user requests there. Compared with the built-in tool, it does not stream output while the command runs and has no timeout parameter, but it keeps PowerShell 7 verification, UTF-8 source transport and encoding handling, and the final native command's exact exit code.
 
 ## Features
 
