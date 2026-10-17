@@ -16,7 +16,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRuntimeEnv, SOURCE_BOOTSTRAP, UTF8_PREFIX, wrapPowerShellCommand } from "./spawn.ts";
 import { userPowerShellArguments, type ResolvedPwshRuntime } from "./runtime.ts";
-import { mutateMetadataSnapshots, readLatestMetadataSnapshot, renameWithRetry } from "./task-metadata-store.mjs";
+import { MetadataWriterBusyError, mutateMetadataSnapshots, readLatestMetadataSnapshot, renameWithRetry } from "./task-metadata-store.mjs";
 
 export { renameWithRetry };
 
@@ -105,6 +105,15 @@ function isAlive(pid?: number): boolean {
 	} catch (error) {
 		return (error as NodeJS.ErrnoException).code === "EPERM";
 	}
+}
+
+function refreshFailure(metadata: TaskMetadata): string | undefined {
+	if (TERMINAL.has(metadata.status)) return undefined;
+	if (metadata.status === "starting"
+		&& metadata.supervisorPid === 0
+		&& Date.now() - Date.parse(metadata.createdAt) > START_GRACE_MS) return LAUNCHER_STALE_ERROR;
+	if (metadata.supervisorPid > 0 && !isAlive(metadata.supervisorPid)) return SUPERVISOR_LOST_ERROR;
+	return undefined;
 }
 
 function isProcessGroupAlive(pid: number): boolean {
@@ -854,30 +863,34 @@ export class PwshTaskRuntime {
 	}
 
 	private async refresh(id: string): Promise<TaskMetadata> {
-		let metadata = await this.readMetadata(id);
-		const staleStart = metadata.status === "starting"
-			&& metadata.supervisorPid === 0
-			&& Date.now() - Date.parse(metadata.createdAt) > START_GRACE_MS;
-		const dead = !TERMINAL.has(metadata.status)
-			&& metadata.supervisorPid > 0
-			&& !isAlive(metadata.supervisorPid);
-		if (!staleStart && !dead) return metadata;
-		if (dead) await new Promise((resolve) => setTimeout(resolve, 50));
+		const metadata = await this.readMetadata(id);
+		const failure = refreshFailure(metadata);
+		if (!failure) return metadata;
+		if (failure === SUPERVISOR_LOST_ERROR) await new Promise((resolve) => setTimeout(resolve, 50));
 
-		return this.updateMetadata(id, (current) => {
-			if (!current) throw new Error(`pwsh: task ${JSON.stringify(id)} has no metadata`);
-			const stillDead = current.supervisorPid > 0 && !isAlive(current.supervisorPid);
-			if (current.instanceId !== metadata.instanceId || TERMINAL.has(current.status) || (!staleStart && !stillDead)) return undefined;
-			metadata = {
-				...current,
-				status: "failed",
-				exitCode: null,
-				error: staleStart ? LAUNCHER_STALE_ERROR : SUPERVISOR_LOST_ERROR,
-				failureKind: "infrastructure",
-				updatedAt: new Date().toISOString(),
-			};
-			return metadata;
-		});
+		try {
+			return await this.updateMetadata(id, (current) => {
+				if (!current) throw new Error(`pwsh: task ${JSON.stringify(id)} has no metadata`);
+				if (current.instanceId !== metadata.instanceId) return undefined;
+				// The launcher may have published a live supervisor while this reader
+				// waited for the writer lock. Decide from the locked snapshot, not the old one.
+				const failure = refreshFailure(current);
+				if (!failure) return undefined;
+				return {
+					...current,
+					status: "failed",
+					exitCode: null,
+					error: failure,
+					failureKind: "infrastructure",
+					updatedAt: new Date().toISOString(),
+				};
+			});
+		} catch (error) {
+			if (!(error instanceof MetadataWriterBusyError)) throw error;
+			// Reconciliation is best-effort: another writer must not break a read
+			// or the observer's entire scan. A later poll can retry the transition.
+			return this.readMetadata(id);
+		}
 	}
 
 	/**

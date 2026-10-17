@@ -10,6 +10,13 @@ const RETAINED_SNAPSHOTS = 3;
 const SNAPSHOT_RELIST_ATTEMPTS = 3;
 const SNAPSHOT_RELIST_DELAY_MS = 5;
 
+export class MetadataWriterBusyError extends Error {
+	constructor() {
+		super("metadata snapshot writer lock is busy");
+		this.code = "EBUSY";
+	}
+}
+
 function errorWithCode(message, code) {
 	const error = new Error(message);
 	error.code = code;
@@ -173,7 +180,7 @@ async function acquireWriterLock(directory) {
 			if (!choosing && tickets[0]?.name === ticketName) {
 				return () => retireWriterClaim(ticketPath);
 			}
-			if (Date.now() >= deadline) throw errorWithCode("metadata snapshot writer lock is busy", "EBUSY");
+			if (Date.now() >= deadline) throw new MetadataWriterBusyError();
 			await new Promise((resolve) => setTimeout(resolve, 10 + Math.floor(Math.random() * 40)));
 		}
 	} catch (error) {

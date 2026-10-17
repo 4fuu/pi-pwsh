@@ -34,7 +34,7 @@
     "typecheck": "tsc --noEmit",
     "test": "npm run typecheck && npm run test:controls && npm run test:tasks && npm run test:config && npm run test:runtime && npm run test:transport && npm run test:exitcode && npm run test:output && npm run test:encoding && npm run test:launcher && npm run test:logcap && npm run test:timeout && npm run test:pty",
     "test:e2e": "tsx e2e/driver.mjs",
-    "test:tasks": "tsx scripts/test-tasks.mjs",
+    "test:tasks": "tsx scripts/test-tasks.mjs && tsx --test scripts/test-task-refresh.mjs",
     "test:controls": "tsx --test scripts/test-controls.mjs",
     "test:controls-ui": "node scripts/smoke-controls-ui.mjs",
     "test:config": "tsx scripts/smoke-config.mjs",
