@@ -1,3 +1,8 @@
+export class MetadataWriterBusyError extends Error {
+	readonly code: "EBUSY";
+	constructor();
+}
+
 export interface MetadataSnapshot<T> {
 	revision: number;
 	metadata: T;
