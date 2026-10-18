@@ -1,5 +1,6 @@
 export class MetadataWriterBusyError extends Error {
 	readonly code: "EBUSY";
+	readonly name: "MetadataWriterBusyError";
 	constructor();
 }
 

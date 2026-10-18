@@ -874,13 +874,13 @@ export class PwshTaskRuntime {
 				if (current.instanceId !== metadata.instanceId) return undefined;
 				// The launcher may have published a live supervisor while this reader
 				// waited for the writer lock. Decide from the locked snapshot, not the old one.
-				const failure = refreshFailure(current);
-				if (!failure) return undefined;
+				const lockedFailure = refreshFailure(current);
+				if (!lockedFailure) return undefined;
 				return {
 					...current,
 					status: "failed",
 					exitCode: null,
-					error: failure,
+					error: lockedFailure,
 					failureKind: "infrastructure",
 					updatedAt: new Date().toISOString(),
 				};

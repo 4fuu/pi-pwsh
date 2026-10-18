@@ -13,6 +13,7 @@ const SNAPSHOT_RELIST_DELAY_MS = 5;
 export class MetadataWriterBusyError extends Error {
 	constructor() {
 		super("metadata snapshot writer lock is busy");
+		this.name = "MetadataWriterBusyError";
 		this.code = "EBUSY";
 	}
 }
@@ -172,6 +173,9 @@ async function acquireWriterLock(directory) {
 		while (true) {
 			const claims = await listWriterClaims(directory);
 			if (!claims.some((claim) => claim.name === ticketName)) {
+				// Deliberately not MetadataWriterBusyError: a vanished ticket means
+				// this process's own claim was reaped (it looked dead), which is a
+				// real fault, not contention. refresh() must not degrade on it.
 				throw errorWithCode("metadata snapshot writer lost its ticket", "EBUSY");
 			}
 			const choosing = claims.some((claim) => claim.choosing);
